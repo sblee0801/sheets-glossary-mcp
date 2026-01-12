@@ -1,31 +1,30 @@
 import "dotenv/config";
+import express from "express";
 import { google } from "googleapis";
 import { z } from "zod";
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 
+const PORT = Number(process.env.PORT || 8080);
 const SPREADSHEET_ID = process.env.SPREADSHEET_ID;
 const SHEET_NAME = process.env.SHEET_NAME || "Glossary";
 
-if (!SPREADSHEET_ID) {
-  throw new Error("SPREADSHEET_ID is missing. Check .env");
-}
+if (!SPREADSHEET_ID) throw new Error("SPREADSHEET_ID is missing. Check env.");
+if (!process.env.GOOGLE_SERVICE_ACCOUNT_JSON)
+  throw new Error("GOOGLE_SERVICE_ACCOUNT_JSON is missing. Check env.");
 
 function normalize(h) {
   return String(h ?? "").trim().toLowerCase();
 }
 
 async function readGlossary() {
-const serviceAccount = JSON.parse(
-  process.env.GOOGLE_SERVICE_ACCOUNT_JSON
-);
+  const serviceAccount = JSON.parse(process.env.GOOGLE_SERVICE_ACCOUNT_JSON);
 
-const auth = new google.auth.GoogleAuth({
-  credentials: serviceAccount,
-  scopes: ["https://www.googleapis.com/auth/spreadsheets.readonly"],
-});
-
+  const auth = new google.auth.GoogleAuth({
+    credentials: serviceAccount,
+    scopes: ["https://www.googleapis.com/auth/spreadsheets.readonly"],
+  });
 
   const sheets = google.sheets({ version: "v4", auth });
 
@@ -66,12 +65,13 @@ const auth = new google.auth.GoogleAuth({
     .filter((x) => x.term && x.translation && x.status);
 }
 
-const server = new McpServer({
+// MCP 서버(도구 정의)
+const mcp = new McpServer({
   name: "sheets-glossary-mcp",
-  version: "0.1.0",
+  version: "0.2.0",
 });
 
-server.tool(
+mcp.tool(
   "get_glossary",
   { domain: z.string().optional() },
   async ({ domain }) => {
@@ -88,8 +88,37 @@ server.tool(
   }
 );
 
-async function main() {
-  const transport = new StdioServerTransport();
-  await server.connect(transport);
+// HTTP 앱
+const app = express();
+app.use(express.json({ limit: "2mb" }));
+
+// (최소한의) Origin 검증: 필요 시 환경변수로 확장 가능
+const ALLOWED_ORIGINS = new Set([
+  "https://chat.openai.com",
+  "https://chatgpt.com",
+]);
+
+function assertOrigin(req, res) {
+  const origin = req.headers.origin;
+  // Origin이 없는 경우(서버-서버 호출 등)는 일단 허용
+  if (!origin) return true;
+  if (ALLOWED_ORIGINS.has(origin)) return true;
+  res.status(403).send("Forbidden origin");
+  return false;
 }
-main();
+
+// MCP 엔드포인트: /mcp (GET/POST)
+app.all("/mcp", async (req, res) => {
+  if (!assertOrigin(req, res)) return;
+
+  const transport = new StreamableHTTPServerTransport(req, res);
+  await mcp.connect(transport);
+});
+
+// 헬스체크(Cloud Run용)
+app.get("/", (req, res) => res.status(200).send("ok"));
+
+app.listen(PORT, () => {
+  // stdout 로그는 Cloud Run에서 정상
+  console.log(`MCP server listening on :${PORT} (endpoint: /mcp)`);
+});
