@@ -17,9 +17,15 @@ function normalize(h) {
 }
 
 async function readGlossary() {
-  const auth = new google.auth.GoogleAuth({
-    scopes: ["https://www.googleapis.com/auth/spreadsheets.readonly"],
-  });
+const serviceAccount = JSON.parse(
+  process.env.GOOGLE_SERVICE_ACCOUNT_JSON
+);
+
+const auth = new google.auth.GoogleAuth({
+  credentials: serviceAccount,
+  scopes: ["https://www.googleapis.com/auth/spreadsheets.readonly"],
+});
+
 
   const sheets = google.sheets({ version: "v4", auth });
 
