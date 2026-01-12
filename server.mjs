@@ -93,24 +93,9 @@ const app = express();
 app.use(express.json({ limit: "2mb" }));
 
 // (최소한의) Origin 검증: 필요 시 환경변수로 확장 가능
-const ALLOWED_ORIGINS = new Set([
-  "https://chat.openai.com",
-  "https://chatgpt.com",
-]);
-
-function assertOrigin(req, res) {
-  const origin = req.headers.origin;
-  // Origin이 없는 경우(서버-서버 호출 등)는 일단 허용
-  if (!origin) return true;
-  if (ALLOWED_ORIGINS.has(origin)) return true;
-  res.status(403).send("Forbidden origin");
-  return false;
-}
 
 // MCP 엔드포인트: /mcp (GET/POST)
 app.all("/mcp", async (req, res) => {
-  if (!assertOrigin(req, res)) return;
-
   const transport = new StreamableHTTPServerTransport(req, res);
   await mcp.connect(transport);
 });
