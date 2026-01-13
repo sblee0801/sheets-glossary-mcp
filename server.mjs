@@ -1,24 +1,32 @@
 /**
- * server.mjs (Polished)
+ * server.mjs (Revised: Dual-key Glossary + Fast Replacement + Session Guardrails)
  *
- * 목적:
- * - “대화형 웹 세션”에서 Glossary를 1회 로드(세션 캐시)하고
- * - 사용자가 명시적으로 “Glossary 업데이트”를 요청하기 전까지
- *   동일 Glossary 기준으로 치환(Glossary Lock)만 수행
+ * 핵심 목표 (2026-01 기준 합의 반영):
+ * - 대화형 웹 세션에서 Glossary를 1회 로드(세션 캐시)하고
+ * - 사용자가 “Glossary 업데이트” 요청하기 전까지 동일 Glossary 기준으로 Phase 1(치환)만 수행
+ * - Glossary 매칭이 있으면 우선 치환, 이후 번역 단계(Phase 2)로 넘겨도 용어가 흔들리지 않게 설계 가능한 출력 제공
+ *
+ * 주요 개선:
+ * 1) Dual-key 치환 (B안 우선 + TERM 보조):
+ *    - primary key: sourceLang 컬럼 값 (예: ko-KR)
+ *    - secondary key: TERM 컬럼 값 (선택)
+ * 2) 고성능 치환:
+ *    - 세션 로딩 시 정규식(OR) 컴파일 (chunking)
+ *    - 요청 처리에서는 text.replace() 기반으로 1~N회 (chunk 수 만큼) 치환
+ * 3) Session Guardrails:
+ *    - /v1/translate/replace에서 category/sourceLang/targetLang 검증(409)
+ *    - TTL(미사용/최대 수명) 만료 시 410 Gone
+ * 4) glossaryVersion:
+ *    - 시간 기반이 아니라 “실제 로드된 Glossary 내용 기반” 해시
  *
  * 엔드포인트:
- * - GET  /              : 연결 확인(상태 JSON)
- * - GET  /healthz       : Liveness (외부 의존성 없이 항상 200)
- * - GET  /readyz        : Readiness (Sheets 연결/권한/범위 체크)
+ * - GET  /              : 상태 JSON
+ * - GET  /healthz       : Liveness (항상 200)
+ * - GET  /readyz        : Readiness (Sheets 연결/범위 확인)
  * - POST /v1/session/init      : 세션 생성 + Glossary 1회 로드
  * - POST /v1/translate/replace : 세션 Glossary로 용어 치환(Phase 1)
  * - POST /v1/glossary/update   : 세션 Glossary 강제 갱신
  * - (옵션) /mcp         : MCP 연결 유지
- *
- * 설계 포인트:
- * - 서버 부팅 시점에는 외부 의존성(Sheets)을 강제하지 않음 → Cloud Run 안정성
- * - /readyz에서만 실제 Sheets 호출로 “정상 연결” 확인 가능
- * - Glossary는 세션 단위로 1회 로드 (요청마다 Sheets 재호출하지 않음)
  */
 
 import "dotenv/config";
@@ -36,14 +44,22 @@ const SPREADSHEET_ID = process.env.SPREADSHEET_ID;
 const SHEET_NAME = process.env.SHEET_NAME || "Glossary";
 const GOOGLE_SERVICE_ACCOUNT_JSON = process.env.GOOGLE_SERVICE_ACCOUNT_JSON;
 
-// “부팅 안정성”을 위해 여기서 throw 하지 않습니다.
-// 대신 /readyz 및 실제 로딩 시점에서 오류를 명확히 반환합니다.
+// Session TTL (Cloud Run 인메모리 캐시 현실 대응)
+const SESSION_IDLE_TTL_MS = Number(process.env.SESSION_IDLE_TTL_MS || 30 * 60 * 1000); // 30m idle
+const SESSION_MAX_TTL_MS = Number(process.env.SESSION_MAX_TTL_MS || 6 * 60 * 60 * 1000); // 6h absolute
+
+// 정규식 chunk size (너무 긴 패턴 방지)
+const REGEX_CHUNK_SIZE = Number(process.env.REGEX_CHUNK_SIZE || 800);
+
 function envSummary() {
   return {
     PORT,
     SPREADSHEET_ID: Boolean(SPREADSHEET_ID),
     SHEET_NAME: SHEET_NAME || "",
     GOOGLE_SERVICE_ACCOUNT_JSON: Boolean(GOOGLE_SERVICE_ACCOUNT_JSON),
+    SESSION_IDLE_TTL_MS,
+    SESSION_MAX_TTL_MS,
+    REGEX_CHUNK_SIZE,
   };
 }
 
@@ -51,45 +67,34 @@ function envSummary() {
 function nowIso() {
   return new Date().toISOString();
 }
-
-function log(level, msg, extra = undefined) {
-  // Cloud Logging에서 구조화 로그로 보기 좋게 JSON 형태 유지
-  const base = { ts: nowIso(), level, msg };
-  if (extra !== undefined) {
-    console.log(JSON.stringify({ ...base, ...extra }));
-  } else {
-    console.log(JSON.stringify(base));
-  }
+function nowMs() {
+  return Date.now();
 }
-
+function log(level, msg, extra = undefined) {
+  const base = { ts: nowIso(), level, msg };
+  if (extra !== undefined) console.log(JSON.stringify({ ...base, ...extra }));
+  else console.log(JSON.stringify(base));
+}
 process.on("unhandledRejection", (err) => {
   log("error", "unhandledRejection", { err: String(err?.stack || err) });
 });
 process.on("uncaughtException", (err) => {
   log("error", "uncaughtException", { err: String(err?.stack || err) });
-  // 의도적으로 즉시 종료하지 않음 (Cloud Run에서 restart loop 방지 관점)
 });
 
 // ---------------- Helpers ----------------
 function normalizeHeader(h) {
   return String(h ?? "").trim().toLowerCase();
 }
-
 function normalizeLang(lang) {
   return String(lang ?? "")
     .trim()
     .toLowerCase()
     .replace(/_/g, "-");
 }
-
 function normalizeCategory(cat) {
   return String(cat ?? "").trim().toLowerCase();
 }
-
-function sha1(s) {
-  return crypto.createHash("sha1").update(String(s)).digest("hex");
-}
-
 function safeJsonParse(s, fallback = null) {
   try {
     return JSON.parse(s);
@@ -97,61 +102,24 @@ function safeJsonParse(s, fallback = null) {
     return fallback;
   }
 }
-
-// 단순 치환(긴 term 우선) + 중복치환 방지(placeholder)
-function applyReplacements(text, pairs) {
-  // pairs: [{ ko, en }]
-  if (!text || !pairs || pairs.length === 0) {
-    return { output: text ?? "", hits: [] };
-  }
-
-  const source = String(text);
-  const hits = [];
-  const placeholders = [];
-
-  // 1) ko 매칭된 부분을 placeholder로 치환
-  let tmp = source;
-
-  for (let i = 0; i < pairs.length; i++) {
-    const { ko, en } = pairs[i];
-    if (!ko) continue;
-
-    // 전역 replace (정확 문자열 매칭)
-    if (tmp.includes(ko)) {
-      const ph = `[[G${i}]]`;
-      tmp = tmp.split(ko).join(ph);
-      placeholders.push({ ph, en, ko });
-      hits.push({ ko, en });
-    }
-  }
-
-  // 2) placeholder를 en으로 복원
-  let out = tmp;
-  for (const p of placeholders) {
-    out = out.split(p.ph).join(p.en);
-  }
-
-  return { output: out, hits };
+function sha256Hex(s) {
+  return crypto.createHash("sha256").update(String(s)).digest("hex");
+}
+function escapeRegExp(s) {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
 // ---------------- Google Sheets Client ----------------
-// 간단한 “프로세스 단위” 캐시: 매번 auth 생성 비용을 줄이기 위함
 let _sheetsClient = null;
 
 function getSheetsClientOrThrow() {
   if (_sheetsClient) return _sheetsClient;
 
-  if (!SPREADSHEET_ID) {
-    throw new Error("SPREADSHEET_ID is missing. Check env.");
-  }
-  if (!GOOGLE_SERVICE_ACCOUNT_JSON) {
-    throw new Error("GOOGLE_SERVICE_ACCOUNT_JSON is missing. Check env.");
-  }
+  if (!SPREADSHEET_ID) throw new Error("SPREADSHEET_ID is missing. Check env.");
+  if (!GOOGLE_SERVICE_ACCOUNT_JSON) throw new Error("GOOGLE_SERVICE_ACCOUNT_JSON is missing. Check env.");
 
   const serviceAccount = safeJsonParse(GOOGLE_SERVICE_ACCOUNT_JSON, null);
-  if (!serviceAccount) {
-    throw new Error("GOOGLE_SERVICE_ACCOUNT_JSON is not valid JSON.");
-  }
+  if (!serviceAccount) throw new Error("GOOGLE_SERVICE_ACCOUNT_JSON is not valid JSON.");
 
   const auth = new google.auth.GoogleAuth({
     credentials: serviceAccount,
@@ -159,7 +127,6 @@ function getSheetsClientOrThrow() {
   });
 
   const sheets = google.sheets({ version: "v4", auth });
-
   _sheetsClient = sheets;
   return sheets;
 }
@@ -167,8 +134,6 @@ function getSheetsClientOrThrow() {
 // ---------------- Sheets Reader (I:U only) ----------------
 async function readGlossaryIU() {
   const sheets = getSheetsClientOrThrow();
-
-  // ✅ I~U만 읽음
   const range = `${SHEET_NAME}!I:U`;
 
   const res = await sheets.spreadsheets.values.get({
@@ -177,33 +142,33 @@ async function readGlossaryIU() {
   });
 
   const rows = res.data.values || [];
-  if (rows.length < 2) return { header: [], data: [] };
+  if (rows.length < 2) return { headerRaw: [], headerNorm: [], data: [] };
 
   const headerRaw = rows[0].map((h) => String(h ?? "").trim());
-  const header = headerRaw.map(normalizeHeader);
+  const headerNorm = headerRaw.map(normalizeHeader);
   const body = rows.slice(1);
 
-  // 스프레드시트 기준: I=분류, ... T=LEN, U=TERM (헤더 대소문자/위치 변동 가능)
   const idx = {
-    category: header.indexOf("분류"),
-    term: header.indexOf("term"),
-    len: header.indexOf("len"),
+    category: headerNorm.indexOf("분류"),
+    term: headerNorm.indexOf("term"),
+    len: headerNorm.indexOf("len"),
   };
 
   if (idx.term < 0) {
     throw new Error("I:U 범위 헤더에 TERM(또는 term)이 없습니다. U열 헤더가 'TERM'인지 확인하세요.");
   }
 
-  // 언어 컬럼 인덱스 맵: 예) ko-kr, en-us ...
+  // 언어 컬럼 인덱스 맵
+  // - 기본: xx-yy, xx
+  // - 확장: zh-hans 같은 3파트도 허용(옵션)
   const langIndex = {};
-  for (let i = 0; i < header.length; i++) {
+  for (let i = 0; i < headerNorm.length; i++) {
     if (i === idx.term || i === idx.len || i === idx.category) continue;
-
-    const h = header[i];
+    const h = headerNorm[i];
     if (!h) continue;
 
-    // locale 형태면 언어 컬럼로 인정
-    if (/^[a-z]{2}(-[a-z]{2})?$/.test(h) || /^[a-z]{2}-[a-z]{2}$/.test(h)) {
+    // 허용: en, en-us, zh-cn, zh-hans 등
+    if (/^[a-z]{2}(-[a-z0-9]{2,8}){0,2}$/.test(h)) {
       langIndex[h] = i;
     }
   }
@@ -222,28 +187,100 @@ async function readGlossaryIU() {
 
       return { term, category, len, translations };
     })
-    .filter((x) => x.term);
+    .filter((x) => x.term || Object.keys(x.translations || {}).length > 0);
 
-  return { header: headerRaw, data };
+  return { headerRaw, headerNorm, data };
+}
+
+// ---------------- Replacement Compiler (Fast) ----------------
+function compileReplacers(map, chunkSize = REGEX_CHUNK_SIZE) {
+  const keys = [...map.keys()].filter((k) => k && String(k).length > 0);
+  if (keys.length === 0) return { chunks: [], keyCount: 0 };
+
+  // 긴 term 우선
+  keys.sort((a, b) => b.length - a.length);
+
+  const chunks = [];
+  for (let i = 0; i < keys.length; i += chunkSize) {
+    const slice = keys.slice(i, i + chunkSize).map(escapeRegExp);
+    const pattern = slice.join("|");
+    // 빈 패턴 방지
+    if (!pattern) continue;
+    const re = new RegExp(pattern, "g");
+    chunks.push(re);
+  }
+
+  return { chunks, keyCount: keys.length };
+}
+
+function applyReplacementsFast(text, map, regexChunks) {
+  const src = String(text ?? "");
+  if (!src || !map || map.size === 0 || !regexChunks || regexChunks.length === 0) {
+    return { output: src, hits: [] };
+  }
+
+  const hitsSet = new Set();
+  let out = src;
+
+  // chunk별 순차 replace
+  for (const re of regexChunks) {
+    out = out.replace(re, (m) => {
+      const rep = map.get(m);
+      if (rep !== undefined) {
+        hitsSet.add(m);
+        return rep;
+      }
+      return m;
+    });
+  }
+
+  // hits는 필요한 만큼만(성능)
+  const hits = [...hitsSet].map((k) => ({ from: k, to: map.get(k) }));
+  return { output: out, hits };
 }
 
 // ---------------- Session-Scoped Glossary Cache ----------------
 /**
  * sessions.get(sessionId) = {
- *   createdAt,
- *   updatedAt,
+ *   createdAtMs,
+ *   updatedAtMs,
+ *   lastUsedAtMs,
+ *   expiresAtMs,
+ *   maxExpiresAtMs,
  *   category,
  *   sourceLang,
  *   targetLang,
  *   glossaryVersion,
- *   map,             // Map<sourceTerm, targetTerm>
- *   pairsSorted,     // [{ko,en}] length desc
- *   termCount
+ *   map,             // Map<sourceKey, targetTerm>
+ *   regexChunks,     // RegExp[] (chunked)
+ *   termCount,
+ *   stats: { duplicates, fromSourceLangKeys, fromTermKeys }
  * }
  */
 const sessions = new Map();
 
-function buildGlossaryMap(rows, category, sourceLang, targetLang) {
+function computeGlossaryVersion({ category, sourceLang, targetLang, entries }) {
+  // entries는 안정적 순서로 구성해야 함
+  const payload = JSON.stringify({
+    category: category ?? "",
+    sourceLang: normalizeLang(sourceLang),
+    targetLang: normalizeLang(targetLang),
+    entries,
+  });
+  return sha256Hex(payload).slice(0, 16);
+}
+
+/**
+ * Dual-key map build:
+ * - primary: srcLang column value -> tgtLang column value
+ * - secondary: TERM value -> tgtLang column value (if non-empty)
+ *
+ * 충돌 정책:
+ * - primary 키 충돌: "마지막 값 우선"(시트 수정 반영 유리)
+ * - TERM 키 충돌: "마지막 값 우선"
+ * - 동일 문자열이 primary와 secondary에 모두 등장: primary가 최종 우선
+ */
+function buildGlossaryMapDual(rows, category, sourceLang, targetLang) {
   const cat = normalizeCategory(category);
   const src = normalizeLang(sourceLang);
   const tgt = normalizeLang(targetLang);
@@ -253,41 +290,126 @@ function buildGlossaryMap(rows, category, sourceLang, targetLang) {
     return normalizeCategory(r.category) === cat;
   });
 
-  const map = new Map();
+  const primary = new Map(); // srcLangValue -> tgtLangValue
+  const secondary = new Map(); // TERM -> tgtLangValue
+
+  let dupPrimary = 0;
+  let dupSecondary = 0;
+  let fromSourceLangKeys = 0;
+  let fromTermKeys = 0;
 
   for (const r of filtered) {
-    const srcTerm = String(r.translations?.[src] ?? "").trim();
-    const tgtTerm = String(r.translations?.[tgt] ?? "").trim();
-    if (!srcTerm || !tgtTerm) continue;
+    const termKey = String(r.term ?? "").trim();
+    const srcKey = String(r.translations?.[src] ?? "").trim();
+    const tgtVal = String(r.translations?.[tgt] ?? "").trim();
+    if (!tgtVal) continue;
 
-    // 중복 sourceTerm 정책: 첫 값 유지
-    if (!map.has(srcTerm)) map.set(srcTerm, tgtTerm);
+    if (srcKey) {
+      if (primary.has(srcKey)) dupPrimary++;
+      primary.set(srcKey, tgtVal);
+      fromSourceLangKeys++;
+    }
+
+    if (termKey) {
+      if (secondary.has(termKey)) dupSecondary++;
+      secondary.set(termKey, tgtVal);
+      fromTermKeys++;
+    }
   }
 
-  const pairsSorted = [...map.entries()]
-    .map(([ko, en]) => ({ ko, en }))
-    .sort((a, b) => b.ko.length - a.ko.length);
+  // merge with priority: primary wins
+  const merged = new Map(secondary);
+  for (const [k, v] of primary.entries()) {
+    merged.set(k, v);
+  }
 
-  return { map, pairsSorted, count: pairsSorted.length };
+  const { chunks: regexChunks } = compileReplacers(merged, REGEX_CHUNK_SIZE);
+
+  // glossaryVersion 계산용 entries: key 정렬(안정성)
+  const entries = [...merged.entries()].sort((a, b) => {
+    // 길이 우선이 아니라 "안정 정렬" (버전 계산용)
+    if (a[0] === b[0]) return 0;
+    return a[0] < b[0] ? -1 : 1;
+  });
+
+  return {
+    map: merged,
+    regexChunks,
+    termCount: merged.size,
+    versionEntries: entries,
+    stats: {
+      duplicates: { primary: dupPrimary, secondary: dupSecondary },
+      fromSourceLangKeys,
+      fromTermKeys,
+    },
+  };
+}
+
+function computeSessionExpiry(createdAtMs, lastUsedAtMs) {
+  const now = nowMs();
+  const maxExpiresAtMs = createdAtMs + SESSION_MAX_TTL_MS;
+  const idleExpiresAtMs = (lastUsedAtMs ?? now) + SESSION_IDLE_TTL_MS;
+  const expiresAtMs = Math.min(idleExpiresAtMs, maxExpiresAtMs);
+  return { expiresAtMs, maxExpiresAtMs };
+}
+
+function touchSession(session) {
+  const t = nowMs();
+  session.lastUsedAtMs = t;
+  session.updatedAtMs = t;
+  const { expiresAtMs, maxExpiresAtMs } = computeSessionExpiry(session.createdAtMs, session.lastUsedAtMs);
+  session.expiresAtMs = expiresAtMs;
+  session.maxExpiresAtMs = maxExpiresAtMs;
+}
+
+function getSessionOrExpire(sessionId) {
+  const s = sessions.get(sessionId);
+  if (!s) return { session: null, expired: false };
+
+  const now = nowMs();
+  if (now > s.expiresAtMs || now > s.maxExpiresAtMs) {
+    sessions.delete(sessionId);
+    return { session: null, expired: true };
+  }
+
+  touchSession(s);
+  return { session: s, expired: false };
 }
 
 async function loadSessionGlossary(sessionId, { category, sourceLang, targetLang }) {
   const { data } = await readGlossaryIU();
-  const built = buildGlossaryMap(data, category, sourceLang, targetLang);
+  const built = buildGlossaryMapDual(data, category, sourceLang, targetLang);
 
   const existing = sessions.get(sessionId);
+  const createdAtMs = existing?.createdAtMs ?? nowMs();
+
+  const glossaryVersion = computeGlossaryVersion({
+    category,
+    sourceLang,
+    targetLang,
+    entries: built.versionEntries,
+  });
 
   const session = {
-    createdAt: existing?.createdAt ?? nowIso(),
-    updatedAt: nowIso(),
+    createdAtMs,
+    updatedAtMs: nowMs(),
+    lastUsedAtMs: nowMs(),
+    expiresAtMs: 0,
+    maxExpiresAtMs: 0,
     category: category ?? "",
     sourceLang: normalizeLang(sourceLang),
     targetLang: normalizeLang(targetLang),
-    glossaryVersion: sha1(`${nowIso()}|${category}|${sourceLang}|${targetLang}`),
+    glossaryVersion,
     map: built.map,
-    pairsSorted: built.pairsSorted,
-    termCount: built.count,
+    regexChunks: built.regexChunks,
+    termCount: built.termCount,
+    stats: built.stats,
   };
+
+  // expiry 계산
+  const { expiresAtMs, maxExpiresAtMs } = computeSessionExpiry(session.createdAtMs, session.lastUsedAtMs);
+  session.expiresAtMs = expiresAtMs;
+  session.maxExpiresAtMs = maxExpiresAtMs;
 
   sessions.set(sessionId, session);
   return session;
@@ -300,13 +422,13 @@ const app = express();
 app.use(express.json({ limit: "5mb", type: ["application/json", "application/*+json"] }));
 app.use(express.text({ limit: "5mb", type: ["text/*"] }));
 
-// 요청 로깅(필요 시 줄일 수 있음)
+// request logging
 app.use((req, _res, next) => {
   log("info", "request", { method: req.method, path: req.path });
   next();
 });
 
-// 0) Root: “연결 확인”용 상태 JSON (단순 OK가 아니라 의미 있는 진단 정보)
+// Root
 app.get("/", (_req, res) => {
   const uptimeSec = Math.floor(process.uptime());
   const summary = envSummary();
@@ -317,9 +439,7 @@ app.get("/", (_req, res) => {
     time: nowIso(),
     uptimeSec,
     env: summary,
-    sessions: {
-      count: sessions.size,
-    },
+    sessions: { count: sessions.size },
     endpoints: {
       healthz: "/healthz",
       readyz: "/readyz",
@@ -330,13 +450,10 @@ app.get("/", (_req, res) => {
   });
 });
 
-// 0-1) Liveness: 외부 의존성 없이 항상 OK
 app.get("/healthz", (_req, res) => res.status(200).send("OK"));
 
-// 0-2) Readiness: Sheets 연결/권한/범위 접근 확인
 app.get("/readyz", async (_req, res) => {
   try {
-    // 최소 범위(I1:U1)만 읽어서 “연결”을 확인
     const sheets = getSheetsClientOrThrow();
     const range = `${SHEET_NAME}!I1:U1`;
 
@@ -379,9 +496,7 @@ app.post("/v1/session/init", async (req, res) => {
   });
 
   const parsed = schema.safeParse(req.body ?? {});
-  if (!parsed.success) {
-    return res.status(400).json({ error: parsed.error.flatten() });
-  }
+  if (!parsed.success) return res.status(400).json({ error: parsed.error.flatten() });
 
   const { category, sourceLang, targetLang } = parsed.data;
   const sessionId = parsed.data.sessionId?.trim() || crypto.randomUUID();
@@ -396,7 +511,11 @@ app.post("/v1/session/init", async (req, res) => {
       targetLang: session.targetLang,
       glossaryVersion: session.glossaryVersion,
       termCount: session.termCount,
-      updatedAt: session.updatedAt,
+      updatedAt: new Date(session.updatedAtMs).toISOString(),
+      expiresAt: new Date(session.expiresAtMs).toISOString(),
+      maxExpiresAt: new Date(session.maxExpiresAtMs).toISOString(),
+      // 운영 관측용(가볍게)
+      stats: session.stats,
     });
   } catch (e) {
     log("error", "session_init_failed", { err: String(e?.stack || e) });
@@ -414,9 +533,7 @@ app.post("/v1/glossary/update", async (req, res) => {
   });
 
   const parsed = schema.safeParse(req.body ?? {});
-  if (!parsed.success) {
-    return res.status(400).json({ error: parsed.error.flatten() });
-  }
+  if (!parsed.success) return res.status(400).json({ error: parsed.error.flatten() });
 
   const { sessionId } = parsed.data;
   const current = sessions.get(sessionId);
@@ -436,7 +553,10 @@ app.post("/v1/glossary/update", async (req, res) => {
       targetLang: session.targetLang,
       glossaryVersion: session.glossaryVersion,
       termCount: session.termCount,
-      updatedAt: session.updatedAt,
+      updatedAt: new Date(session.updatedAtMs).toISOString(),
+      expiresAt: new Date(session.expiresAtMs).toISOString(),
+      maxExpiresAt: new Date(session.maxExpiresAtMs).toISOString(),
+      stats: session.stats,
     });
   } catch (e) {
     log("error", "glossary_update_failed", { err: String(e?.stack || e) });
@@ -449,17 +569,40 @@ app.post("/v1/translate/replace", async (req, res) => {
   const schema = z.object({
     sessionId: z.string(),
     texts: z.array(z.string()).min(1).max(200),
+    // 세션 오용 방지: 검증용 필드(권장: 클라이언트가 항상 포함)
+    category: z.string().optional(),
+    sourceLang: z.string().optional(),
+    targetLang: z.string().optional(),
     limit: z.number().int().min(1).max(200).optional(),
   });
 
   const parsed = schema.safeParse(req.body ?? {});
-  if (!parsed.success) {
-    return res.status(400).json({ error: parsed.error.flatten() });
-  }
+  if (!parsed.success) return res.status(400).json({ error: parsed.error.flatten() });
 
   const { sessionId, texts } = parsed.data;
-  const s = sessions.get(sessionId);
-  if (!s) return res.status(404).json({ error: "Unknown sessionId. Call /v1/session/init first." });
+
+  const { session: s, expired } = getSessionOrExpire(sessionId);
+  if (!s) {
+    if (expired) {
+      return res.status(410).json({ error: "Session expired. Call /v1/session/init again." });
+    }
+    return res.status(404).json({ error: "Unknown sessionId. Call /v1/session/init first." });
+  }
+
+  // 세션 메타 검증(409): 잘못된 sessionId 재사용 차단
+  const reqCat = parsed.data.category;
+  const reqSrc = parsed.data.sourceLang ? normalizeLang(parsed.data.sourceLang) : undefined;
+  const reqTgt = parsed.data.targetLang ? normalizeLang(parsed.data.targetLang) : undefined;
+
+  if (reqCat !== undefined && normalizeCategory(reqCat) !== normalizeCategory(s.category)) {
+    return res.status(409).json({ error: "Session/category mismatch." });
+  }
+  if (reqSrc !== undefined && reqSrc !== s.sourceLang) {
+    return res.status(409).json({ error: "Session/sourceLang mismatch." });
+  }
+  if (reqTgt !== undefined && reqTgt !== s.targetLang) {
+    return res.status(409).json({ error: "Session/targetLang mismatch." });
+  }
 
   const limit = parsed.data.limit ?? texts.length;
   const sliced = texts.slice(0, limit);
@@ -468,13 +611,12 @@ app.post("/v1/translate/replace", async (req, res) => {
   let noHitCount = 0;
 
   for (const t of sliced) {
-    const { output, hits } = applyReplacements(t, s.pairsSorted);
+    const { output, hits } = applyReplacementsFast(t, s.map, s.regexChunks);
     if ((hits?.length ?? 0) === 0) noHitCount++;
-
     results.push({
       input: t,
       output,
-      replacements: hits,
+      replacements: hits, // [{from,to}]
     });
   }
 
@@ -484,13 +626,17 @@ app.post("/v1/translate/replace", async (req, res) => {
     category: s.category,
     sourceLang: s.sourceLang,
     targetLang: s.targetLang,
+    termCount: s.termCount,
+    updatedAt: new Date(s.updatedAtMs).toISOString(),
+    expiresAt: new Date(s.expiresAtMs).toISOString(),
+    maxExpiresAt: new Date(s.maxExpiresAtMs).toISOString(),
     results,
     notes: noHitCount > 0 ? [`no glossary hit in ${noHitCount} line(s)`] : [],
   });
 });
 
 // ---------------- (선택) MCP 유지: /mcp ----------------
-const mcp = new McpServer({ name: "sheets-glossary-mcp", version: "1.0.0" });
+const mcp = new McpServer({ name: "sheets-glossary-mcp", version: "2.0.0" });
 
 mcp.tool(
   "session_init",
@@ -519,7 +665,10 @@ mcp.tool(
               targetLang: session.targetLang,
               glossaryVersion: session.glossaryVersion,
               termCount: session.termCount,
-              updatedAt: session.updatedAt,
+              updatedAt: new Date(session.updatedAtMs).toISOString(),
+              expiresAt: new Date(session.expiresAtMs).toISOString(),
+              maxExpiresAt: new Date(session.maxExpiresAtMs).toISOString(),
+              stats: session.stats,
             },
             null,
             2
@@ -535,17 +684,40 @@ mcp.tool(
   {
     sessionId: z.string(),
     texts: z.array(z.string()).min(1).max(200),
+    category: z.string().optional(),
+    sourceLang: z.string().optional(),
+    targetLang: z.string().optional(),
   },
-  async ({ sessionId, texts }) => {
-    const s = sessions.get(sessionId);
+  async ({ sessionId, texts, category, sourceLang, targetLang }) => {
+    const { session: s, expired } = getSessionOrExpire(sessionId);
     if (!s) {
       return {
-        content: [{ type: "text", text: JSON.stringify({ error: "Unknown sessionId" }, null, 2) }],
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify(
+              { error: expired ? "Session expired. Re-init required." : "Unknown sessionId" },
+              null,
+              2
+            ),
+          },
+        ],
       };
     }
 
+    // 메타 검증(선택)
+    if (category !== undefined && normalizeCategory(category) !== normalizeCategory(s.category)) {
+      return { content: [{ type: "text", text: JSON.stringify({ error: "Session/category mismatch." }, null, 2) }] };
+    }
+    if (sourceLang !== undefined && normalizeLang(sourceLang) !== s.sourceLang) {
+      return { content: [{ type: "text", text: JSON.stringify({ error: "Session/sourceLang mismatch." }, null, 2) }] };
+    }
+    if (targetLang !== undefined && normalizeLang(targetLang) !== s.targetLang) {
+      return { content: [{ type: "text", text: JSON.stringify({ error: "Session/targetLang mismatch." }, null, 2) }] };
+    }
+
     const results = texts.map((t) => {
-      const { output, hits } = applyReplacements(t, s.pairsSorted);
+      const { output, hits } = applyReplacementsFast(t, s.map, s.regexChunks);
       return { input: t, output, replacements: hits };
     });
 
