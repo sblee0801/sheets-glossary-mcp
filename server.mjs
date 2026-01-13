@@ -733,11 +733,14 @@ mcp.tool(
 );
 
 app.all("/mcp", async (req, res) => {
-  // ---- Accept 헤더 보정: */*, 미지정, application/json만 온 경우에도 통과시키기 ----
   const accept = String(req.headers["accept"] ?? "").toLowerCase();
 
-  // SDK가 text/event-stream을 요구하므로, 애매한 Accept는 강제로 추가
-  if (!accept || accept.includes("*/*") || (accept.includes("application/json") && !accept.includes("text/event-stream"))) {
+  // 애매한 Accept는 강제로 MCP가 만족할 형태로 보정
+  if (
+    !accept ||
+    accept.includes("*/*") ||
+    (accept.includes("application/json") && !accept.includes("text/event-stream"))
+  ) {
     req.headers["accept"] = "text/event-stream, application/json";
   }
 
