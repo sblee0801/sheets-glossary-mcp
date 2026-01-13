@@ -1,32 +1,13 @@
 /**
- * server.mjs (Revised: Dual-key Glossary + Fast Replacement + Session Guardrails)
+ * server.mjs (Revised v3)
  *
- * 핵심 목표 (2026-01 기준 합의 반영):
- * - 대화형 웹 세션에서 Glossary를 1회 로드(세션 캐시)하고
- * - 사용자가 “Glossary 업데이트” 요청하기 전까지 동일 Glossary 기준으로 Phase 1(치환)만 수행
- * - Glossary 매칭이 있으면 우선 치환, 이후 번역 단계(Phase 2)로 넘겨도 용어가 흔들리지 않게 설계 가능한 출력 제공
- *
- * 주요 개선:
- * 1) Dual-key 치환 (B안 우선 + TERM 보조):
- *    - primary key: sourceLang 컬럼 값 (예: ko-KR)
- *    - secondary key: TERM 컬럼 값 (선택)
- * 2) 고성능 치환:
- *    - 세션 로딩 시 정규식(OR) 컴파일 (chunking)
- *    - 요청 처리에서는 text.replace() 기반으로 1~N회 (chunk 수 만큼) 치환
- * 3) Session Guardrails:
- *    - /v1/translate/replace에서 category/sourceLang/targetLang 검증(409)
- *    - TTL(미사용/최대 수명) 만료 시 410 Gone
- * 4) glossaryVersion:
- *    - 시간 기반이 아니라 “실제 로드된 Glossary 내용 기반” 해시
- *
- * 엔드포인트:
- * - GET  /              : 상태 JSON
- * - GET  /healthz       : Liveness (항상 200)
- * - GET  /readyz        : Readiness (Sheets 연결/범위 확인)
- * - POST /v1/session/init      : 세션 생성 + Glossary 1회 로드
- * - POST /v1/translate/replace : 세션 Glossary로 용어 치환(Phase 1)
- * - POST /v1/glossary/update   : 세션 Glossary 강제 갱신
- * - (옵션) /mcp         : MCP 연결 유지
+ * 이번 수정의 핵심:
+ * - 시트 구조 변경(카테고리/언어/TERM 컬럼 위치 변경)에 대응
+ * - "헤더 기반"으로 컬럼을 탐색하되, 읽어오는 Range는 넉넉히(A:AA) 가져오도록 변경
+ * - Dual-key 치환(B안 우선 + TERM 보조) 유지
+ * - 고성능 정규식 chunk 치환 유지
+ * - 세션 TTL / 메타 검증(409) 유지
+ * - /mcp Accept 헤더 보정(406 방지) 포함
  */
 
 import "dotenv/config";
@@ -44,11 +25,14 @@ const SPREADSHEET_ID = process.env.SPREADSHEET_ID;
 const SHEET_NAME = process.env.SHEET_NAME || "Glossary";
 const GOOGLE_SERVICE_ACCOUNT_JSON = process.env.GOOGLE_SERVICE_ACCOUNT_JSON;
 
-// Session TTL (Cloud Run 인메모리 캐시 현실 대응)
+// ✅ 시트 구조 변경 대응: 기본을 A:AA로 확장 (필요 시 env로 오버라이드)
+const GLOSSARY_RANGE = process.env.GLOSSARY_RANGE || `${SHEET_NAME}!A:AA`;
+
+// Session TTL
 const SESSION_IDLE_TTL_MS = Number(process.env.SESSION_IDLE_TTL_MS || 30 * 60 * 1000); // 30m idle
 const SESSION_MAX_TTL_MS = Number(process.env.SESSION_MAX_TTL_MS || 6 * 60 * 60 * 1000); // 6h absolute
 
-// 정규식 chunk size (너무 긴 패턴 방지)
+// 정규식 chunk size
 const REGEX_CHUNK_SIZE = Number(process.env.REGEX_CHUNK_SIZE || 800);
 
 function envSummary() {
@@ -56,6 +40,7 @@ function envSummary() {
     PORT,
     SPREADSHEET_ID: Boolean(SPREADSHEET_ID),
     SHEET_NAME: SHEET_NAME || "",
+    GLOSSARY_RANGE,
     GOOGLE_SERVICE_ACCOUNT_JSON: Boolean(GOOGLE_SERVICE_ACCOUNT_JSON),
     SESSION_IDLE_TTL_MS,
     SESSION_MAX_TTL_MS,
@@ -131,14 +116,21 @@ function getSheetsClientOrThrow() {
   return sheets;
 }
 
-// ---------------- Sheets Reader (I:U only) ----------------
-async function readGlossaryIU() {
+// ---------------- Sheets Reader (Header-driven) ----------------
+function findHeaderIndex(headerNorm, candidates) {
+  for (const c of candidates) {
+    const idx = headerNorm.indexOf(c);
+    if (idx >= 0) return idx;
+  }
+  return -1;
+}
+
+async function readGlossary() {
   const sheets = getSheetsClientOrThrow();
-  const range = `${SHEET_NAME}!I:U`;
 
   const res = await sheets.spreadsheets.values.get({
     spreadsheetId: SPREADSHEET_ID,
-    range,
+    range: GLOSSARY_RANGE,
   });
 
   const rows = res.data.values || [];
@@ -148,26 +140,25 @@ async function readGlossaryIU() {
   const headerNorm = headerRaw.map(normalizeHeader);
   const body = rows.slice(1);
 
-  const idx = {
-    category: headerNorm.indexOf("분류"),
-    term: headerNorm.indexOf("term"),
-    len: headerNorm.indexOf("len"),
-  };
+  // ✅ 구조 변경 대응: "분류" 컬럼이 L/M 등으로 이동해도 헤더로 찾음
+  const idxCategory = findHeaderIndex(headerNorm, ["분류", "category", "cat"]);
+  const idxTerm = findHeaderIndex(headerNorm, ["term"]); // TERM/term 모두 normalizeHeader로 "term" 됨
+  const idxLen = findHeaderIndex(headerNorm, ["len"]); // 있을 수도/없을 수도
 
-  if (idx.term < 0) {
-    throw new Error("I:U 범위 헤더에 TERM(또는 term)이 없습니다. U열 헤더가 'TERM'인지 확인하세요.");
+  if (idxTerm < 0) {
+    throw new Error(
+      "헤더에서 TERM 컬럼을 찾지 못했습니다. 'TERM' 헤더가 존재하는지 확인하세요."
+    );
   }
 
   // 언어 컬럼 인덱스 맵
-  // - 기본: xx-yy, xx
-  // - 확장: zh-hans 같은 3파트도 허용(옵션)
+  // - 허용: en, en-us, zh-cn, zh-hans 등
   const langIndex = {};
   for (let i = 0; i < headerNorm.length; i++) {
-    if (i === idx.term || i === idx.len || i === idx.category) continue;
+    if (i === idxTerm || i === idxLen || i === idxCategory) continue;
     const h = headerNorm[i];
     if (!h) continue;
 
-    // 허용: en, en-us, zh-cn, zh-hans 등
     if (/^[a-z]{2}(-[a-z0-9]{2,8}){0,2}$/.test(h)) {
       langIndex[h] = i;
     }
@@ -175,9 +166,9 @@ async function readGlossaryIU() {
 
   const data = body
     .map((r) => {
-      const term = String(r[idx.term] ?? "").trim();
-      const category = idx.category >= 0 ? String(r[idx.category] ?? "").trim() : "";
-      const len = idx.len >= 0 ? String(r[idx.len] ?? "").trim() : "";
+      const term = String(r[idxTerm] ?? "").trim();
+      const category = idxCategory >= 0 ? String(r[idxCategory] ?? "").trim() : "";
+      const len = idxLen >= 0 ? String(r[idxLen] ?? "").trim() : "";
 
       const translations = {};
       for (const [langKey, colIdx] of Object.entries(langIndex)) {
@@ -204,10 +195,8 @@ function compileReplacers(map, chunkSize = REGEX_CHUNK_SIZE) {
   for (let i = 0; i < keys.length; i += chunkSize) {
     const slice = keys.slice(i, i + chunkSize).map(escapeRegExp);
     const pattern = slice.join("|");
-    // 빈 패턴 방지
     if (!pattern) continue;
-    const re = new RegExp(pattern, "g");
-    chunks.push(re);
+    chunks.push(new RegExp(pattern, "g"));
   }
 
   return { chunks, keyCount: keys.length };
@@ -222,7 +211,6 @@ function applyReplacementsFast(text, map, regexChunks) {
   const hitsSet = new Set();
   let out = src;
 
-  // chunk별 순차 replace
   for (const re of regexChunks) {
     out = out.replace(re, (m) => {
       const rep = map.get(m);
@@ -234,33 +222,14 @@ function applyReplacementsFast(text, map, regexChunks) {
     });
   }
 
-  // hits는 필요한 만큼만(성능)
   const hits = [...hitsSet].map((k) => ({ from: k, to: map.get(k) }));
   return { output: out, hits };
 }
 
-// ---------------- Session-Scoped Glossary Cache ----------------
-/**
- * sessions.get(sessionId) = {
- *   createdAtMs,
- *   updatedAtMs,
- *   lastUsedAtMs,
- *   expiresAtMs,
- *   maxExpiresAtMs,
- *   category,
- *   sourceLang,
- *   targetLang,
- *   glossaryVersion,
- *   map,             // Map<sourceKey, targetTerm>
- *   regexChunks,     // RegExp[] (chunked)
- *   termCount,
- *   stats: { duplicates, fromSourceLangKeys, fromTermKeys }
- * }
- */
+// ---------------- Session Cache ----------------
 const sessions = new Map();
 
 function computeGlossaryVersion({ category, sourceLang, targetLang, entries }) {
-  // entries는 안정적 순서로 구성해야 함
   const payload = JSON.stringify({
     category: category ?? "",
     sourceLang: normalizeLang(sourceLang),
@@ -273,12 +242,11 @@ function computeGlossaryVersion({ category, sourceLang, targetLang, entries }) {
 /**
  * Dual-key map build:
  * - primary: srcLang column value -> tgtLang column value
- * - secondary: TERM value -> tgtLang column value (if non-empty)
+ * - secondary: TERM value -> tgtLang column value
  *
  * 충돌 정책:
- * - primary 키 충돌: "마지막 값 우선"(시트 수정 반영 유리)
- * - TERM 키 충돌: "마지막 값 우선"
- * - 동일 문자열이 primary와 secondary에 모두 등장: primary가 최종 우선
+ * - primary/secondary 각각 "마지막 값 우선"
+ * - primary가 최종 우선(merge 시 primary overwrite)
  */
 function buildGlossaryMapDual(rows, category, sourceLang, targetLang) {
   const cat = normalizeCategory(category);
@@ -290,8 +258,8 @@ function buildGlossaryMapDual(rows, category, sourceLang, targetLang) {
     return normalizeCategory(r.category) === cat;
   });
 
-  const primary = new Map(); // srcLangValue -> tgtLangValue
-  const secondary = new Map(); // TERM -> tgtLangValue
+  const primary = new Map();
+  const secondary = new Map();
 
   let dupPrimary = 0;
   let dupSecondary = 0;
@@ -309,7 +277,6 @@ function buildGlossaryMapDual(rows, category, sourceLang, targetLang) {
       primary.set(srcKey, tgtVal);
       fromSourceLangKeys++;
     }
-
     if (termKey) {
       if (secondary.has(termKey)) dupSecondary++;
       secondary.set(termKey, tgtVal);
@@ -317,20 +284,12 @@ function buildGlossaryMapDual(rows, category, sourceLang, targetLang) {
     }
   }
 
-  // merge with priority: primary wins
   const merged = new Map(secondary);
-  for (const [k, v] of primary.entries()) {
-    merged.set(k, v);
-  }
+  for (const [k, v] of primary.entries()) merged.set(k, v);
 
   const { chunks: regexChunks } = compileReplacers(merged, REGEX_CHUNK_SIZE);
 
-  // glossaryVersion 계산용 entries: key 정렬(안정성)
-  const entries = [...merged.entries()].sort((a, b) => {
-    // 길이 우선이 아니라 "안정 정렬" (버전 계산용)
-    if (a[0] === b[0]) return 0;
-    return a[0] < b[0] ? -1 : 1;
-  });
+  const entries = [...merged.entries()].sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0));
 
   return {
     map: merged,
@@ -377,7 +336,7 @@ function getSessionOrExpire(sessionId) {
 }
 
 async function loadSessionGlossary(sessionId, { category, sourceLang, targetLang }) {
-  const { data } = await readGlossaryIU();
+  const { data } = await readGlossary();
   const built = buildGlossaryMapDual(data, category, sourceLang, targetLang);
 
   const existing = sessions.get(sessionId);
@@ -406,7 +365,6 @@ async function loadSessionGlossary(sessionId, { category, sourceLang, targetLang
     stats: built.stats,
   };
 
-  // expiry 계산
   const { expiresAtMs, maxExpiresAtMs } = computeSessionExpiry(session.createdAtMs, session.lastUsedAtMs);
   session.expiresAtMs = expiresAtMs;
   session.maxExpiresAtMs = maxExpiresAtMs;
@@ -418,11 +376,9 @@ async function loadSessionGlossary(sessionId, { category, sourceLang, targetLang
 // ---------------- Express App ----------------
 const app = express();
 
-// body parsing
 app.use(express.json({ limit: "5mb", type: ["application/json", "application/*+json"] }));
 app.use(express.text({ limit: "5mb", type: ["text/*"] }));
 
-// request logging
 app.use((req, _res, next) => {
   log("info", "request", { method: req.method, path: req.path });
   next();
@@ -431,14 +387,12 @@ app.use((req, _res, next) => {
 // Root
 app.get("/", (_req, res) => {
   const uptimeSec = Math.floor(process.uptime());
-  const summary = envSummary();
-
   res.status(200).json({
     status: "OK",
     service: "sheets-glossary-mcp",
     time: nowIso(),
     uptimeSec,
-    env: summary,
+    env: envSummary(),
     sessions: { count: sessions.size },
     endpoints: {
       healthz: "/healthz",
@@ -446,6 +400,7 @@ app.get("/", (_req, res) => {
       sessionInit: "/v1/session/init",
       replace: "/v1/translate/replace",
       glossaryUpdate: "/v1/glossary/update",
+      mcp: "/mcp",
     },
   });
 });
@@ -455,8 +410,9 @@ app.get("/healthz", (_req, res) => res.status(200).send("OK"));
 app.get("/readyz", async (_req, res) => {
   try {
     const sheets = getSheetsClientOrThrow();
-    const range = `${SHEET_NAME}!I1:U1`;
 
+    // ✅ readiness는 실제 range의 첫 row만 읽어 헤더 확인
+    const range = `${SHEET_NAME}!A1:AA1`;
     const r = await sheets.spreadsheets.values.get({
       spreadsheetId: SPREADSHEET_ID,
       range,
@@ -486,7 +442,7 @@ app.get("/readyz", async (_req, res) => {
 
 // ---------------- API ----------------
 
-// 1) 세션 생성 + Glossary 1회 로드
+// Session init
 app.post("/v1/session/init", async (req, res) => {
   const schema = z.object({
     category: z.string().optional().default(""),
@@ -514,7 +470,6 @@ app.post("/v1/session/init", async (req, res) => {
       updatedAt: new Date(session.updatedAtMs).toISOString(),
       expiresAt: new Date(session.expiresAtMs).toISOString(),
       maxExpiresAt: new Date(session.maxExpiresAtMs).toISOString(),
-      // 운영 관측용(가볍게)
       stats: session.stats,
     });
   } catch (e) {
@@ -523,7 +478,7 @@ app.post("/v1/session/init", async (req, res) => {
   }
 });
 
-// 2) Glossary 업데이트(명시적 갱신)
+// Glossary update
 app.post("/v1/glossary/update", async (req, res) => {
   const schema = z.object({
     sessionId: z.string(),
@@ -564,15 +519,17 @@ app.post("/v1/glossary/update", async (req, res) => {
   }
 });
 
-// 3) 대량 치환(Phase 1: Glossary Lock only)
+// Replace (Phase 1 only)
 app.post("/v1/translate/replace", async (req, res) => {
   const schema = z.object({
     sessionId: z.string(),
     texts: z.array(z.string()).min(1).max(200),
-    // 세션 오용 방지: 검증용 필드(권장: 클라이언트가 항상 포함)
+
+    // 세션 오용 방지(권장: 항상 포함)
     category: z.string().optional(),
     sourceLang: z.string().optional(),
     targetLang: z.string().optional(),
+
     limit: z.number().int().min(1).max(200).optional(),
   });
 
@@ -583,13 +540,11 @@ app.post("/v1/translate/replace", async (req, res) => {
 
   const { session: s, expired } = getSessionOrExpire(sessionId);
   if (!s) {
-    if (expired) {
-      return res.status(410).json({ error: "Session expired. Call /v1/session/init again." });
-    }
+    if (expired) return res.status(410).json({ error: "Session expired. Call /v1/session/init again." });
     return res.status(404).json({ error: "Unknown sessionId. Call /v1/session/init first." });
   }
 
-  // 세션 메타 검증(409): 잘못된 sessionId 재사용 차단
+  // meta 검증(409)
   const reqCat = parsed.data.category;
   const reqSrc = parsed.data.sourceLang ? normalizeLang(parsed.data.sourceLang) : undefined;
   const reqTgt = parsed.data.targetLang ? normalizeLang(parsed.data.targetLang) : undefined;
@@ -613,11 +568,7 @@ app.post("/v1/translate/replace", async (req, res) => {
   for (const t of sliced) {
     const { output, hits } = applyReplacementsFast(t, s.map, s.regexChunks);
     if ((hits?.length ?? 0) === 0) noHitCount++;
-    results.push({
-      input: t,
-      output,
-      replacements: hits, // [{from,to}]
-    });
+    results.push({ input: t, output, replacements: hits });
   }
 
   return res.status(200).json({
@@ -635,8 +586,8 @@ app.post("/v1/translate/replace", async (req, res) => {
   });
 });
 
-// ---------------- (선택) MCP 유지: /mcp ----------------
-const mcp = new McpServer({ name: "sheets-glossary-mcp", version: "2.0.0" });
+// ---------------- MCP: /mcp ----------------
+const mcp = new McpServer({ name: "sheets-glossary-mcp", version: "3.0.0" });
 
 mcp.tool(
   "session_init",
@@ -705,7 +656,6 @@ mcp.tool(
       };
     }
 
-    // 메타 검증(선택)
     if (category !== undefined && normalizeCategory(category) !== normalizeCategory(s.category)) {
       return { content: [{ type: "text", text: JSON.stringify({ error: "Session/category mismatch." }, null, 2) }] };
     }
@@ -732,10 +682,9 @@ mcp.tool(
   }
 );
 
+// ✅ 406(Not Acceptable) 방지: Accept 헤더 보정
 app.all("/mcp", async (req, res) => {
   const accept = String(req.headers["accept"] ?? "").toLowerCase();
-
-  // 애매한 Accept는 강제로 MCP가 만족할 형태로 보정
   if (
     !accept ||
     accept.includes("*/*") ||
