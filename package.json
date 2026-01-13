@@ -3,11 +3,14 @@
   "version": "1.0.0",
   "type": "module",
   "description": "",
-"main": "server.mjs",
-"scripts": {
-  "start": "node server.mjs",
-  "test": "echo \"Error: no test specified\" && exit 1"
-},
+  "main": "server.mjs",
+  "scripts": {
+    "start": "node server.mjs",
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "engines": {
+    "node": "20.x"
+  },
   "keywords": [],
   "author": "",
   "license": "ISC",

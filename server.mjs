@@ -1,18 +1,24 @@
 /**
- * server.mjs
+ * server.mjs (Polished)
+ *
  * 목적:
- * - “대화형 웹 세션”에서 Glossary를 1회 로드(캐시)하고
+ * - “대화형 웹 세션”에서 Glossary를 1회 로드(세션 캐시)하고
  * - 사용자가 명시적으로 “Glossary 업데이트”를 요청하기 전까지
  *   동일 Glossary 기준으로 치환(Glossary Lock)만 수행
  *
- * 주요 엔드포인트:
- * - POST /v1/session/init            : 세션 생성 + Glossary 로드(카테고리/언어 기준)
- * - POST /v1/translate/replace       : 세션의 Glossary로 용어 치환 (ko-KR -> en-US)
- * - POST /v1/glossary/update         : 세션 Glossary 강제 갱신
- * - GET  /healthz                   : 헬스체크
+ * 엔드포인트:
+ * - GET  /              : 연결 확인(상태 JSON)
+ * - GET  /healthz       : Liveness (외부 의존성 없이 항상 200)
+ * - GET  /readyz        : Readiness (Sheets 연결/권한/범위 체크)
+ * - POST /v1/session/init      : 세션 생성 + Glossary 1회 로드
+ * - POST /v1/translate/replace : 세션 Glossary로 용어 치환(Phase 1)
+ * - POST /v1/glossary/update   : 세션 Glossary 강제 갱신
+ * - (옵션) /mcp         : MCP 연결 유지
  *
- * (선택) MCP 엔드포인트도 유지 가능: /mcp
- * - 필요 없다면 /mcp 블록은 삭제해도 됨
+ * 설계 포인트:
+ * - 서버 부팅 시점에는 외부 의존성(Sheets)을 강제하지 않음 → Cloud Run 안정성
+ * - /readyz에서만 실제 Sheets 호출로 “정상 연결” 확인 가능
+ * - Glossary는 세션 단위로 1회 로드 (요청마다 Sheets 재호출하지 않음)
  */
 
 import "dotenv/config";
@@ -28,10 +34,41 @@ import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/
 const PORT = Number(process.env.PORT || 8080);
 const SPREADSHEET_ID = process.env.SPREADSHEET_ID;
 const SHEET_NAME = process.env.SHEET_NAME || "Glossary";
+const GOOGLE_SERVICE_ACCOUNT_JSON = process.env.GOOGLE_SERVICE_ACCOUNT_JSON;
 
-if (!SPREADSHEET_ID) throw new Error("SPREADSHEET_ID is missing. Check env.");
-if (!process.env.GOOGLE_SERVICE_ACCOUNT_JSON)
-  throw new Error("GOOGLE_SERVICE_ACCOUNT_JSON is missing. Check env.");
+// “부팅 안정성”을 위해 여기서 throw 하지 않습니다.
+// 대신 /readyz 및 실제 로딩 시점에서 오류를 명확히 반환합니다.
+function envSummary() {
+  return {
+    PORT,
+    SPREADSHEET_ID: Boolean(SPREADSHEET_ID),
+    SHEET_NAME: SHEET_NAME || "",
+    GOOGLE_SERVICE_ACCOUNT_JSON: Boolean(GOOGLE_SERVICE_ACCOUNT_JSON),
+  };
+}
+
+// ---------------- Logging / Safety ----------------
+function nowIso() {
+  return new Date().toISOString();
+}
+
+function log(level, msg, extra = undefined) {
+  // Cloud Logging에서 구조화 로그로 보기 좋게 JSON 형태 유지
+  const base = { ts: nowIso(), level, msg };
+  if (extra !== undefined) {
+    console.log(JSON.stringify({ ...base, ...extra }));
+  } else {
+    console.log(JSON.stringify(base));
+  }
+}
+
+process.on("unhandledRejection", (err) => {
+  log("error", "unhandledRejection", { err: String(err?.stack || err) });
+});
+process.on("uncaughtException", (err) => {
+  log("error", "uncaughtException", { err: String(err?.stack || err) });
+  // 의도적으로 즉시 종료하지 않음 (Cloud Run에서 restart loop 방지 관점)
+});
 
 // ---------------- Helpers ----------------
 function normalizeHeader(h) {
@@ -53,10 +90,6 @@ function sha1(s) {
   return crypto.createHash("sha1").update(String(s)).digest("hex");
 }
 
-function nowIso() {
-  return new Date().toISOString();
-}
-
 function safeJsonParse(s, fallback = null) {
   try {
     return JSON.parse(s);
@@ -68,7 +101,7 @@ function safeJsonParse(s, fallback = null) {
 // 단순 치환(긴 term 우선) + 중복치환 방지(placeholder)
 function applyReplacements(text, pairs) {
   // pairs: [{ ko, en }]
-  if (!text || pairs.length === 0) {
+  if (!text || !pairs || pairs.length === 0) {
     return { output: text ?? "", hits: [] };
   }
 
@@ -101,9 +134,24 @@ function applyReplacements(text, pairs) {
   return { output: out, hits };
 }
 
-// ---------------- Sheets Reader (I:U only) ----------------
-async function readGlossaryIU() {
-  const serviceAccount = JSON.parse(process.env.GOOGLE_SERVICE_ACCOUNT_JSON);
+// ---------------- Google Sheets Client ----------------
+// 간단한 “프로세스 단위” 캐시: 매번 auth 생성 비용을 줄이기 위함
+let _sheetsClient = null;
+
+function getSheetsClientOrThrow() {
+  if (_sheetsClient) return _sheetsClient;
+
+  if (!SPREADSHEET_ID) {
+    throw new Error("SPREADSHEET_ID is missing. Check env.");
+  }
+  if (!GOOGLE_SERVICE_ACCOUNT_JSON) {
+    throw new Error("GOOGLE_SERVICE_ACCOUNT_JSON is missing. Check env.");
+  }
+
+  const serviceAccount = safeJsonParse(GOOGLE_SERVICE_ACCOUNT_JSON, null);
+  if (!serviceAccount) {
+    throw new Error("GOOGLE_SERVICE_ACCOUNT_JSON is not valid JSON.");
+  }
 
   const auth = new google.auth.GoogleAuth({
     credentials: serviceAccount,
@@ -111,6 +159,14 @@ async function readGlossaryIU() {
   });
 
   const sheets = google.sheets({ version: "v4", auth });
+
+  _sheetsClient = sheets;
+  return sheets;
+}
+
+// ---------------- Sheets Reader (I:U only) ----------------
+async function readGlossaryIU() {
+  const sheets = getSheetsClientOrThrow();
 
   // ✅ I~U만 읽음
   const range = `${SHEET_NAME}!I:U`;
@@ -127,7 +183,7 @@ async function readGlossaryIU() {
   const header = headerRaw.map(normalizeHeader);
   const body = rows.slice(1);
 
-  // 스크린샷 기준: I=분류, ... T=LEN, U=TERM (대소문자/위치 변동 가능)
+  // 스프레드시트 기준: I=분류, ... T=LEN, U=TERM (헤더 대소문자/위치 변동 가능)
   const idx = {
     category: header.indexOf("분류"),
     term: header.indexOf("term"),
@@ -135,9 +191,7 @@ async function readGlossaryIU() {
   };
 
   if (idx.term < 0) {
-    throw new Error(
-      "I:U 범위 헤더에 TERM(또는 term)이 없습니다. U열 헤더가 'TERM'인지 확인하세요."
-    );
+    throw new Error("I:U 범위 헤더에 TERM(또는 term)이 없습니다. U열 헤더가 'TERM'인지 확인하세요.");
   }
 
   // 언어 컬럼 인덱스 맵: 예) ko-kr, en-us ...
@@ -148,8 +202,7 @@ async function readGlossaryIU() {
     const h = header[i];
     if (!h) continue;
 
-    // 너무 엄격히 제한하지 않고 locale 형태(ko-kr 등)면 언어 컬럼로 인정
-    // 필요 시 제외 목록을 확장 가능
+    // locale 형태면 언어 컬럼로 인정
     if (/^[a-z]{2}(-[a-z]{2})?$/.test(h) || /^[a-z]{2}-[a-z]{2}$/.test(h)) {
       langIndex[h] = i;
     }
@@ -176,16 +229,16 @@ async function readGlossaryIU() {
 
 // ---------------- Session-Scoped Glossary Cache ----------------
 /**
- * 세션별 캐시 구조:
  * sessions.get(sessionId) = {
  *   createdAt,
  *   updatedAt,
  *   category,
  *   sourceLang,
  *   targetLang,
- *   glossaryVersion, // 업데이트 시각 기반
- *   map,             // Map<ko, en>
- *   pairsSorted      // [{ko,en}] 길이 내림차순 정렬 (치환용)
+ *   glossaryVersion,
+ *   map,             // Map<sourceTerm, targetTerm>
+ *   pairsSorted,     // [{ko,en}] length desc
+ *   termCount
  * }
  */
 const sessions = new Map();
@@ -195,7 +248,6 @@ function buildGlossaryMap(rows, category, sourceLang, targetLang) {
   const src = normalizeLang(sourceLang);
   const tgt = normalizeLang(targetLang);
 
-  // category가 비어있으면 전체 대상으로 하되, 실무에서는 category를 권장
   const filtered = rows.filter((r) => {
     if (!cat) return true;
     return normalizeCategory(r.category) === cat;
@@ -204,15 +256,14 @@ function buildGlossaryMap(rows, category, sourceLang, targetLang) {
   const map = new Map();
 
   for (const r of filtered) {
-    const ko = String(r.translations?.[src] ?? "").trim();
-    const en = String(r.translations?.[tgt] ?? "").trim();
-    if (!ko || !en) continue;
+    const srcTerm = String(r.translations?.[src] ?? "").trim();
+    const tgtTerm = String(r.translations?.[tgt] ?? "").trim();
+    if (!srcTerm || !tgtTerm) continue;
 
-    // 동일 ko가 중복될 경우: 먼저 들어온 것을 유지(정책 필요 시 변경)
-    if (!map.has(ko)) map.set(ko, en);
+    // 중복 sourceTerm 정책: 첫 값 유지
+    if (!map.has(srcTerm)) map.set(srcTerm, tgtTerm);
   }
 
-  // 긴 용어 우선 치환(부분 매칭/중첩 치환 감소)
   const pairsSorted = [...map.entries()]
     .map(([ko, en]) => ({ ko, en }))
     .sort((a, b) => b.ko.length - a.ko.length);
@@ -222,11 +273,12 @@ function buildGlossaryMap(rows, category, sourceLang, targetLang) {
 
 async function loadSessionGlossary(sessionId, { category, sourceLang, targetLang }) {
   const { data } = await readGlossaryIU();
-
   const built = buildGlossaryMap(data, category, sourceLang, targetLang);
 
+  const existing = sessions.get(sessionId);
+
   const session = {
-    createdAt: sessions.get(sessionId)?.createdAt ?? nowIso(),
+    createdAt: existing?.createdAt ?? nowIso(),
     updatedAt: nowIso(),
     category: category ?? "",
     sourceLang: normalizeLang(sourceLang),
@@ -241,32 +293,81 @@ async function loadSessionGlossary(sessionId, { category, sourceLang, targetLang
   return session;
 }
 
-function requireSession(req, res) {
-  const sessionId =
-    req.headers["x-session-id"] ||
-    req.body?.sessionId ||
-    req.query?.sessionId;
-
-  if (!sessionId) {
-    res.status(400).json({ error: "Missing sessionId. Provide X-Session-Id header or body.sessionId." });
-    return null;
-  }
-
-  const s = sessions.get(String(sessionId));
-  if (!s) {
-    res.status(404).json({ error: "Unknown sessionId. Call /v1/session/init first." });
-    return null;
-  }
-
-  return { sessionId: String(sessionId), session: s };
-}
-
 // ---------------- Express App ----------------
 const app = express();
+
+// body parsing
 app.use(express.json({ limit: "5mb", type: ["application/json", "application/*+json"] }));
 app.use(express.text({ limit: "5mb", type: ["text/*"] }));
 
-app.get("/healthz", (_req, res) => res.status(200).send("ok"));
+// 요청 로깅(필요 시 줄일 수 있음)
+app.use((req, _res, next) => {
+  log("info", "request", { method: req.method, path: req.path });
+  next();
+});
+
+// 0) Root: “연결 확인”용 상태 JSON (단순 OK가 아니라 의미 있는 진단 정보)
+app.get("/", (_req, res) => {
+  const uptimeSec = Math.floor(process.uptime());
+  const summary = envSummary();
+
+  res.status(200).json({
+    status: "OK",
+    service: "sheets-glossary-mcp",
+    time: nowIso(),
+    uptimeSec,
+    env: summary,
+    sessions: {
+      count: sessions.size,
+    },
+    endpoints: {
+      healthz: "/healthz",
+      readyz: "/readyz",
+      sessionInit: "/v1/session/init",
+      replace: "/v1/translate/replace",
+      glossaryUpdate: "/v1/glossary/update",
+    },
+  });
+});
+
+// 0-1) Liveness: 외부 의존성 없이 항상 OK
+app.get("/healthz", (_req, res) => res.status(200).send("OK"));
+
+// 0-2) Readiness: Sheets 연결/권한/범위 접근 확인
+app.get("/readyz", async (_req, res) => {
+  try {
+    // 최소 범위(I1:U1)만 읽어서 “연결”을 확인
+    const sheets = getSheetsClientOrThrow();
+    const range = `${SHEET_NAME}!I1:U1`;
+
+    const r = await sheets.spreadsheets.values.get({
+      spreadsheetId: SPREADSHEET_ID,
+      range,
+    });
+
+    const header = r?.data?.values?.[0] ?? [];
+
+    return res.status(200).json({
+      status: "OK",
+      sheets: {
+        spreadsheetIdPresent: Boolean(SPREADSHEET_ID),
+        sheetName: SHEET_NAME,
+        range,
+        headerCells: header.length,
+      },
+      time: nowIso(),
+    });
+  } catch (e) {
+    return res.status(500).json({
+      status: "NOT_READY",
+      error: String(e?.message || e),
+      env: envSummary(),
+      time: nowIso(),
+    });
+  }
+});
+
+// ---------------- API ----------------
 
 // 1) 세션 생성 + Glossary 1회 로드
 app.post("/v1/session/init", async (req, res) => {
@@ -274,7 +375,7 @@ app.post("/v1/session/init", async (req, res) => {
     category: z.string().optional().default(""),
     sourceLang: z.string().optional().default("ko-KR"),
     targetLang: z.string().optional().default("en-US"),
-    sessionId: z.string().optional(), // 외부에서 지정하고 싶으면 허용
+    sessionId: z.string().optional(),
   });
 
   const parsed = schema.safeParse(req.body ?? {});
@@ -283,11 +384,11 @@ app.post("/v1/session/init", async (req, res) => {
   }
 
   const { category, sourceLang, targetLang } = parsed.data;
-
   const sessionId = parsed.data.sessionId?.trim() || crypto.randomUUID();
 
   try {
     const session = await loadSessionGlossary(sessionId, { category, sourceLang, targetLang });
+
     return res.status(200).json({
       sessionId,
       category: session.category,
@@ -298,6 +399,7 @@ app.post("/v1/session/init", async (req, res) => {
       updatedAt: session.updatedAt,
     });
   } catch (e) {
+    log("error", "session_init_failed", { err: String(e?.stack || e) });
     return res.status(500).json({ error: String(e?.message || e) });
   }
 });
@@ -306,7 +408,6 @@ app.post("/v1/session/init", async (req, res) => {
 app.post("/v1/glossary/update", async (req, res) => {
   const schema = z.object({
     sessionId: z.string(),
-    // 변경 없이 단순 갱신도 가능. 필요하면 아래 값 생략
     category: z.string().optional(),
     sourceLang: z.string().optional(),
     targetLang: z.string().optional(),
@@ -327,6 +428,7 @@ app.post("/v1/glossary/update", async (req, res) => {
 
   try {
     const session = await loadSessionGlossary(sessionId, { category, sourceLang, targetLang });
+
     return res.status(200).json({
       sessionId,
       category: session.category,
@@ -337,6 +439,7 @@ app.post("/v1/glossary/update", async (req, res) => {
       updatedAt: session.updatedAt,
     });
   } catch (e) {
+    log("error", "glossary_update_failed", { err: String(e?.stack || e) });
     return res.status(500).json({ error: String(e?.message || e) });
   }
 });
@@ -345,8 +448,7 @@ app.post("/v1/glossary/update", async (req, res) => {
 app.post("/v1/translate/replace", async (req, res) => {
   const schema = z.object({
     sessionId: z.string(),
-    texts: z.array(z.string()).min(1).max(200), // 대화형 UX 기준: 50줄은 무난
-    // 출력 형식 옵션
+    texts: z.array(z.string()).min(1).max(200),
     limit: z.number().int().min(1).max(200).optional(),
   });
 
@@ -363,23 +465,16 @@ app.post("/v1/translate/replace", async (req, res) => {
   const sliced = texts.slice(0, limit);
 
   const results = [];
-  const missing = new Set();
+  let noHitCount = 0;
 
-  // 치환은 pairsSorted(긴 term 우선)로 수행
   for (const t of sliced) {
     const { output, hits } = applyReplacements(t, s.pairsSorted);
-
-    // “특이사항(미등록 용어)”을 완벽히 하려면 NER/토크나이즈가 필요하지만,
-    // 여기서는 “치환 히트가 0인 문장”에 대해 알림 수준으로만 수집
-    if ((hits?.length ?? 0) === 0) {
-      // 문장 전체를 missing으로 잡으면 노이즈가 크니, 일단 문장 인덱스만 표시하도록 둠
-      missing.add("(no glossary hit in some lines)");
-    }
+    if ((hits?.length ?? 0) === 0) noHitCount++;
 
     results.push({
       input: t,
       output,
-      replacements: hits, // 치환된 용어만 기록
+      replacements: hits,
     });
   }
 
@@ -390,15 +485,13 @@ app.post("/v1/translate/replace", async (req, res) => {
     sourceLang: s.sourceLang,
     targetLang: s.targetLang,
     results,
-    notes: missing.size ? [...missing] : [],
+    notes: noHitCount > 0 ? [`no glossary hit in ${noHitCount} line(s)`] : [],
   });
 });
 
 // ---------------- (선택) MCP 유지: /mcp ----------------
-// 기존 ChatGPT MCP 연결을 계속 쓸 경우에만 사용하세요.
 const mcp = new McpServer({ name: "sheets-glossary-mcp", version: "1.0.0" });
 
-// MCP에서 “세션 초기화”를 노출하고 싶으면 도구 추가 가능 (옵션)
 mcp.tool(
   "session_init",
   {
@@ -437,7 +530,6 @@ mcp.tool(
   }
 );
 
-// MCP에서 “대량 치환” 도구(옵션)
 mcp.tool(
   "replace_batch",
   {
@@ -461,24 +553,14 @@ mcp.tool(
       content: [
         {
           type: "text",
-          text: JSON.stringify(
-            {
-              sessionId,
-              glossaryVersion: s.glossaryVersion,
-              results,
-            },
-            null,
-            2
-          ),
+          text: JSON.stringify({ sessionId, glossaryVersion: s.glossaryVersion, results }, null, 2),
         },
       ],
     };
   }
 );
 
-// MCP 엔드포인트
 app.all("/mcp", async (req, res) => {
-  // body 파싱
   let body = req.body;
   if (typeof body === "string") body = safeJsonParse(body, body);
 
@@ -489,7 +571,17 @@ app.all("/mcp", async (req, res) => {
   await transport.handleRequest(req, res, body);
 });
 
+// ---------------- 404 / Error Handling ----------------
+app.use((_req, res) => {
+  res.status(404).json({ error: "Not Found" });
+});
+
+app.use((err, _req, res, _next) => {
+  log("error", "express_error", { err: String(err?.stack || err) });
+  res.status(500).json({ error: "Internal Server Error" });
+});
+
 // ---------------- Start ----------------
 app.listen(PORT, () => {
-  console.log(`API listening on :${PORT}`);
+  log("info", "server_started", { port: PORT, env: envSummary() });
 });
