@@ -1,462 +1,297 @@
 import "dotenv/config";
 import express from "express";
-import crypto from "crypto";
 import { google } from "googleapis";
 import { z } from "zod";
+
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 
 const PORT = Number(process.env.PORT || 8080);
 const SPREADSHEET_ID = process.env.SPREADSHEET_ID;
 const SHEET_NAME = process.env.SHEET_NAME || "Glossary";
-const GOOGLE_SERVICE_ACCOUNT_JSON = process.env.GOOGLE_SERVICE_ACCOUNT_JSON;
-const GLOSSARY_RANGE = process.env.GLOSSARY_RANGE || `${SHEET_NAME}!A:AA`;
 
-const SESSION_IDLE_TTL_MS = Number(process.env.SESSION_IDLE_TTL_MS || 30 * 60 * 1000);
-const SESSION_MAX_TTL_MS = Number(process.env.SESSION_MAX_TTL_MS || 6 * 60 * 60 * 1000);
-const MAX_PATTERN_LEN = Number(process.env.MAX_PATTERN_LEN || 50000);
+if (!SPREADSHEET_ID) throw new Error("SPREADSHEET_ID is missing. Check env.");
+if (!process.env.GOOGLE_SERVICE_ACCOUNT_JSON)
+  throw new Error("GOOGLE_SERVICE_ACCOUNT_JSON is missing. Check env.");
 
-const nowIso = () => new Date().toISOString();
-const nowMs = () => Date.now();
-const log = (level, msg, extra) => console.log(JSON.stringify({ ts: nowIso(), level, msg, ...(extra || {}) }));
-
-process.on("unhandledRejection", (e) => log("error", "unhandledRejection", { err: String(e?.stack || e) }));
-process.on("uncaughtException", (e) => log("error", "uncaughtException", { err: String(e?.stack || e) }));
-
-const normHeader = (s) => String(s ?? "").trim().toLowerCase();
-const normLang = (s) => String(s ?? "").trim().toLowerCase().replace(/_/g, "-");
-const normCat = (s) => String(s ?? "").trim().toLowerCase();
-const safeJson = (s, fb = null) => {
-  try { return JSON.parse(s); } catch { return fb; }
-};
-const sha256 = (s) => crypto.createHash("sha256").update(String(s)).digest("hex");
-const escRe = (s) => String(s).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-
-let _sheets = null;
-function sheetsClient() {
-  if (_sheets) return _sheets;
-  if (!SPREADSHEET_ID) throw new Error("SPREADSHEET_ID is missing.");
-  if (!GOOGLE_SERVICE_ACCOUNT_JSON) throw new Error("GOOGLE_SERVICE_ACCOUNT_JSON is missing.");
-  const creds = safeJson(GOOGLE_SERVICE_ACCOUNT_JSON);
-  if (!creds) throw new Error("GOOGLE_SERVICE_ACCOUNT_JSON is not valid JSON.");
-  const auth = new google.auth.GoogleAuth({
-    credentials: creds,
-    scopes: ["https://www.googleapis.com/auth/spreadsheets.readonly"],
-  });
-  _sheets = google.sheets({ version: "v4", auth });
-  return _sheets;
+// ---------------- Helpers ----------------
+function normalize(h) {
+  return String(h ?? "").trim().toLowerCase();
 }
 
-const findHeaderIdx = (hn, candidates, contains = false) => {
-  if (!contains) {
-    for (const c of candidates) {
-      const i = hn.indexOf(c);
-      if (i >= 0) return i;
+function getParsedBody(req) {
+  if (req.body == null) return undefined;
+  if (typeof req.body === "string") {
+    try {
+      return JSON.parse(req.body);
+    } catch {
+      return req.body;
     }
-    return -1;
   }
-  for (let i = 0; i < hn.length; i++) {
-    const h = hn[i] || "";
-    for (const c of candidates) if (h.includes(c)) return i;
-  }
-  return -1;
-};
+  return req.body;
+}
 
-async function readGlossary() {
-  const res = await sheetsClient().spreadsheets.values.get({ spreadsheetId: SPREADSHEET_ID, range: GLOSSARY_RANGE });
+/**
+ * lang 문자열을 시트 헤더 형태로 정규화 (예: "ko", "ko-kr", "ko_KR" -> "ko-kr")
+ */
+function normalizeLang(lang) {
+  if (!lang) return "";
+  return String(lang).trim().toLowerCase().replace("_", "-");
+}
+
+/**
+ * I~U 범위에서 language 컬럼 후보를 반환 (분류/len/term/notes 제외)
+ */
+function isLanguageHeader(h) {
+  const x = normalize(h);
+  if (!x) return false;
+  // 제외 목록: 분류/term/len/notes/비고성 컬럼(프로젝트 상황에 맞춰 추가 가능)
+  const excluded = new Set([
+    "분류",
+    "category",
+    "term",
+    "len",
+    "length",
+    "note",
+    "notes",
+    "번역메모",
+    "클리펀트",
+  ]);
+  if (excluded.has(x)) return false;
+
+  // 언어 컬럼은 보통 ko-kr, en-us, zh-cn 같은 형태이거나 locale 코드
+  // 너무 엄격히 제한하지 않고, 제외 목록에만 걸리지 않으면 후보로 둠
+  return true;
+}
+
+// ---------------- Google Sheets (I~U only) ----------------
+async function readGlossaryIU() {
+  const serviceAccount = JSON.parse(process.env.GOOGLE_SERVICE_ACCOUNT_JSON);
+
+  const auth = new google.auth.GoogleAuth({
+    credentials: serviceAccount,
+    scopes: ["https://www.googleapis.com/auth/spreadsheets.readonly"],
+  });
+
+  const sheets = google.sheets({ version: "v4", auth });
+
+  // ✅ 핵심: I~U만 읽음
+  const range = `${SHEET_NAME}!I:U`;
+
+  const res = await sheets.spreadsheets.values.get({
+    spreadsheetId: SPREADSHEET_ID,
+    range,
+  });
+
   const rows = res.data.values || [];
-  if (rows.length < 2) return { headerRaw: [], headerNorm: [], data: [] };
+  if (rows.length < 2) return { header: [], data: [] };
 
-  const headerRaw = rows[0].map((h) => String(h ?? "").trim());
-  const headerNorm = headerRaw.map(normHeader);
+  const header = rows[0].map((h) => String(h ?? "").trim());
   const body = rows.slice(1);
 
-  const idxCategory = findHeaderIdx(headerNorm, ["분류", "category", "cat"], true);
-  const idxTerm = findHeaderIdx(headerNorm, ["term"], true);
-  const idxLen = findHeaderIdx(headerNorm, ["len"], false);
+  // I~U 내부에 있는 헤더만으로 매핑
+  const normHeader = header.map(normalize);
 
-  if (idxTerm < 0) throw new Error("TERM header not found (expected header containing 'TERM').");
+  // 스크린샷 기준: I=분류, J=ko-KR, ... T=LEN, U=TERM
+  const idx = {
+    category: normHeader.indexOf("분류"),
+    term: normHeader.indexOf("term"), // "TERM"
+    len: normHeader.indexOf("len"),   // "LEN"
+    notes: normHeader.indexOf("note") >= 0 ? normHeader.indexOf("note") : normHeader.indexOf("notes"),
+  };
 
+  // 최소 요구: TERM, 분류는 없어도 동작하게(필터만 못 함)
+  if (idx.term < 0) {
+    throw new Error(
+      "I:U 범위 헤더에 TERM(또는 term)이 없습니다. U열 헤더가 'TERM'인지 확인하세요."
+    );
+  }
+
+  // 언어 컬럼 인덱스 맵 생성
   const langIndex = {};
-  for (let i = 0; i < headerNorm.length; i++) {
-    if (i === idxTerm || i === idxLen || i === idxCategory) continue;
-    const h = headerNorm[i];
-    if (!h) continue;
-    if (/^[a-z]{2}(-[a-z0-9]{2,8}){0,2}$/.test(h)) langIndex[h] = i;
+  for (let i = 0; i < normHeader.length; i++) {
+    const hRaw = header[i];
+    const hNorm = normHeader[i];
+
+    // TERM/LEN/분류/notes류는 제외하고 언어 후보만
+    if (i === idx.term || i === idx.len || i === idx.category) continue;
+    if (hNorm === "note" || hNorm === "notes" || hNorm === "번역메모" || hNorm === "클리펀트") continue;
+
+    if (isLanguageHeader(hRaw)) {
+      langIndex[hNorm] = i;
+    }
   }
 
   const data = body
     .map((r) => {
-      const term = String(r[idxTerm] ?? "").trim();
-      const category = idxCategory >= 0 ? String(r[idxCategory] ?? "").trim() : "";
-      const len = idxLen >= 0 ? String(r[idxLen] ?? "").trim() : "";
+      const term = String(r[idx.term] ?? "").trim();
+      const category = idx.category >= 0 ? String(r[idx.category] ?? "").trim() : "";
+      const len = idx.len >= 0 ? String(r[idx.len] ?? "").trim() : "";
+      const notes =
+        idx.notes >= 0 ? String(r[idx.notes] ?? "").trim() : "";
+
+      // 언어별 값
       const translations = {};
-      for (const [lk, ci] of Object.entries(langIndex)) {
-        const v = String(r[ci] ?? "").trim();
-        if (v) translations[lk] = v;
+      for (const [langKey, colIdx] of Object.entries(langIndex)) {
+        const v = String(r[colIdx] ?? "").trim();
+        if (v) translations[langKey] = v;
       }
-      return { term, category, len, translations };
+
+      return { term, category, len, notes, translations };
     })
-    .filter((x) => x.term || Object.keys(x.translations || {}).length > 0);
+    .filter((x) => x.term); // term 없는 행 제거
 
-  return { headerRaw, headerNorm, data };
+  return { header, data };
 }
 
-function compileReplacers(map) {
-  const keys = [...map.keys()].filter((k) => k && String(k).length);
-  if (!keys.length) return { chunks: [], keyCount: 0 };
+// ---------------- MCP Server ----------------
+const mcp = new McpServer({
+  name: "sheets-glossary-mcp",
+  version: "0.4.0",
+});
 
-  keys.sort((a, b) => b.length - a.length);
-  const chunks = [];
-  let buf = [];
-  let bufLen = 0;
+/**
+ * ✅ get_glossary
+ * - category(=분류)로 필터 가능
+ * - lang 지정 시 해당 언어 번역만 반환 (예: ko-kr, en-us)
+ * - lang 미지정 시 I~U에 있는 언어 컬럼을 가능한 한 모두 반환
+ */
+mcp.tool(
+  "get_glossary",
+  {
+    category: z.string().optional(), // 분류 필터
+    lang: z.string().optional(),     // "ko-KR" 등
+  },
+  async ({ category, lang }) => {
+    const { data } = await readGlossaryIU();
 
-  for (const k of keys) {
-    const ek = escRe(k);
-    const addLen = ek.length + (buf.length ? 1 : 0);
-    if (bufLen + addLen > MAX_PATTERN_LEN && buf.length) {
-      chunks.push(new RegExp(buf.join("|"), "g"));
-      buf = [];
-      bufLen = 0;
-    }
-    buf.push(ek);
-    bufLen += addLen;
-  }
-  if (buf.length) chunks.push(new RegExp(buf.join("|"), "g"));
-  return { chunks, keyCount: keys.length };
-}
+    const cat = category ? String(category).trim().toLowerCase() : "";
+    const langKey = lang ? normalizeLang(lang) : "";
 
-function applyReplace(text, map, chunks) {
-  const src = String(text ?? "");
-  if (!src || !map?.size || !chunks?.length) return { output: src, hits: [] };
-  const hit = new Set();
-  let out = src;
-  for (const re of chunks) {
-    out = out.replace(re, (m) => {
-      const rep = map.get(m);
-      if (rep !== undefined) { hit.add(m); return rep; }
-      return m;
+    const filtered = data.filter((row) => {
+      if (!cat) return true;
+      return String(row.category ?? "").trim().toLowerCase() === cat;
     });
+
+    const out = filtered.map((row) => {
+      if (!langKey) {
+        // 언어 미지정: 가능한 번역 전체 반환
+        return {
+          term: row.term,
+          category: row.category || undefined,
+          len: row.len || undefined,
+          notes: row.notes || undefined,
+          translations: row.translations,
+        };
+      }
+
+      // 언어 지정: 해당 언어만(없으면 빈 문자열)
+      return {
+        term: row.term,
+        category: row.category || undefined,
+        len: row.len || undefined,
+        notes: row.notes || undefined,
+        translation: row.translations?.[langKey] ?? "",
+        lang: langKey,
+      };
+    });
+
+    return {
+      content: [{ type: "text", text: JSON.stringify(out, null, 2) }],
+    };
   }
-  return { output: out, hits: [...hit].map((k) => ({ from: k, to: map.get(k) })) };
-}
+);
 
-function buildGlossaryDual(rows, category, sourceLang, targetLang) {
-  const cat = normCat(category);
-  const src = normLang(sourceLang);
-  const tgt = normLang(targetLang);
+/**
+ * ✅ lookup_term
+ * - term(=TERM) 정확 일치 조회
+ * - category(=분류) 옵션 필터
+ * - lang 지정 시 해당 언어만
+ */
+mcp.tool(
+  "lookup_term",
+  {
+    term: z.string(),
+    category: z.string().optional(),
+    lang: z.string().optional(),
+  },
+  async ({ term, category, lang }) => {
+    const { data } = await readGlossaryIU();
 
-  const filtered = rows.filter((r) => !cat || normCat(r.category) === cat);
+    const t = String(term).trim().toLowerCase();
+    const cat = category ? String(category).trim().toLowerCase() : "";
+    const langKey = lang ? normalizeLang(lang) : "";
 
-  const primary = new Map();
-  const secondary = new Map();
-  let dupP = 0, dupS = 0, fromSrc = 0, fromTerm = 0;
+    const hit = data.find((row) => {
+      if (String(row.term).trim().toLowerCase() !== t) return false;
+      if (!cat) return true;
+      return String(row.category ?? "").trim().toLowerCase() === cat;
+    });
 
-  for (const r of filtered) {
-    const termKey = String(r.term ?? "").trim();
-    const srcKey = String(r.translations?.[src] ?? "").trim();
-    const tgtVal = String(r.translations?.[tgt] ?? "").trim();
-    if (!tgtVal) continue;
+    const result = !hit
+      ? null
+      : !langKey
+        ? {
+            term: hit.term,
+            category: hit.category || undefined,
+            len: hit.len || undefined,
+            notes: hit.notes || undefined,
+            translations: hit.translations,
+          }
+        : {
+            term: hit.term,
+            category: hit.category || undefined,
+            len: hit.len || undefined,
+            notes: hit.notes || undefined,
+            lang: langKey,
+            translation: hit.translations?.[langKey] ?? "",
+          };
 
-    if (srcKey) { if (primary.has(srcKey)) dupP++; primary.set(srcKey, tgtVal); fromSrc++; }
-    if (termKey) { if (secondary.has(termKey)) dupS++; secondary.set(termKey, tgtVal); fromTerm++; }
+    return {
+      content: [
+        {
+          type: "text",
+          text: JSON.stringify(
+            { found: Boolean(hit), result },
+            null,
+            2
+          ),
+        },
+      ],
+    };
   }
+);
 
-  const merged = new Map(secondary);
-  for (const [k, v] of primary.entries()) merged.set(k, v);
-
-  const { chunks } = compileReplacers(merged);
-  const entries = [...merged.entries()].sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0));
-
-  return {
-    map: merged,
-    regexChunks: chunks,
-    termCount: merged.size,
-    versionEntries: entries,
-    stats: { duplicates: { primary: dupP, secondary: dupS }, fromSourceLangKeys: fromSrc, fromTermKeys: fromTerm },
-  };
-}
-
-const sessions = new Map();
-
-const expiry = (createdAtMs, lastUsedAtMs) => {
-  const maxExpiresAtMs = createdAtMs + SESSION_MAX_TTL_MS;
-  const idleExpiresAtMs = (lastUsedAtMs ?? nowMs()) + SESSION_IDLE_TTL_MS;
-  const expiresAtMs = Math.min(idleExpiresAtMs, maxExpiresAtMs);
-  return { expiresAtMs, maxExpiresAtMs };
-};
-
-const touch = (s) => {
-  const t = nowMs();
-  s.lastUsedAtMs = t;
-  s.updatedAtMs = t;
-  const { expiresAtMs, maxExpiresAtMs } = expiry(s.createdAtMs, s.lastUsedAtMs);
-  s.expiresAtMs = expiresAtMs;
-  s.maxExpiresAtMs = maxExpiresAtMs;
-};
-
-const getSession = (id) => {
-  const s = sessions.get(id);
-  if (!s) return { session: null, expired: false };
-  const t = nowMs();
-  if (t > s.expiresAtMs || t > s.maxExpiresAtMs) { sessions.delete(id); return { session: null, expired: true }; }
-  touch(s);
-  return { session: s, expired: false };
-};
-
-async function loadSession(sessionId, { category, sourceLang, targetLang }) {
-  const { data } = await readGlossary();
-  const built = buildGlossaryDual(data, category, sourceLang, targetLang);
-
-  const existing = sessions.get(sessionId);
-  const createdAtMs = existing?.createdAtMs ?? nowMs();
-
-  const glossaryVersion = sha256(
-    JSON.stringify({
-      category: category ?? "",
-      sourceLang: normLang(sourceLang),
-      targetLang: normLang(targetLang),
-      entries: built.versionEntries,
-    })
-  ).slice(0, 16);
-
-  const s = {
-    createdAtMs,
-    updatedAtMs: nowMs(),
-    lastUsedAtMs: nowMs(),
-    expiresAtMs: 0,
-    maxExpiresAtMs: 0,
-    category: category ?? "",
-    sourceLang: normLang(sourceLang),
-    targetLang: normLang(targetLang),
-    glossaryVersion,
-    map: built.map,
-    regexChunks: built.regexChunks,
-    termCount: built.termCount,
-    stats: built.stats,
-  };
-
-  Object.assign(s, expiry(s.createdAtMs, s.lastUsedAtMs));
-  sessions.set(sessionId, s);
-  return s;
-}
-
-// ---------------- HTTP ----------------
+// ---------------- HTTP App ----------------
 const app = express();
-app.use(express.json({ limit: "5mb", type: ["application/json", "application/*+json"] }));
-app.use(express.text({ limit: "5mb", type: ["text/*"] }));
-app.use((req, _res, next) => { log("info", "request", { method: req.method, path: req.path }); next(); });
 
-app.get("/", (_req, res) => {
-  res.status(200).json({
-    status: "OK",
-    service: "sheets-glossary-mcp",
-    time: nowIso(),
-    uptimeSec: Math.floor(process.uptime()),
-    env: {
-      PORT,
-      SPREADSHEET_ID: Boolean(SPREADSHEET_ID),
-      SHEET_NAME,
-      GLOSSARY_RANGE,
-      GOOGLE_SERVICE_ACCOUNT_JSON: Boolean(GOOGLE_SERVICE_ACCOUNT_JSON),
-      SESSION_IDLE_TTL_MS,
-      SESSION_MAX_TTL_MS,
-      MAX_PATTERN_LEN,
-    },
-    sessions: { count: sessions.size },
-    endpoints: {
-      healthz: "/healthz",
-      readyz: "/readyz",
-      sessionInit: "/v1/session/init",
-      replace: "/v1/translate/replace",
-      glossaryUpdate: "/v1/glossary/update",
-      mcp: "/mcp",
-    },
-  });
-});
-
-app.get("/healthz", (_req, res) => res.status(200).send("OK"));
-
-app.get("/readyz", async (_req, res) => {
-  try {
-    const range = `${SHEET_NAME}!A1:AA1`;
-    const r = await sheetsClient().spreadsheets.values.get({ spreadsheetId: SPREADSHEET_ID, range });
-    const header = r?.data?.values?.[0] ?? [];
-    res.status(200).json({
-      status: "OK",
-      sheets: { spreadsheetIdPresent: Boolean(SPREADSHEET_ID), sheetName: SHEET_NAME, range, headerCells: header.length },
-      time: nowIso(),
-    });
-  } catch (e) {
-    res.status(500).json({ status: "NOT_READY", error: String(e?.message || e), time: nowIso() });
-  }
-});
-
-app.post("/v1/session/init", async (req, res) => {
-  const schema = z.object({
-    category: z.string().optional().default(""),
-    sourceLang: z.string().optional().default("ko-KR"),
-    targetLang: z.string().optional().default("en-US"),
-    sessionId: z.string().optional(),
-  });
-  const p = schema.safeParse(req.body ?? {});
-  if (!p.success) return res.status(400).json({ error: p.error.flatten() });
-
-  const sessionId = p.data.sessionId?.trim() || crypto.randomUUID();
-  try {
-    const s = await loadSession(sessionId, p.data);
-    res.status(200).json({
-      sessionId,
-      category: s.category,
-      sourceLang: s.sourceLang,
-      targetLang: s.targetLang,
-      glossaryVersion: s.glossaryVersion,
-      termCount: s.termCount,
-      updatedAt: new Date(s.updatedAtMs).toISOString(),
-      expiresAt: new Date(s.expiresAtMs).toISOString(),
-      maxExpiresAt: new Date(s.maxExpiresAtMs).toISOString(),
-      stats: s.stats,
-    });
-  } catch (e) {
-    log("error", "session_init_failed", { err: String(e?.stack || e) });
-    res.status(500).json({ error: "Internal Server Error" });
-  }
-});
-
-app.post("/v1/glossary/update", async (req, res) => {
-  const schema = z.object({
-    sessionId: z.string(),
-    category: z.string().optional(),
-    sourceLang: z.string().optional(),
-    targetLang: z.string().optional(),
-  });
-  const p = schema.safeParse(req.body ?? {});
-  if (!p.success) return res.status(400).json({ error: p.error.flatten() });
-
-  const cur = sessions.get(p.data.sessionId);
-  if (!cur) return res.status(404).json({ error: "Unknown sessionId." });
-
-  const category = p.data.category ?? cur.category;
-  const sourceLang = p.data.sourceLang ?? cur.sourceLang;
-  const targetLang = p.data.targetLang ?? cur.targetLang;
-
-  try {
-    const s = await loadSession(p.data.sessionId, { category, sourceLang, targetLang });
-    res.status(200).json({
-      sessionId: p.data.sessionId,
-      category: s.category,
-      sourceLang: s.sourceLang,
-      targetLang: s.targetLang,
-      glossaryVersion: s.glossaryVersion,
-      termCount: s.termCount,
-      updatedAt: new Date(s.updatedAtMs).toISOString(),
-      expiresAt: new Date(s.expiresAtMs).toISOString(),
-      maxExpiresAt: new Date(s.maxExpiresAtMs).toISOString(),
-      stats: s.stats,
-    });
-  } catch (e) {
-    log("error", "glossary_update_failed", { err: String(e?.stack || e) });
-    res.status(500).json({ error: "Internal Server Error" });
-  }
-});
-
-app.post("/v1/translate/replace", async (req, res) => {
-  const schema = z.object({
-    sessionId: z.string(),
-    texts: z.array(z.string()).min(1).max(200),
-    category: z.string().optional(),
-    sourceLang: z.string().optional(),
-    targetLang: z.string().optional(),
-    limit: z.number().int().min(1).max(200).optional(),
-  });
-  const p = schema.safeParse(req.body ?? {});
-  if (!p.success) return res.status(400).json({ error: p.error.flatten() });
-
-  const { session: s, expired } = getSession(p.data.sessionId);
-  if (!s) return res.status(expired ? 410 : 404).json({ error: expired ? "Session expired. Re-init required." : "Unknown sessionId." });
-
-  const reqCat = p.data.category;
-  const reqSrc = p.data.sourceLang ? normLang(p.data.sourceLang) : undefined;
-  const reqTgt = p.data.targetLang ? normLang(p.data.targetLang) : undefined;
-
-  if (reqCat !== undefined && normCat(reqCat) !== normCat(s.category)) return res.status(409).json({ error: "Session/category mismatch." });
-  if (reqSrc !== undefined && reqSrc !== s.sourceLang) return res.status(409).json({ error: "Session/sourceLang mismatch." });
-  if (reqTgt !== undefined && reqTgt !== s.targetLang) return res.status(409).json({ error: "Session/targetLang mismatch." });
-
-  const sliced = p.data.texts.slice(0, p.data.limit ?? p.data.texts.length);
-  const results = [];
-  let noHit = 0;
-
-  for (const t of sliced) {
-    const { output, hits } = applyReplace(t, s.map, s.regexChunks);
-    if (!hits.length) noHit++;
-    results.push({ input: t, output, replacements: hits });
-  }
-
-  res.status(200).json({
-    sessionId: p.data.sessionId,
-    glossaryVersion: s.glossaryVersion,
-    category: s.category,
-    sourceLang: s.sourceLang,
-    targetLang: s.targetLang,
-    termCount: s.termCount,
-    updatedAt: new Date(s.updatedAtMs).toISOString(),
-    expiresAt: new Date(s.expiresAtMs).toISOString(),
-    maxExpiresAt: new Date(s.maxExpiresAtMs).toISOString(),
-    results,
-    notes: noHit ? [`no glossary hit in ${noHit} line(s)`] : [],
-  });
-});
-
-// ---------------- MCP ----------------
-const mcp = new McpServer({ name: "sheets-glossary-mcp", version: "4.0.0" });
-
-mcp.tool(
-  "session_init",
-  { category: z.string().optional(), sourceLang: z.string().optional(), targetLang: z.string().optional() },
-  async ({ category, sourceLang, targetLang }) => {
-    const sessionId = crypto.randomUUID();
-    const s = await loadSession(sessionId, { category: category ?? "", sourceLang: sourceLang ?? "ko-KR", targetLang: targetLang ?? "en-US" });
-    return { content: [{ type: "text", text: JSON.stringify({ sessionId, category: s.category, sourceLang: s.sourceLang, targetLang: s.targetLang, glossaryVersion: s.glossaryVersion, termCount: s.termCount, updatedAt: new Date(s.updatedAtMs).toISOString(), expiresAt: new Date(s.expiresAtMs).toISOString(), stats: s.stats }, null, 2) }] };
-  }
+app.use(
+  express.json({
+    limit: "2mb",
+    type: ["application/json", "application/*+json"],
+  })
 );
+app.use(express.text({ limit: "2mb", type: ["text/*"] }));
 
-mcp.tool(
-  "replace_batch",
-  { sessionId: z.string(), texts: z.array(z.string()).min(1).max(200), category: z.string().optional(), sourceLang: z.string().optional(), targetLang: z.string().optional() },
-  async ({ sessionId, texts, category, sourceLang, targetLang }) => {
-    const { session: s, expired } = getSession(sessionId);
-    if (!s) return { content: [{ type: "text", text: JSON.stringify({ error: expired ? "Session expired. Re-init required." : "Unknown sessionId" }, null, 2) }] };
-
-    if (category !== undefined && normCat(category) !== normCat(s.category)) return { content: [{ type: "text", text: JSON.stringify({ error: "Session/category mismatch." }, null, 2) }] };
-    if (sourceLang !== undefined && normLang(sourceLang) !== s.sourceLang) return { content: [{ type: "text", text: JSON.stringify({ error: "Session/sourceLang mismatch." }, null, 2) }] };
-    if (targetLang !== undefined && normLang(targetLang) !== s.targetLang) return { content: [{ type: "text", text: JSON.stringify({ error: "Session/targetLang mismatch." }, null, 2) }] };
-
-    const results = texts.map((t) => {
-      const { output, hits } = applyReplace(t, s.map, s.regexChunks);
-      return { input: t, output, replacements: hits };
-    });
-    return { content: [{ type: "text", text: JSON.stringify({ sessionId, glossaryVersion: s.glossaryVersion, results }, null, 2) }] };
-  }
-);
-
-// Accept 보정(406 방지)
+// MCP endpoint
 app.all("/mcp", async (req, res) => {
-  const accept = String(req.headers["accept"] ?? "").toLowerCase();
-  if (!accept || accept.includes("*/*") || (accept.includes("application/json") && !accept.includes("text/event-stream"))) {
-    req.headers["accept"] = "text/event-stream, application/json";
-  }
-  let body = req.body;
-  if (typeof body === "string") body = safeJson(body, body);
+  const transport = new StreamableHTTPServerTransport({
+    enableJsonResponse: true,
+  });
 
-  const transport = new StreamableHTTPServerTransport({ enableJsonResponse: true });
-  res.on("close", () => transport.close());
+  res.on("close", () => {
+    transport.close();
+  });
 
   await mcp.connect(transport);
+
+  const body = getParsedBody(req);
   await transport.handleRequest(req, res, body);
 });
 
-app.use((_req, res) => res.status(404).json({ error: "Not Found" }));
-app.use((err, _req, res, _next) => { log("error", "express_error", { err: String(err?.stack || err) }); res.status(500).json({ error: "Internal Server Error" }); });
+// health check
+app.get("/", (_req, res) => res.status(200).send("ok"));
 
-app.listen(PORT, () => log("info", "server_started", { port: PORT }));
+app.listen(PORT, () => {
+  console.log(`MCP server listening on :${PORT} (endpoint: /mcp)`);
+});
