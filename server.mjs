@@ -2,38 +2,18 @@ import "dotenv/config";
 import express from "express";
 import crypto from "crypto";
 import { google } from "googleapis";
+import { z } from "zod";
 
-/**
- * ============================================================
- * Sheets Glossary Replace Server (Cloud Run, Node.js ESM)
- *
- * 핵심 요구사항 반영:
- * - Glossary는 "세션당 1회" 로드하고, 사용자가 업데이트 요청 전까지 고정
- * - TERM(V열)은 완전히 무시 (ko-KR과 동일하므로)
- * - 행이 5000개면 5000개를 "온전히" 로드 (중복 제거/필터로 삭제하지 않음)
- * - 치환은 category + ko-KR 기준으로 수행 (Phase 1)
- * - 대량 texts[]를 한번에 처리
- *
- * 엔드포인트:
- * - POST /v1/session/init
- * - POST /v1/translate/replace
- * - POST /v1/glossary/update
- * - GET  /healthz
- * ============================================================
- */
+import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 
 const PORT = Number(process.env.PORT || 8080);
 const SPREADSHEET_ID = process.env.SPREADSHEET_ID;
 const SHEET_NAME = process.env.SHEET_NAME || "Glossary";
 
 /**
- * 사용자 시트 구조(스크린샷 기준):
- * A: KEY
- * I: 분류
- * K~U: 국가별 번역 데이터(ko-KR 포함)
- * V: TERM (사용 안 함)
- *
- * ✅ TERM을 완전히 무시하므로 범위는 A:U까지만 읽습니다.
+ * ✅ TERM(V열) 무시: A~U만 읽음
+ * (A=KEY, I=분류, K~U=언어 데이터)
  */
 const SHEET_RANGE = process.env.SHEET_RANGE || `${SHEET_NAME}!A:U`;
 
@@ -54,6 +34,17 @@ function escapeRegExp(s) {
 }
 function newSessionId() {
   return crypto.randomUUID?.() ?? crypto.randomBytes(16).toString("hex");
+}
+function getParsedBody(req) {
+  if (req.body == null) return undefined;
+  if (typeof req.body === "string") {
+    try {
+      return JSON.parse(req.body);
+    } catch {
+      return req.body;
+    }
+  }
+  return req.body;
 }
 
 // ---------------- Google Sheets Read ----------------
@@ -82,10 +73,9 @@ async function readSheetRange() {
 }
 
 /**
- * Glossary 로드 (A:U)
- * - ✅ 행 삭제/중복 제거 없음: "온전히" 로드
+ * Glossary 전체 로드 (중복 제거/필터 제거 없이 "온전히" 로드)
  * - 필수 헤더: KEY, 분류, ko-KR
- * - TERM은 범위에 없고, 설령 있어도 사용하지 않음
+ * - TERM은 읽지 않음(범위에 없음)
  */
 async function loadGlossaryAll() {
   const { header, rows } = await readSheetRange();
@@ -101,22 +91,18 @@ async function loadGlossaryAll() {
 
   const norm = header.map(normalizeHeader);
 
-  // KEY / 분류 인덱스 (헤더명 기준)
   const idxKey = norm.indexOf("key");
-  const idxCategory = norm.indexOf("분류"); // 사용 시트가 "분류"로 되어 있다고 가정
+  const idxCategory = norm.indexOf("분류"); // 시트 헤더가 '분류'라고 가정
 
   if (idxKey < 0) throw new Error("헤더에 KEY가 없습니다. A열 헤더가 'KEY'인지 확인하세요.");
   if (idxCategory < 0)
     throw new Error("헤더에 분류가 없습니다. I열 헤더가 '분류'인지 확인하세요.");
 
-  // 언어 컬럼 인덱스 맵 생성
-  // - A:U 범위 내의 언어 컬럼(ko-kr, en-us, zh-cn, ...)을 헤더 기반으로 매핑
-  // - 비언어 컬럼은 제외 목록으로 제거
   const excluded = new Set([
     "key",
     "분류",
     "category",
-    "term", // 혹시 범위 안에 있어도 제외
+    "term",
     "len",
     "length",
     "gt_lang",
@@ -138,37 +124,32 @@ async function loadGlossaryAll() {
     const h = norm[i];
     if (!h) continue;
     if (excluded.has(h)) continue;
-    langIndex[h] = i; // ex) "ko-kr" -> col index
+    langIndex[h] = i;
   }
 
-  // ko-KR은 치환 기준(소스) 컬럼이므로 필수
   if (langIndex["ko-kr"] == null) {
     throw new Error("헤더에 ko-KR이 없습니다. 언어 컬럼 헤더가 'ko-KR'인지 확인하세요.");
   }
 
-  // ✅ 행을 온전히 로드: 필터링 없이 그대로 entries에 넣음
-  // (다만 rows의 컬럼 길이가 짧을 수 있으니 안전하게 접근)
+  // ✅ 행은 절대 필터링/중복제거 하지 않음
   const entries = rows.map((r, rowIdx) => {
     const key = String(r[idxKey] ?? "").trim();
     const category = String(r[idxCategory] ?? "").trim();
+    const ko = String(r[langIndex["ko-kr"]] ?? "").trim();
 
     const translations = {};
     for (const [langKey, colIdx] of Object.entries(langIndex)) {
       const v = String(r[colIdx] ?? "").trim();
-      // 비어있는 번역도 "온전히" 로드 관점에서는 보존할 수 있으나,
-      // 실제 치환에는 필요 없으므로 값이 있을 때만 저장 (메모리 최적화)
+      // 값이 있는 것만 저장(메모리 절약) — 행 자체는 entries로 온전히 보존됨
       if (v) translations[langKey] = v;
     }
 
-    const ko = String(r[langIndex["ko-kr"]] ?? "").trim();
-
     return {
-      // 행 추적/디버깅을 위해 row index 유지(1-based sheet row는 +2)
-      _rowIndex: rowIdx + 2,
+      _rowIndex: rowIdx + 2, // 시트 행 추적
       key,
       category,
-      ko, // ko-KR 원문
-      translations, // 타겟 언어 포함
+      ko,
+      translations,
     };
   });
 
@@ -186,11 +167,11 @@ async function loadGlossaryAll() {
  * sessions.get(sessionId) = {
  *   sessionId,
  *   categoryKey, sourceLangKey, targetLangKey,
- *   glossary: { entries, rawRowCount, loadedAt, byCategoryKo },
+ *   glossary: { entries, rawRowCount, loadedAt, byCategoryKo }
  * }
  *
- * byCategoryKo:
- *   Map<categoryLower, Map<koString, entry[]>>  // ✅ 중복 보존 위해 배열
+ * byCategoryKo: Map<categoryLower, Map<koString, entry[]>>
+ * ✅ 중복 보존: entry[] 로 저장
  */
 const sessions = new Map();
 
@@ -212,31 +193,25 @@ function buildIndexPreserveDuplicates(entries) {
     if (!cat) continue;
 
     const ko = String(e.ko ?? "").trim();
-    if (!ko) continue; // ko가 비면 치환 기준이 될 수 없으므로 인덱스에서는 제외 (entries 자체는 유지됨)
+    if (!ko) continue; // 인덱스 제외(치환 기준 불가) — entries는 보존됨
 
     if (!byCategoryKo.has(cat)) byCategoryKo.set(cat, new Map());
     const koMap = byCategoryKo.get(cat);
 
     if (!koMap.has(ko)) koMap.set(ko, []);
-    koMap.get(ko).push(e); // ✅ 중복 보존
+    koMap.get(ko).push(e);
   }
 
   return byCategoryKo;
 }
 
-/**
- * Phase 1: Glossary 치환
- * - category는 세션에서 고정
- * - ko-KR 문자열이 텍스트에 포함되면 targetLang 값으로 치환
- * - 동일 category에서 동일 ko가 여러 행 존재(중복)해도, entries는 보존하되
- *   치환 결과는 "시트 상 먼저 등장한(배열[0]) 항목 중 target 번역이 있는 것"을 사용
- */
+// ---------------- Replace Logic (Phase 1) ----------------
 function replaceByGlossary({ text, targetLangKey, koMap }) {
   if (typeof text !== "string" || !text) {
     return { out: text ?? "", replacedTotal: 0 };
   }
 
-  // 치환 우선순위: 긴 문자열부터 (부분 중첩 방지)
+  // ✅ 긴 문자열 우선(부분 중첩 방지)
   const terms = Array.from(koMap.keys()).sort((a, b) => b.length - a.length);
 
   let out = text;
@@ -245,7 +220,7 @@ function replaceByGlossary({ text, targetLangKey, koMap }) {
   for (const ko of terms) {
     const candidates = koMap.get(ko) || [];
 
-    // 중복 중 "타겟 번역이 존재하는 첫 후보" 선택 (결정적/안정적)
+    // ✅ 중복이 있어도 "시트에서 먼저 등장 + 타겟 값 존재" 첫 후보로 결정
     let target = "";
     for (const c of candidates) {
       const v = c?.translations?.[targetLangKey];
@@ -254,7 +229,7 @@ function replaceByGlossary({ text, targetLangKey, koMap }) {
         break;
       }
     }
-    if (!target) continue; // 타겟이 없으면 치환 안 함
+    if (!target) continue;
 
     const re = new RegExp(escapeRegExp(ko), "g");
     let localCount = 0;
@@ -268,19 +243,23 @@ function replaceByGlossary({ text, targetLangKey, koMap }) {
   return { out, replacedTotal };
 }
 
-// ---------------- HTTP App ----------------
+// ---------------- REST API ----------------
 const app = express();
-app.use(express.json({ limit: "8mb" }));
+
+app.use(
+  express.json({
+    limit: "8mb",
+    type: ["application/json", "application/*+json"],
+  })
+);
+app.use(express.text({ limit: "8mb", type: ["text/*"] }));
 
 app.get("/healthz", (_req, res) => res.status(200).json({ ok: true }));
+app.get("/", (_req, res) => res.status(200).send("ok"));
 
 /**
  * POST /v1/session/init
  * body: { category, sourceLang, targetLang }
- *
- * - Glossary를 1회 로드하고 sessionId 반환
- * - category는 세션 고정
- * - sourceLang은 정책상 "ko-KR"로 쓰는 게 일반적이지만, 현재 치환 기준은 ko-KR 고정
  */
 app.post("/v1/session/init", async (req, res) => {
   try {
@@ -302,13 +281,8 @@ app.post("/v1/session/init", async (req, res) => {
       return res.status(400).json({
         ok: false,
         error: `Category not found in glossary index: ${category}`,
-        hint: "분류(I열) 값이 정확히 일치하는지 확인하세요.",
       });
     }
-
-    // 타겟 언어 컬럼 존재 여부는 '있으면 치환, 없으면 치환 없음'으로 처리 가능
-    // 여기서는 명확하게 오류로 막지 않고 info로만 알려줌
-    const hasTargetLangColumn = loaded.langIndex[targetLangKey] != null;
 
     const sessionId = newSessionId();
     sessions.set(sessionId, {
@@ -317,7 +291,7 @@ app.post("/v1/session/init", async (req, res) => {
       sourceLangKey,
       targetLangKey,
       glossary: {
-        entries: loaded.entries, // ✅ 전체 행 보존(5000개면 5000개)
+        entries: loaded.entries, // ✅ 5000개면 5000개 그대로 보존
         rawRowCount: loaded.rawRowCount,
         loadedAt: loaded.loadedAt,
         byCategoryKo,
@@ -331,11 +305,7 @@ app.post("/v1/session/init", async (req, res) => {
       sourceLang: sourceLangKey,
       targetLang: targetLangKey,
       glossaryLoadedAt: loaded.loadedAt,
-      rawRowCount: loaded.rawRowCount, // ✅ "온전히" 가져온 행 수
-      hasTargetLangColumn,
-      note: hasTargetLangColumn
-        ? undefined
-        : `Target language column '${targetLangKey}' not found in header. Replace will produce zero substitutions.`,
+      rawRowCount: loaded.rawRowCount,
     });
   } catch (e) {
     const status = e?.status ?? 500;
@@ -346,9 +316,6 @@ app.post("/v1/session/init", async (req, res) => {
 /**
  * POST /v1/translate/replace
  * body: { sessionId, texts: string[] }
- *
- * - Phase 1 (Glossary 치환)만 수행
- * - 세션 캐시 사용 (시트 재조회 없음)
  */
 app.post("/v1/translate/replace", async (req, res) => {
   try {
@@ -360,13 +327,9 @@ app.post("/v1/translate/replace", async (req, res) => {
       return res.status(400).json({ ok: false, error: "texts[] is required" });
 
     const s = getSessionOrThrow(sessionId);
-
     const koMap = s.glossary.byCategoryKo.get(s.categoryKey);
     if (!koMap) {
-      return res.status(400).json({
-        ok: false,
-        error: `Category index not found in session: ${s.categoryKey}`,
-      });
+      return res.status(400).json({ ok: false, error: `Category not indexed: ${s.categoryKey}` });
     }
 
     const outTexts = [];
@@ -399,9 +362,6 @@ app.post("/v1/translate/replace", async (req, res) => {
 /**
  * POST /v1/glossary/update
  * body: { sessionId }
- *
- * - 사용자가 명시적으로 업데이트를 요청했을 때만 시트를 재조회
- * - 해당 세션의 캐시를 새로 고침
  */
 app.post("/v1/glossary/update", async (req, res) => {
   try {
@@ -421,7 +381,7 @@ app.post("/v1/glossary/update", async (req, res) => {
     }
 
     s.glossary = {
-      entries: loaded.entries, // ✅ 전체 행 보존
+      entries: loaded.entries,
       rawRowCount: loaded.rawRowCount,
       loadedAt: loaded.loadedAt,
       byCategoryKo,
@@ -442,8 +402,178 @@ app.post("/v1/glossary/update", async (req, res) => {
   }
 });
 
+// ---------------- MCP Compatibility (/mcp) ----------------
+/**
+ * 기존 ChatGPT Actions / MCP 클라이언트가 /mcp 를 호출하므로,
+ * /mcp 를 다시 제공해서 404를 없애고, get_glossary / lookup_term 도구를 유지합니다.
+ *
+ * 주의:
+ * - MCP 도구는 "REST 세션 캐시"와 별개로 동작할 수 있습니다.
+ * - 여기서는 MCP에서도 성능을 위해 "프로세스 내 캐시(단일 캐시)"를 둡니다.
+ */
+const mcp = new McpServer({
+  name: "sheets-glossary-mcp",
+  version: "1.0.0",
+});
+
+let mcpGlossaryCache = null; // { loadedAt, entries, rawRowCount, byCategoryKo, langIndex }
+
+async function ensureMcpGlossaryLoaded(forceReload = false) {
+  if (mcpGlossaryCache && !forceReload) return mcpGlossaryCache;
+
+  const loaded = await loadGlossaryAll();
+  mcpGlossaryCache = {
+    loadedAt: loaded.loadedAt,
+    entries: loaded.entries, // ✅ 전체 행
+    rawRowCount: loaded.rawRowCount,
+    langIndex: loaded.langIndex,
+    byCategoryKo: buildIndexPreserveDuplicates(loaded.entries),
+  };
+  return mcpGlossaryCache;
+}
+
+/**
+ * ✅ get_glossary
+ * - category(분류) 지정 시 해당 category의 모든 행 반환
+ * - lang 지정 시 해당 언어만 포함해서 반환(없으면 빈 문자열)
+ * - TERM은 없음/무시
+ */
+mcp.tool(
+  "get_glossary",
+  {
+    category: z.string().optional(),
+    lang: z.string().optional(),
+    forceReload: z.boolean().optional(), // 필요 시 강제 재로딩
+  },
+  async ({ category, lang, forceReload }) => {
+    const cache = await ensureMcpGlossaryLoaded(Boolean(forceReload));
+    const catKey = category ? String(category).trim().toLowerCase() : "";
+    const langKey = lang ? normalizeLang(lang) : "";
+
+    const out = [];
+    for (const e of cache.entries) {
+      const eCat = String(e.category ?? "").trim().toLowerCase();
+      if (catKey && eCat !== catKey) continue;
+
+      if (!langKey) {
+        out.push({
+          key: e.key || undefined,
+          category: e.category || undefined,
+          ko: e.ko || "",
+          translations: e.translations,
+          _rowIndex: e._rowIndex,
+        });
+      } else {
+        out.push({
+          key: e.key || undefined,
+          category: e.category || undefined,
+          ko: e.ko || "",
+          lang: langKey,
+          translation: e.translations?.[langKey] ?? "",
+          _rowIndex: e._rowIndex,
+        });
+      }
+    }
+
+    return {
+      content: [
+        {
+          type: "text",
+          text: JSON.stringify(
+            {
+              loadedAt: cache.loadedAt,
+              rawRowCount: cache.rawRowCount,
+              count: out.length,
+              data: out,
+            },
+            null,
+            2
+          ),
+        },
+      ],
+    };
+  }
+);
+
+/**
+ * ✅ lookup_term
+ * - ko-KR 문자열로 정확 조회(완전 일치)
+ * - category 옵션으로 범위 제한
+ * - lang 지정 시 해당 언어만 반환
+ */
+mcp.tool(
+  "lookup_term",
+  {
+    ko: z.string(), // ✅ ko-KR 기준
+    category: z.string().optional(),
+    lang: z.string().optional(),
+    forceReload: z.boolean().optional(),
+  },
+  async ({ ko, category, lang, forceReload }) => {
+    const cache = await ensureMcpGlossaryLoaded(Boolean(forceReload));
+    const koKey = String(ko).trim();
+    const catKey = category ? String(category).trim().toLowerCase() : "";
+    const langKey = lang ? normalizeLang(lang) : "";
+
+    const results = [];
+    for (const e of cache.entries) {
+      const eCat = String(e.category ?? "").trim().toLowerCase();
+      if (catKey && eCat !== catKey) continue;
+      if (String(e.ko ?? "").trim() !== koKey) continue;
+
+      if (!langKey) {
+        results.push({
+          key: e.key || undefined,
+          category: e.category || undefined,
+          ko: e.ko || "",
+          translations: e.translations,
+          _rowIndex: e._rowIndex,
+        });
+      } else {
+        results.push({
+          key: e.key || undefined,
+          category: e.category || undefined,
+          ko: e.ko || "",
+          lang: langKey,
+          translation: e.translations?.[langKey] ?? "",
+          _rowIndex: e._rowIndex,
+        });
+      }
+    }
+
+    return {
+      content: [
+        {
+          type: "text",
+          text: JSON.stringify(
+            { found: results.length > 0, count: results.length, results },
+            null,
+            2
+          ),
+        },
+      ],
+    };
+  }
+);
+
+// MCP endpoint (restore)
+app.all("/mcp", async (req, res) => {
+  const transport = new StreamableHTTPServerTransport({
+    enableJsonResponse: true,
+  });
+
+  res.on("close", () => transport.close());
+
+  await mcp.connect(transport);
+
+  const body = getParsedBody(req);
+  await transport.handleRequest(req, res, body);
+});
+
+// ---------------- Start ----------------
 app.listen(PORT, () => {
   console.log(`Server listening on :${PORT}`);
-  console.log(`Sheet range: ${SHEET_RANGE}`);
-  console.log(`TERM is ignored. 기준: category(I) + ko-KR(K)`);
+  console.log(`Sheet range: ${SHEET_RANGE} (TERM ignored)`);
+  console.log(`REST: /v1/session/init, /v1/translate/replace, /v1/glossary/update`);
+  console.log(`MCP: /mcp (get_glossary, lookup_term)`);
 });
