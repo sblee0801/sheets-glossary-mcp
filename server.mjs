@@ -523,10 +523,10 @@ app.get("/v1/glossary/raw", (req, res) => {
   }
 });
 
-// ---------------- MCP ----------------
+// ---------------- MCP (ONLY 2 TOOLS) ----------------
 const mcp = new McpServer({
   name: "sheets-glossary-mcp",
-  version: "2.3.0",
+  version: "2.4.0",
 });
 
 /**
@@ -555,51 +555,130 @@ async function ensureMcpLoaded(forceReload = false) {
 }
 
 /**
- * MCP: get_glossary (페이지네이션/필터)
+ * category가 없을 때: 모든 카테고리의 sourceTextMap을 하나로 머지
+ * Map<sourceText, entry[]>
+ */
+function mergeSourceTextMaps(cache, sourceLangKey, categories) {
+  const merged = new Map();
+
+  for (const cat of categories) {
+    const bySource = cache.byCategoryBySource.get(cat);
+    const map = bySource?.get(sourceLangKey);
+    if (!map) continue;
+
+    for (const [term, entries] of map.entries()) {
+      if (!merged.has(term)) merged.set(term, []);
+      merged.get(term).push(...entries); // ✅ 중복/순서 보존
+    }
+  }
+
+  return merged;
+}
+
+/**
+ * MCP Tool #1: replace_texts
+ * - Glossary 기반 Phase 1 치환(배치)
+ * - category: optional (없으면 전체 카테고리에서 합쳐서 치환)
+ * - sourceLang이 ko-KR이면 ko-KR 인덱스
+ * - sourceLang이 en-US이면 en-US 인덱스
  */
 mcp.tool(
-  "get_glossary",
+  "replace_texts",
   {
+    texts: z.array(z.string()).min(1).max(2000),
     category: z.string().optional(),
-    lang: z.string().optional(),
-    offset: z.number().int().nonnegative().optional(),
-    limit: z.number().int().min(1).max(2000).optional(),
+
+    sourceLang: z.string().min(1), // ko-KR | en-US
+    targetLang: z.string().min(1), // en-US | th-TH | zh-CN ...
+
+    includeLogs: z.boolean().optional(),
     forceReload: z.boolean().optional(),
   },
-  async ({ category, lang, offset, limit, forceReload }) => {
+  async ({ texts, category, sourceLang, targetLang, includeLogs, forceReload }) => {
     const cache = await ensureMcpLoaded(Boolean(forceReload));
 
-    const catKey = category ? String(category).trim().toLowerCase() : "";
-    const langKey = lang ? normalizeLang(lang) : "";
+    const sourceLangKey = normalizeLang(sourceLang);
+    const targetLangKey = normalizeLang(targetLang);
 
-    const off = Math.max(0, Number(offset ?? 0));
-    const lim = Math.min(2000, Math.max(1, Number(limit ?? 500)));
+    assertAllowedSourceLang(sourceLangKey);
 
-    const filtered = [];
-    for (const e of cache.entries) {
-      const eCat = String(e.category ?? "").trim().toLowerCase();
-      if (catKey && eCat !== catKey) continue;
-      filtered.push(e);
+    if (sourceLangKey === "en-us" && cache.langIndex["en-us"] == null) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify(
+              { ok: false, error: "Header does not include en-US. Cannot use sourceLang=en-US." },
+              null,
+              2
+            ),
+          },
+        ],
+      };
     }
 
-    const page = filtered.slice(off, off + lim);
-    const out = page.map((e) => {
-      if (!langKey) {
+    // category optional: 지정되면 해당 카테고리만, 아니면 전체
+    let categories = [];
+    if (category && String(category).trim()) {
+      const catKey = String(category).trim().toLowerCase();
+      if (!cache.byCategoryBySource.has(catKey)) {
         return {
-          key: e.key || undefined,
-          category: e.category || undefined,
-          translations: e.translations || {},
-          _rowIndex: e._rowIndex,
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify({ ok: false, error: `Category not found: ${category}` }, null, 2),
+            },
+          ],
         };
       }
+      categories = [catKey];
+    } else {
+      categories = Array.from(cache.byCategoryBySource.keys());
+    }
+
+    const sourceTextMap = mergeSourceTextMaps(cache, sourceLangKey, categories);
+    if (!sourceTextMap || sourceTextMap.size === 0) {
       return {
-        key: e.key || undefined,
-        category: e.category || undefined,
-        lang: langKey,
-        text: e.translations?.[langKey] ?? "",
-        _rowIndex: e._rowIndex,
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify(
+              {
+                ok: false,
+                error: `No source texts found for sourceLang='${sourceLangKey}' (category=${
+                  category ? String(category) : "ALL"
+                }).`,
+              },
+              null,
+              2
+            ),
+          },
+        ],
       };
-    });
+    }
+
+    const wantLogs = includeLogs ?? true;
+
+    const outTexts = [];
+    const perLineLogs = [];
+    let replacedTotalAll = 0;
+    let matchedTermsAll = 0;
+
+    for (let i = 0; i < texts.length; i++) {
+      const input = texts[i];
+      const { out, replacedTotal, logs } = replaceByGlossaryWithLogs({
+        text: input,
+        sourceLangKey,
+        targetLangKey,
+        sourceTextMap,
+      });
+
+      outTexts.push(out);
+      replacedTotalAll += replacedTotal;
+      matchedTermsAll += logs.length;
+
+      if (wantLogs) perLineLogs.push({ index: i, replacedTotal, logs });
+    }
 
     return {
       content: [
@@ -607,13 +686,21 @@ mcp.tool(
           type: "text",
           text: JSON.stringify(
             {
-              loadedAt: cache.loadedAt,
-              rawRowCount: cache.rawRowCount,
-              filteredCount: filtered.length,
-              offset: off,
-              limit: lim,
-              count: out.length,
-              data: out,
+              ok: true,
+              category: category ? String(category).trim().toLowerCase() : "ALL",
+              sourceLang: sourceLangKey,
+              targetLang: targetLangKey,
+              texts: outTexts,
+              summary: {
+                lines: texts.length,
+                replacedTotal: replacedTotalAll,
+                matchedTerms: matchedTermsAll,
+                glossaryLoadedAt: cache.loadedAt,
+                rawRowCount: cache.rawRowCount,
+                categoriesUsedCount: categories.length,
+                uniqueTermsInIndex: sourceTextMap.size,
+              },
+              logs: wantLogs ? perLineLogs : undefined,
             },
             null,
             2
@@ -625,171 +712,34 @@ mcp.tool(
 );
 
 /**
- * MCP: lookup_text (단건 정확 일치)
+ * MCP Tool #2: glossary_update
+ * - MCP 캐시 강제 리로드
  */
 mcp.tool(
-  "lookup_text",
+  "glossary_update",
   {
-    text: z.string(),
-    sourceLang: z.string(), // ko-KR | en-US
-    targetLang: z.string().optional(),
-    category: z.string().optional(),
     forceReload: z.boolean().optional(),
   },
-  async ({ text, sourceLang, targetLang, category, forceReload }) => {
-    const cache = await ensureMcpLoaded(Boolean(forceReload));
-
-    const sourceLangKey = normalizeLang(sourceLang);
-    assertAllowedSourceLang(sourceLangKey);
-
-    const targetLangKey = targetLang ? normalizeLang(targetLang) : "";
-    const catKey = category ? String(category).trim().toLowerCase() : "";
-    const needle = String(text ?? "").trim();
-
-    const results = [];
-
-    const scanCategory = (cat) => {
-      const bySource = cache.byCategoryBySource.get(cat);
-      const map = bySource?.get(sourceLangKey);
-      const candidates = map?.get(needle) || [];
-      for (const e of candidates) {
-        results.push({
-          key: e.key || undefined,
-          category: e.category || cat,
-          sourceLang: sourceLangKey,
-          sourceText: needle,
-          targetLang: targetLangKey || undefined,
-          targetText: targetLangKey ? e.translations?.[targetLangKey] ?? "" : undefined,
-          translations: targetLangKey ? undefined : (e.translations || {}),
-          _rowIndex: e._rowIndex,
-        });
-      }
-    };
-
-    if (catKey) scanCategory(catKey);
-    else for (const cat of cache.byCategoryBySource.keys()) scanCategory(cat);
+  async ({ forceReload }) => {
+    const cache = await ensureMcpLoaded(forceReload ?? true);
 
     return {
       content: [
         {
           type: "text",
-          text: JSON.stringify({ found: results.length > 0, count: results.length, results }, null, 2),
+          text: JSON.stringify(
+            {
+              ok: true,
+              glossaryLoadedAt: cache.loadedAt,
+              rawRowCount: cache.rawRowCount,
+              categoriesCount: cache.byCategoryBySource.size,
+              range: SHEET_RANGE,
+            },
+            null,
+            2
+          ),
         },
       ],
-    };
-  }
-);
-
-/**
- * MCP: lookup_texts (배치 정확 일치)
- */
-mcp.tool(
-  "lookup_texts",
-  {
-    texts: z.array(z.string()).min(1).max(2000),
-    sourceLang: z.string(), // ko-KR | en-US
-    targetLang: z.string().optional(),
-    category: z.string().optional(),
-    forceReload: z.boolean().optional(),
-  },
-  async ({ texts, sourceLang, targetLang, category, forceReload }) => {
-    const cache = await ensureMcpLoaded(Boolean(forceReload));
-
-    const sourceLangKey = normalizeLang(sourceLang);
-    assertAllowedSourceLang(sourceLangKey);
-
-    const targetLangKey = targetLang ? normalizeLang(targetLang) : "";
-    const catKey = category ? String(category).trim().toLowerCase() : "";
-    const categories = catKey ? [catKey] : Array.from(cache.byCategoryBySource.keys());
-
-    const out = [];
-    for (const rawText of texts) {
-      const needle = String(rawText ?? "").trim();
-      if (!needle) {
-        out.push({ text: rawText, found: false, count: 0, matches: [] });
-        continue;
-      }
-
-      const matches = [];
-      for (const cat of categories) {
-        const bySource = cache.byCategoryBySource.get(cat);
-        const map = bySource?.get(sourceLangKey);
-        const candidates = map?.get(needle) || [];
-        for (const e of candidates) {
-          matches.push({
-            key: e.key || undefined,
-            category: e.category || cat,
-            sourceLang: sourceLangKey,
-            sourceText: needle,
-            targetLang: targetLangKey || undefined,
-            targetText: targetLangKey ? e.translations?.[targetLangKey] ?? "" : undefined,
-            translations: targetLangKey ? undefined : (e.translations || {}),
-            _rowIndex: e._rowIndex,
-          });
-        }
-      }
-
-      out.push({ text: needle, found: matches.length > 0, count: matches.length, matches });
-    }
-
-    return {
-      content: [{ type: "text", text: JSON.stringify({ count: out.length, results: out }, null, 2) }],
-    };
-  }
-);
-
-/**
- * MCP: read_sheet_rows (원본 row 읽기)
- */
-mcp.tool(
-  "read_sheet_rows",
-  {
-    category: z.string().optional(),
-    offset: z.number().int().nonnegative().optional(),
-    limit: z.number().int().min(1).max(2000).optional(),
-    includeHeader: z.boolean().optional(),
-    forceReload: z.boolean().optional(),
-  },
-  async ({ category, offset, limit, includeHeader, forceReload }) => {
-    const cache = await ensureMcpLoaded(Boolean(forceReload));
-
-    const off = Math.max(0, Number(offset ?? 0));
-    const lim = Math.min(2000, Math.max(1, Number(limit ?? 200)));
-    const catKey = category ? String(category).trim().toLowerCase() : "";
-
-    let rowsOut = [];
-
-    if (!catKey) {
-      rowsOut = cache.rawRows.slice(off, off + lim).map((cells, i) => ({
-        rowIndex: off + i + 2,
-        cells,
-      }));
-    } else {
-      const indices = [];
-      for (const e of cache.entries) {
-        const eCat = String(e.category ?? "").trim().toLowerCase();
-        if (eCat === catKey) indices.push(e._rowIndex);
-      }
-      const page = indices.slice(off, off + lim);
-      rowsOut = page.map((rowIndex) => ({
-        rowIndex,
-        cells: cache.rawRows[rowIndex - 2] ?? [],
-      }));
-    }
-
-    const payload = {
-      loadedAt: cache.loadedAt,
-      range: SHEET_RANGE,
-      rawRowCount: cache.rawRowCount,
-      offset: off,
-      limit: lim,
-      count: rowsOut.length,
-      rows: rowsOut,
-    };
-    if (includeHeader) payload.header = cache.header;
-
-    return {
-      content: [{ type: "text", text: JSON.stringify(payload, null, 2) }],
     };
   }
 );
@@ -813,5 +763,5 @@ app.listen(PORT, () => {
   console.log(`Server listening on :${PORT}`);
   console.log(`Sheet range: ${SHEET_RANGE} (TERM ignored)`);
   console.log(`REST: /v1/session/init, /v1/translate/replace(+logs), /v1/glossary/update, /v1/glossary/raw`);
-  console.log(`MCP: /mcp (get_glossary, lookup_text, lookup_texts, read_sheet_rows)`);
+  console.log(`MCP: /mcp (replace_texts, glossary_update)`);
 });
