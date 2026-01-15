@@ -31,21 +31,17 @@ function getParsedBody(req) {
   return req.body;
 }
 
-/**
- * lang 문자열을 시트 헤더 형태로 정규화 (예: "ko", "ko-kr", "ko_KR" -> "ko-kr")
- */
+/** "ko", "ko-kr", "ko_KR" -> "ko-kr" */
 function normalizeLang(lang) {
   if (!lang) return "";
-  return String(lang).trim().toLowerCase().replace("_", "-");
+  return String(lang).trim().toLowerCase().replace(/_/g, "-");
 }
 
-/**
- * I~U 범위에서 language 컬럼 후보를 반환 (분류/len/term/notes 제외)
- */
+/** I~U 범위에서 language 컬럼 후보를 반환 (분류/len/term/notes 제외) */
 function isLanguageHeader(h) {
   const x = normalize(h);
   if (!x) return false;
-  // 제외 목록: 분류/term/len/notes/비고성 컬럼(프로젝트 상황에 맞춰 추가 가능)
+
   const excluded = new Set([
     "분류",
     "category",
@@ -59,8 +55,6 @@ function isLanguageHeader(h) {
   ]);
   if (excluded.has(x)) return false;
 
-  // 언어 컬럼은 보통 ko-kr, en-us, zh-cn 같은 형태이거나 locale 코드
-  // 너무 엄격히 제한하지 않고, 제외 목록에만 걸리지 않으면 후보로 둠
   return true;
 }
 
@@ -75,7 +69,7 @@ async function readGlossaryIU() {
 
   const sheets = google.sheets({ version: "v4", auth });
 
-  // ✅ 핵심: I~U만 읽음
+  // ✅ I~U만 읽음
   const range = `${SHEET_NAME}!I:U`;
 
   const res = await sheets.spreadsheets.values.get({
@@ -89,33 +83,42 @@ async function readGlossaryIU() {
   const header = rows[0].map((h) => String(h ?? "").trim());
   const body = rows.slice(1);
 
-  // I~U 내부에 있는 헤더만으로 매핑
   const normHeader = header.map(normalize);
 
-  // 스크린샷 기준: I=분류, J=ko-KR, ... T=LEN, U=TERM
+  // ✅ ko-KR 기준키(필수), TERM은 "있으면 보관" (비필수)
   const idx = {
     category: normHeader.indexOf("분류"),
-    term: normHeader.indexOf("term"), // "TERM"
-    len: normHeader.indexOf("len"),   // "LEN"
-    notes: normHeader.indexOf("note") >= 0 ? normHeader.indexOf("note") : normHeader.indexOf("notes"),
+    ko: normHeader.indexOf("ko-kr"),
+    term: normHeader.indexOf("term"), // 있을 수도/없을 수도
+    len: normHeader.indexOf("len"),
+    notes:
+      normHeader.indexOf("note") >= 0
+        ? normHeader.indexOf("note")
+        : normHeader.indexOf("notes"),
   };
 
-  // 최소 요구: TERM, 분류는 없어도 동작하게(필터만 못 함)
-  if (idx.term < 0) {
+  // ✅ 최소 요구: ko-KR은 반드시 있어야 함
+  if (idx.ko < 0) {
     throw new Error(
-      "I:U 범위 헤더에 TERM(또는 term)이 없습니다. U열 헤더가 'TERM'인지 확인하세요."
+      "I:U 범위 헤더에 ko-KR(또는 ko-kr)이 없습니다. ko-KR 컬럼 헤더를 확인하세요."
     );
   }
 
-  // 언어 컬럼 인덱스 맵 생성
+  // 언어 컬럼 인덱스 맵 생성 (분류/LEN/TERM/notes 제외)
   const langIndex = {};
   for (let i = 0; i < normHeader.length; i++) {
     const hRaw = header[i];
     const hNorm = normHeader[i];
 
-    // TERM/LEN/분류/notes류는 제외하고 언어 후보만
-    if (i === idx.term || i === idx.len || i === idx.category) continue;
-    if (hNorm === "note" || hNorm === "notes" || hNorm === "번역메모" || hNorm === "클리펀트") continue;
+    if (i === idx.len || i === idx.category) continue;
+    if (idx.term >= 0 && i === idx.term) continue; // TERM은 있으면 제외(언어컬럼 아님)
+    if (
+      hNorm === "note" ||
+      hNorm === "notes" ||
+      hNorm === "번역메모" ||
+      hNorm === "클리펀트"
+    )
+      continue;
 
     if (isLanguageHeader(hRaw)) {
       langIndex[hNorm] = i;
@@ -124,22 +127,25 @@ async function readGlossaryIU() {
 
   const data = body
     .map((r) => {
-      const term = String(r[idx.term] ?? "").trim();
-      const category = idx.category >= 0 ? String(r[idx.category] ?? "").trim() : "";
+      const ko = String(r[idx.ko] ?? "").trim();
+      const term = idx.term >= 0 ? String(r[idx.term] ?? "").trim() : "";
+      const category =
+        idx.category >= 0 ? String(r[idx.category] ?? "").trim() : "";
       const len = idx.len >= 0 ? String(r[idx.len] ?? "").trim() : "";
-      const notes =
-        idx.notes >= 0 ? String(r[idx.notes] ?? "").trim() : "";
+      const notes = idx.notes >= 0 ? String(r[idx.notes] ?? "").trim() : "";
 
-      // 언어별 값
       const translations = {};
       for (const [langKey, colIdx] of Object.entries(langIndex)) {
         const v = String(r[colIdx] ?? "").trim();
         if (v) translations[langKey] = v;
       }
 
-      return { term, category, len, notes, translations };
+      // ko-kr은 기준키이므로 translations에 보장
+      if (ko) translations["ko-kr"] = ko;
+
+      return { ko, term, category, len, notes, translations };
     })
-    .filter((x) => x.term); // term 없는 행 제거
+    .filter((x) => x.ko); // ✅ ko 없는 행 제거
 
   return { header, data };
 }
@@ -147,20 +153,21 @@ async function readGlossaryIU() {
 // ---------------- MCP Server ----------------
 const mcp = new McpServer({
   name: "sheets-glossary-mcp",
-  version: "0.4.0",
+  version: "0.5.1",
 });
 
 /**
- * ✅ get_glossary
- * - category(=분류)로 필터 가능
- * - lang 지정 시 해당 언어 번역만 반환 (예: ko-kr, en-us)
- * - lang 미지정 시 I~U에 있는 언어 컬럼을 가능한 한 모두 반환
+ * get_glossary
+ * - category(=분류) 필터
+ * - lang 지정 시 해당 언어만 반환
+ * - lang 미지정 시 가능한 모든 언어 반환
+ * - ✅ ko(=ko-KR)를 기준키로 항상 포함
  */
 mcp.tool(
   "get_glossary",
   {
-    category: z.string().optional(), // 분류 필터
-    lang: z.string().optional(),     // "ko-KR" 등
+    category: z.string().optional(),
+    lang: z.string().optional(),
   },
   async ({ category, lang }) => {
     const { data } = await readGlossaryIU();
@@ -175,9 +182,9 @@ mcp.tool(
 
     const out = filtered.map((row) => {
       if (!langKey) {
-        // 언어 미지정: 가능한 번역 전체 반환
         return {
-          term: row.term,
+          ko: row.ko,
+          term: row.term || undefined,
           category: row.category || undefined,
           len: row.len || undefined,
           notes: row.notes || undefined,
@@ -185,14 +192,14 @@ mcp.tool(
         };
       }
 
-      // 언어 지정: 해당 언어만(없으면 빈 문자열)
       return {
-        term: row.term,
+        ko: row.ko,
+        term: row.term || undefined,
         category: row.category || undefined,
         len: row.len || undefined,
         notes: row.notes || undefined,
-        translation: row.translations?.[langKey] ?? "",
         lang: langKey,
+        translation: row.translations?.[langKey] ?? "",
       };
     });
 
@@ -203,27 +210,25 @@ mcp.tool(
 );
 
 /**
- * ✅ lookup_term
- * - term(=TERM) 정확 일치 조회
- * - category(=분류) 옵션 필터
- * - lang 지정 시 해당 언어만
+ * lookup_term (호환 유지)
+ * - term 파라미터를 "TERM"이 아니라 ✅ "ko-KR 원문"으로 간주해서 조회
  */
 mcp.tool(
   "lookup_term",
   {
-    term: z.string(),
+    term: z.string(), // ✅ ko-KR 텍스트
     category: z.string().optional(),
     lang: z.string().optional(),
   },
   async ({ term, category, lang }) => {
     const { data } = await readGlossaryIU();
 
-    const t = String(term).trim().toLowerCase();
+    const keyKo = String(term).trim().toLowerCase();
     const cat = category ? String(category).trim().toLowerCase() : "";
     const langKey = lang ? normalizeLang(lang) : "";
 
     const hit = data.find((row) => {
-      if (String(row.term).trim().toLowerCase() !== t) return false;
+      if (String(row.ko).trim().toLowerCase() !== keyKo) return false;
       if (!cat) return true;
       return String(row.category ?? "").trim().toLowerCase() === cat;
     });
@@ -232,14 +237,16 @@ mcp.tool(
       ? null
       : !langKey
         ? {
-            term: hit.term,
+            ko: hit.ko,
+            term: hit.term || undefined,
             category: hit.category || undefined,
             len: hit.len || undefined,
             notes: hit.notes || undefined,
             translations: hit.translations,
           }
         : {
-            term: hit.term,
+            ko: hit.ko,
+            term: hit.term || undefined,
             category: hit.category || undefined,
             len: hit.len || undefined,
             notes: hit.notes || undefined,
@@ -248,16 +255,7 @@ mcp.tool(
           };
 
     return {
-      content: [
-        {
-          type: "text",
-          text: JSON.stringify(
-            { found: Boolean(hit), result },
-            null,
-            2
-          ),
-        },
-      ],
+      content: [{ type: "text", text: JSON.stringify({ found: Boolean(hit), result }, null, 2) }],
     };
   }
 );
@@ -273,15 +271,12 @@ app.use(
 );
 app.use(express.text({ limit: "2mb", type: ["text/*"] }));
 
-// MCP endpoint
 app.all("/mcp", async (req, res) => {
   const transport = new StreamableHTTPServerTransport({
     enableJsonResponse: true,
   });
 
-  res.on("close", () => {
-    transport.close();
-  });
+  res.on("close", () => transport.close());
 
   await mcp.connect(transport);
 
