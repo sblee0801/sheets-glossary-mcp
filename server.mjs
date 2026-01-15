@@ -12,7 +12,7 @@ const SPREADSHEET_ID = process.env.SPREADSHEET_ID;
 const SHEET_NAME = process.env.SHEET_NAME || "Glossary";
 
 /**
- * TERM(V열) 무시 → A:U만 읽음
+ * ✅ TERM(V열) 무시 → A:U만 읽음
  */
 const SHEET_RANGE = process.env.SHEET_RANGE || `${SHEET_NAME}!A:U`;
 
@@ -80,6 +80,8 @@ async function readSheetRange() {
 
 /**
  * Glossary 전체 로드 (온전히)
+ * - rawRows 그대로 저장(원본 row 읽기)
+ * - entries는 rows 길이만큼 모두 생성(필터링 없음)
  */
 async function loadGlossaryAll() {
   const { header, rows } = await readSheetRange();
@@ -98,7 +100,7 @@ async function loadGlossaryAll() {
 
   const norm = header.map(normalizeHeader);
   const idxKey = norm.indexOf("key");
-  const idxCategory = norm.indexOf("분류");
+  const idxCategory = norm.indexOf("분류"); // 확정 구조
 
   if (idxKey < 0) throw new Error("헤더에 KEY가 없습니다. A열 헤더가 'KEY'인지 확인하세요.");
   if (idxCategory < 0)
@@ -126,7 +128,7 @@ async function loadGlossaryAll() {
     const h = norm[i];
     if (!h) continue;
     if (excluded.has(h)) continue;
-    langIndex[h] = i;
+    langIndex[h] = i; // ko-kr, en-us, th-th ...
   }
 
   if (langIndex["ko-kr"] == null) {
@@ -140,7 +142,7 @@ async function loadGlossaryAll() {
     const translations = {};
     for (const [langKey, colIdx] of Object.entries(langIndex)) {
       const v = String(r[colIdx] ?? "").trim();
-      if (v) translations[langKey] = v;
+      if (v) translations[langKey] = v; // 값 있는 것만 저장(메모리)
     }
 
     return {
@@ -183,7 +185,7 @@ function buildIndexBySourcePreserveDuplicates(entries, sourceLangKeys = ["ko-kr"
       const textMap = bySource.get(src);
 
       if (!textMap.has(sourceText)) textMap.set(sourceText, []);
-      textMap.get(sourceText).push(e);
+      textMap.get(sourceText).push(e); // ✅ 중복 보존
     }
   }
 
@@ -191,16 +193,11 @@ function buildIndexBySourcePreserveDuplicates(entries, sourceLangKeys = ["ko-kr"
 }
 
 // ---------------- Replace Logic (Phase 1 + Logs) ----------------
-/**
- * 치환 + 로그 생성
- * - 긴 문자열 우선
- * - 중복 후보가 있으면 "타겟 값 존재하는 첫 후보"로 결정
- * - 로그에는 무엇이 무엇으로 치환됐는지 + 몇 번 + 어떤 row/key를 사용했는지 기록
- */
 function replaceByGlossaryWithLogs({ text, sourceLangKey, targetLangKey, sourceTextMap }) {
   if (typeof text !== "string") text = String(text ?? "");
   if (!text) return { out: "", replacedTotal: 0, logs: [] };
 
+  // ✅ 긴 문자열 우선
   const terms = Array.from(sourceTextMap.keys()).sort((a, b) => b.length - a.length);
 
   let out = text;
@@ -210,7 +207,7 @@ function replaceByGlossaryWithLogs({ text, sourceLangKey, targetLangKey, sourceT
   for (const term of terms) {
     const candidates = sourceTextMap.get(term) || [];
 
-    // 결정적 선택: 타겟 번역이 존재하는 첫 후보
+    // 결정적 선택: targetLang 값이 존재하는 첫 후보
     let chosen = null;
     let target = "";
     for (const c of candidates) {
@@ -271,7 +268,7 @@ const InitSchema = z.object({
 const ReplaceSchema = z.object({
   sessionId: z.string().min(1),
   texts: z.array(z.string()).min(1),
-  includeLogs: z.boolean().optional(), // ✅ 로그 반환 여부 (기본 true)
+  includeLogs: z.boolean().optional(), // default true
 });
 
 const UpdateSchema = z.object({
@@ -293,6 +290,7 @@ app.get("/", (_req, res) => res.status(200).send("ok"));
 
 /**
  * POST /v1/session/init
+ * - 세션당 1회 로드 → 세션 캐시 고정
  */
 app.post("/v1/session/init", async (req, res) => {
   try {
@@ -305,7 +303,6 @@ app.post("/v1/session/init", async (req, res) => {
     assertAllowedSourceLang(sourceLangKey);
 
     const loaded = await loadGlossaryAll();
-
     if (sourceLangKey === "en-us" && loaded.langIndex["en-us"] == null) {
       return res.status(400).json({
         ok: false,
@@ -365,7 +362,7 @@ app.post("/v1/session/init", async (req, res) => {
 
 /**
  * POST /v1/translate/replace
- * - Phase 1 치환 결과 + (옵션) 치환 로그 반환
+ * - Phase 1 치환 + 로그 반환
  */
 app.post("/v1/translate/replace", async (req, res) => {
   try {
@@ -384,13 +381,12 @@ app.post("/v1/translate/replace", async (req, res) => {
     const wantLogs = includeLogs ?? true;
 
     const outTexts = [];
-    const perLineLogs = []; // [{ index, replacedTotal, logs: [...] }]
+    const perLineLogs = [];
     let replacedTotalAll = 0;
     let matchedTermsAll = 0;
 
     for (let i = 0; i < texts.length; i++) {
       const input = texts[i];
-
       const { out, replacedTotal, logs } = replaceByGlossaryWithLogs({
         text: input,
         sourceLangKey: s.sourceLangKey,
@@ -403,11 +399,7 @@ app.post("/v1/translate/replace", async (req, res) => {
       matchedTermsAll += logs.length;
 
       if (wantLogs) {
-        perLineLogs.push({
-          index: i,
-          replacedTotal,
-          logs,
-        });
+        perLineLogs.push({ index: i, replacedTotal, logs });
       }
     }
 
@@ -531,13 +523,19 @@ app.get("/v1/glossary/raw", (req, res) => {
   }
 });
 
-// ---------------- MCP (Batch lookup preserved) ----------------
+// ---------------- MCP ----------------
 const mcp = new McpServer({
   name: "sheets-glossary-mcp",
-  version: "2.2.0",
+  version: "2.3.0",
 });
 
+/**
+ * MCP 캐시(프로세스 단위)
+ */
 let mcpCache = null;
+/**
+ * mcpCache = { loadedAt, header, rawRows, entries, rawRowCount, langIndex, byCategoryBySource }
+ */
 async function ensureMcpLoaded(forceReload = false) {
   if (mcpCache && !forceReload) return mcpCache;
 
@@ -556,17 +554,147 @@ async function ensureMcpLoaded(forceReload = false) {
   return mcpCache;
 }
 
+/**
+ * MCP: get_glossary (페이지네이션/필터)
+ */
+mcp.tool(
+  "get_glossary",
+  {
+    category: z.string().optional(),
+    lang: z.string().optional(),
+    offset: z.number().int().nonnegative().optional(),
+    limit: z.number().int().min(1).max(2000).optional(),
+    forceReload: z.boolean().optional(),
+  },
+  async ({ category, lang, offset, limit, forceReload }) => {
+    const cache = await ensureMcpLoaded(Boolean(forceReload));
+
+    const catKey = category ? String(category).trim().toLowerCase() : "";
+    const langKey = lang ? normalizeLang(lang) : "";
+
+    const off = Math.max(0, Number(offset ?? 0));
+    const lim = Math.min(2000, Math.max(1, Number(limit ?? 500)));
+
+    const filtered = [];
+    for (const e of cache.entries) {
+      const eCat = String(e.category ?? "").trim().toLowerCase();
+      if (catKey && eCat !== catKey) continue;
+      filtered.push(e);
+    }
+
+    const page = filtered.slice(off, off + lim);
+    const out = page.map((e) => {
+      if (!langKey) {
+        return {
+          key: e.key || undefined,
+          category: e.category || undefined,
+          translations: e.translations || {},
+          _rowIndex: e._rowIndex,
+        };
+      }
+      return {
+        key: e.key || undefined,
+        category: e.category || undefined,
+        lang: langKey,
+        text: e.translations?.[langKey] ?? "",
+        _rowIndex: e._rowIndex,
+      };
+    });
+
+    return {
+      content: [
+        {
+          type: "text",
+          text: JSON.stringify(
+            {
+              loadedAt: cache.loadedAt,
+              rawRowCount: cache.rawRowCount,
+              filteredCount: filtered.length,
+              offset: off,
+              limit: lim,
+              count: out.length,
+              data: out,
+            },
+            null,
+            2
+          ),
+        },
+      ],
+    };
+  }
+);
+
+/**
+ * MCP: lookup_text (단건 정확 일치)
+ */
+mcp.tool(
+  "lookup_text",
+  {
+    text: z.string(),
+    sourceLang: z.string(), // ko-KR | en-US
+    targetLang: z.string().optional(),
+    category: z.string().optional(),
+    forceReload: z.boolean().optional(),
+  },
+  async ({ text, sourceLang, targetLang, category, forceReload }) => {
+    const cache = await ensureMcpLoaded(Boolean(forceReload));
+
+    const sourceLangKey = normalizeLang(sourceLang);
+    assertAllowedSourceLang(sourceLangKey);
+
+    const targetLangKey = targetLang ? normalizeLang(targetLang) : "";
+    const catKey = category ? String(category).trim().toLowerCase() : "";
+    const needle = String(text ?? "").trim();
+
+    const results = [];
+
+    const scanCategory = (cat) => {
+      const bySource = cache.byCategoryBySource.get(cat);
+      const map = bySource?.get(sourceLangKey);
+      const candidates = map?.get(needle) || [];
+      for (const e of candidates) {
+        results.push({
+          key: e.key || undefined,
+          category: e.category || cat,
+          sourceLang: sourceLangKey,
+          sourceText: needle,
+          targetLang: targetLangKey || undefined,
+          targetText: targetLangKey ? e.translations?.[targetLangKey] ?? "" : undefined,
+          translations: targetLangKey ? undefined : (e.translations || {}),
+          _rowIndex: e._rowIndex,
+        });
+      }
+    };
+
+    if (catKey) scanCategory(catKey);
+    else for (const cat of cache.byCategoryBySource.keys()) scanCategory(cat);
+
+    return {
+      content: [
+        {
+          type: "text",
+          text: JSON.stringify({ found: results.length > 0, count: results.length, results }, null, 2),
+        },
+      ],
+    };
+  }
+);
+
+/**
+ * MCP: lookup_texts (배치 정확 일치)
+ */
 mcp.tool(
   "lookup_texts",
   {
     texts: z.array(z.string()).min(1).max(2000),
-    sourceLang: z.string(),
+    sourceLang: z.string(), // ko-KR | en-US
     targetLang: z.string().optional(),
     category: z.string().optional(),
     forceReload: z.boolean().optional(),
   },
   async ({ texts, sourceLang, targetLang, category, forceReload }) => {
     const cache = await ensureMcpLoaded(Boolean(forceReload));
+
     const sourceLangKey = normalizeLang(sourceLang);
     assertAllowedSourceLang(sourceLangKey);
 
@@ -578,7 +706,7 @@ mcp.tool(
     for (const rawText of texts) {
       const needle = String(rawText ?? "").trim();
       if (!needle) {
-        out.push({ text: rawText, found: false, matches: [] });
+        out.push({ text: rawText, found: false, count: 0, matches: [] });
         continue;
       }
 
@@ -610,6 +738,62 @@ mcp.tool(
   }
 );
 
+/**
+ * MCP: read_sheet_rows (원본 row 읽기)
+ */
+mcp.tool(
+  "read_sheet_rows",
+  {
+    category: z.string().optional(),
+    offset: z.number().int().nonnegative().optional(),
+    limit: z.number().int().min(1).max(2000).optional(),
+    includeHeader: z.boolean().optional(),
+    forceReload: z.boolean().optional(),
+  },
+  async ({ category, offset, limit, includeHeader, forceReload }) => {
+    const cache = await ensureMcpLoaded(Boolean(forceReload));
+
+    const off = Math.max(0, Number(offset ?? 0));
+    const lim = Math.min(2000, Math.max(1, Number(limit ?? 200)));
+    const catKey = category ? String(category).trim().toLowerCase() : "";
+
+    let rowsOut = [];
+
+    if (!catKey) {
+      rowsOut = cache.rawRows.slice(off, off + lim).map((cells, i) => ({
+        rowIndex: off + i + 2,
+        cells,
+      }));
+    } else {
+      const indices = [];
+      for (const e of cache.entries) {
+        const eCat = String(e.category ?? "").trim().toLowerCase();
+        if (eCat === catKey) indices.push(e._rowIndex);
+      }
+      const page = indices.slice(off, off + lim);
+      rowsOut = page.map((rowIndex) => ({
+        rowIndex,
+        cells: cache.rawRows[rowIndex - 2] ?? [],
+      }));
+    }
+
+    const payload = {
+      loadedAt: cache.loadedAt,
+      range: SHEET_RANGE,
+      rawRowCount: cache.rawRowCount,
+      offset: off,
+      limit: lim,
+      count: rowsOut.length,
+      rows: rowsOut,
+    };
+    if (includeHeader) payload.header = cache.header;
+
+    return {
+      content: [{ type: "text", text: JSON.stringify(payload, null, 2) }],
+    };
+  }
+);
+
 // MCP endpoint
 app.all("/mcp", async (req, res) => {
   const transport = new StreamableHTTPServerTransport({
@@ -624,9 +808,10 @@ app.all("/mcp", async (req, res) => {
   await transport.handleRequest(req, res, body);
 });
 
+// ---------------- Start ----------------
 app.listen(PORT, () => {
   console.log(`Server listening on :${PORT}`);
   console.log(`Sheet range: ${SHEET_RANGE} (TERM ignored)`);
   console.log(`REST: /v1/session/init, /v1/translate/replace(+logs), /v1/glossary/update, /v1/glossary/raw`);
-  console.log(`MCP: /mcp (lookup_texts)`);
+  console.log(`MCP: /mcp (get_glossary, lookup_text, lookup_texts, read_sheet_rows)`);
 });
