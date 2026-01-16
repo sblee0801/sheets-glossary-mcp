@@ -8,13 +8,17 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 
 const PORT = Number(process.env.PORT || 8080);
+
 const SPREADSHEET_ID = process.env.SPREADSHEET_ID;
 const SHEET_NAME = process.env.SHEET_NAME || "Glossary";
-
 /**
  * ✅ TERM(V열) 무시 → A:U만 읽음
  */
 const SHEET_RANGE = process.env.SHEET_RANGE || `${SHEET_NAME}!A:U`;
+
+// Phase 1.5 Rules sheet (separate from Glossary)
+const RULE_SHEET_NAME = process.env.RULE_SHEET_NAME || "Rules";
+const RULE_SHEET_RANGE = process.env.RULE_SHEET_RANGE || `${RULE_SHEET_NAME}!A:U`;
 
 if (!SPREADSHEET_ID) throw new Error("SPREADSHEET_ID is missing. Check env.");
 if (!process.env.GOOGLE_SERVICE_ACCOUNT_JSON)
@@ -53,8 +57,8 @@ function assertAllowedSourceLang(sourceLangKey) {
   }
 }
 
-// ---------------- Google Sheets Read ----------------
-async function readSheetRange() {
+// ---------------- Google Sheets Read (Generic) ----------------
+async function readSheetRange(range) {
   const serviceAccount = JSON.parse(process.env.GOOGLE_SERVICE_ACCOUNT_JSON);
 
   const auth = new google.auth.GoogleAuth({
@@ -66,7 +70,7 @@ async function readSheetRange() {
 
   const res = await sheets.spreadsheets.values.get({
     spreadsheetId: SPREADSHEET_ID,
-    range: SHEET_RANGE,
+    range,
   });
 
   const values = res.data.values || [];
@@ -84,7 +88,7 @@ async function readSheetRange() {
  * - entries는 rows 길이만큼 모두 생성(필터링 없음)
  */
 async function loadGlossaryAll() {
-  const { header, rows } = await readSheetRange();
+  const { header, rows } = await readSheetRange(SHEET_RANGE);
   const loadedAt = new Date().toISOString();
 
   if (!header.length) {
@@ -160,6 +164,56 @@ async function loadGlossaryAll() {
     entries,
     rawRowCount: rows.length,
     langIndex,
+  };
+}
+
+// ---------------- Phase 1.5 Rules Load ----------------
+async function loadRulesAll() {
+  const { header, rows } = await readSheetRange(RULE_SHEET_RANGE);
+  const loadedAt = new Date().toISOString();
+
+  if (!header.length) {
+    return { loadedAt, header: [], rawRows: [], entries: [], rawRowCount: 0 };
+  }
+
+  const norm = header.map(normalizeHeader);
+  const idxKey = norm.indexOf("key");
+  const idxCategory = norm.indexOf("분류");
+  const idxKo = norm.indexOf("ko-kr");
+  const idxMatchType = norm.indexOf("match_type");
+  const idxPriority = norm.indexOf("priority");
+  const idxNote = norm.indexOf("note");
+
+  if (idxKey < 0) throw new Error("Rules 시트 헤더에 KEY가 없습니다.");
+  if (idxCategory < 0) throw new Error("Rules 시트 헤더에 분류가 없습니다.");
+  if (idxKo < 0) throw new Error("Rules 시트 헤더에 ko-KR이 없습니다.");
+
+  const entries = rows.map((r, rowIdx) => {
+    const key = String(r[idxKey] ?? "").trim();
+    const category = String(r[idxCategory] ?? "").trim().toLowerCase();
+    const ko = String(r[idxKo] ?? "").trim();
+
+    const matchType = idxMatchType >= 0 ? String(r[idxMatchType] ?? "").trim().toLowerCase() : "";
+    const priority = idxPriority >= 0 ? Number(String(r[idxPriority] ?? "").trim() || "0") : 0;
+    const note = idxNote >= 0 ? String(r[idxNote] ?? "").trim() : "";
+
+    return {
+      _rowIndex: rowIdx + 2,
+      key,
+      category,
+      ko,
+      matchType,
+      priority,
+      note,
+    };
+  });
+
+  return {
+    loadedAt,
+    header,
+    rawRows: rows,
+    entries,
+    rawRowCount: rows.length,
   };
 }
 
@@ -270,6 +324,30 @@ async function ensureGlobalLoaded(forceReload = false) {
   return globalCache;
 }
 
+// ---------------- Phase 1.5 Rules Cache ----------------
+/**
+ * globalRulesCache = { loadedAt, header, rawRows, entries, rawRowCount, itemEntries }
+ */
+let globalRulesCache = null;
+
+async function ensureRulesLoaded(forceReload = false) {
+  if (globalRulesCache && !forceReload) return globalRulesCache;
+
+  const loaded = await loadRulesAll();
+  const itemEntries = loaded.entries.filter((e) => e.category === "item" && e.ko);
+
+  globalRulesCache = {
+    loadedAt: loaded.loadedAt,
+    header: loaded.header,
+    rawRows: loaded.rawRows,
+    entries: loaded.entries,
+    rawRowCount: loaded.rawRowCount,
+    itemEntries,
+  };
+
+  return globalRulesCache;
+}
+
 /**
  * category가 없을 때: 모든 카테고리의 sourceTextMap을 하나로 머지
  * Map<sourceText, entry[]>
@@ -333,11 +411,6 @@ const ReplaceSchema = z
     { message: "If sessionId is not provided, sourceLang and targetLang are required." }
   );
 
-/**
- * ✅ sessionId 옵션 지원:
- * - sessionId 있으면 해당 세션만 업데이트
- * - sessionId 없으면: 현재 프로세스의 globalCache 리로드 + 모든 세션 갱신
- */
 const UpdateSchema = z.object({
   sessionId: z.string().min(1).optional(),
 });
@@ -518,7 +591,9 @@ app.post("/v1/translate/replace", async (req, res) => {
     if (!sourceTextMap || sourceTextMap.size === 0) {
       return res.status(400).json({
         ok: false,
-        error: `No source texts found for sourceLang='${sourceLangKey}' (category=${category ? String(category) : "ALL"}).`,
+        error: `No source texts found for sourceLang='${sourceLangKey}' (category=${
+          category ? String(category) : "ALL"
+        }).`,
       });
     }
 
@@ -584,19 +659,14 @@ app.post("/v1/glossary/update", async (req, res) => {
 
       let updatedSessions = 0;
       for (const [sid, s] of sessions.entries()) {
-        // 세션의 category/source/target 유지
         const categoryKey = s.categoryKey;
         const sourceLangKey = s.sourceLangKey;
-        const targetLangKey = s.targetLangKey;
 
         if (sourceLangKey === "en-us" && cache.langIndex["en-us"] == null) {
-          // 해당 세션은 유지하되, 번역은 이후 replace 호출 시 오류 가능
-          // 여기서는 업데이트만 진행
+          // 유지하되 이후 replace 호출 시 오류 가능
         }
 
-        // 카테고리 유효성 체크
         if (!cache.byCategoryBySource.has(categoryKey)) {
-          // 카테고리가 사라진 세션은 그대로 두고 카운트만 제외
           continue;
         }
 
@@ -609,7 +679,6 @@ app.post("/v1/glossary/update", async (req, res) => {
           langIndex: cache.langIndex,
           byCategoryBySource: cache.byCategoryBySource,
         };
-        // 그대로 저장
         sessions.set(sid, s);
         updatedSessions += 1;
       }
@@ -624,7 +693,7 @@ app.post("/v1/glossary/update", async (req, res) => {
       });
     }
 
-    // 2) sessionId 있으면: 해당 세션만 갱신 (기존)
+    // 2) sessionId 있으면: 해당 세션만 갱신
     const s = getSessionOrThrow(sessionId);
 
     const cache = await ensureGlobalLoaded(true);
@@ -672,6 +741,28 @@ app.post("/v1/glossary/update", async (req, res) => {
       targetLang: s.targetLangKey,
       glossaryLoadedAt: cache.loadedAt,
       rawRowCount: cache.rawRowCount,
+    });
+  } catch (e) {
+    const status = e?.status ?? 500;
+    return res.status(status).json({ ok: false, error: e?.message ?? String(e) });
+  }
+});
+
+/**
+ * POST /v1/rules/update
+ * - Phase 1.5 Rules 캐시 강제 리로드 (프로세스 단위)
+ * - ✅ 명시적 호출에서만 업데이트
+ */
+app.post("/v1/rules/update", async (_req, res) => {
+  try {
+    const cache = await ensureRulesLoaded(true);
+    return res.status(200).json({
+      ok: true,
+      mode: "process",
+      rulesLoadedAt: cache.loadedAt,
+      rawRowCount: cache.rawRowCount,
+      itemRulesCount: cache.itemEntries.length,
+      range: RULE_SHEET_RANGE,
     });
   } catch (e) {
     const status = e?.status ?? 500;
@@ -906,8 +997,9 @@ app.all("/mcp", async (req, res) => {
 app.listen(PORT, () => {
   console.log(`Server listening on :${PORT}`);
   console.log(`Sheet range: ${SHEET_RANGE} (TERM ignored)`);
+  console.log(`Rule range: ${RULE_SHEET_RANGE}`);
   console.log(
-    `REST: /v1/session/init, /v1/translate/replace(+logs, stateless ok), /v1/glossary/update(session optional), /v1/glossary/raw`
+    `REST: /v1/session/init, /v1/translate/replace(+logs, stateless ok), /v1/glossary/update(session optional), /v1/rules/update, /v1/glossary/raw`
   );
   console.log(`MCP: /mcp (replace_texts, glossary_update)`);
 });
