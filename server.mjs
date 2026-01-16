@@ -568,6 +568,10 @@ app.all("/mcp", async (req, res) => {
   await transport.handleRequest(req, res, body);
 });
 
+app.get("/", (_req, res) => {
+  res.status(200).send("ok");
+});
+
 // ---------------- Start ----------------
 app.listen(PORT, () => {
   console.log(`API listening on :${PORT}`);
