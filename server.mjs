@@ -11,6 +11,7 @@ const PORT = Number(process.env.PORT || 8080);
 
 const SPREADSHEET_ID = process.env.SPREADSHEET_ID;
 const SHEET_NAME = process.env.SHEET_NAME || "Glossary";
+
 /**
  * ✅ TERM(V열) 무시 → A:U만 읽음
  */
@@ -167,31 +168,49 @@ async function loadGlossaryAll() {
   };
 }
 
-// ---------------- Phase 1.5 Rules Load ----------------
+// ---------------- Phase 1.5 Rules Load (with translations) ----------------
 async function loadRulesAll() {
   const { header, rows } = await readSheetRange(RULE_SHEET_RANGE);
   const loadedAt = new Date().toISOString();
 
   if (!header.length) {
-    return { loadedAt, header: [], rawRows: [], entries: [], rawRowCount: 0 };
+    return { loadedAt, header: [], rawRows: [], entries: [], rawRowCount: 0, langIndex: {} };
   }
 
   const norm = header.map(normalizeHeader);
+
   const idxKey = norm.indexOf("key");
   const idxCategory = norm.indexOf("분류");
-  const idxKo = norm.indexOf("ko-kr");
   const idxMatchType = norm.indexOf("match_type");
   const idxPriority = norm.indexOf("priority");
   const idxNote = norm.indexOf("note");
 
   if (idxKey < 0) throw new Error("Rules 시트 헤더에 KEY가 없습니다.");
   if (idxCategory < 0) throw new Error("Rules 시트 헤더에 분류가 없습니다.");
-  if (idxKo < 0) throw new Error("Rules 시트 헤더에 ko-KR이 없습니다.");
+
+  // 언어 컬럼 인덱스 구성 (Glossary와 동일 방식)
+  const excluded = new Set(["key", "분류", "category", "term", "note", "notes", "priority", "match_type"]);
+  const langIndex = {};
+  for (let i = 0; i < norm.length; i++) {
+    const h = norm[i];
+    if (!h) continue;
+    if (excluded.has(h)) continue;
+    langIndex[h] = i; // ko-kr, en-us, zh-cn ...
+  }
+
+  if (langIndex["ko-kr"] == null) {
+    throw new Error("Rules 시트 헤더에 ko-KR이 없습니다. 언어 컬럼 헤더가 'ko-KR'인지 확인하세요.");
+  }
 
   const entries = rows.map((r, rowIdx) => {
     const key = String(r[idxKey] ?? "").trim();
     const category = String(r[idxCategory] ?? "").trim().toLowerCase();
-    const ko = String(r[idxKo] ?? "").trim();
+
+    const translations = {};
+    for (const [langKey, colIdx] of Object.entries(langIndex)) {
+      const v = String(r[colIdx] ?? "").trim();
+      if (v) translations[langKey] = v;
+    }
 
     const matchType = idxMatchType >= 0 ? String(r[idxMatchType] ?? "").trim().toLowerCase() : "";
     const priority = idxPriority >= 0 ? Number(String(r[idxPriority] ?? "").trim() || "0") : 0;
@@ -201,7 +220,7 @@ async function loadRulesAll() {
       _rowIndex: rowIdx + 2,
       key,
       category,
-      ko,
+      translations, // ✅ ko-kr / en-us 등
       matchType,
       priority,
       note,
@@ -214,6 +233,7 @@ async function loadRulesAll() {
     rawRows: rows,
     entries,
     rawRowCount: rows.length,
+    langIndex,
   };
 }
 
@@ -300,6 +320,86 @@ function replaceByGlossaryWithLogs({ text, sourceLangKey, targetLangKey, sourceT
   return { out, replacedTotal, logs };
 }
 
+// ---------------- Phase 1.5 Rule Match + Logs ----------------
+function tokenizePatternToRegex(pattern) {
+  const escaped = escapeRegExp(pattern);
+  return escaped
+    .replace(/\\\{N\\\}/g, "(\\d+)")
+    .replace(/\\\{X\\\}/g, "(\\d+)")
+    .replace(/\\\{T\\\}/g, "(\\d+)")
+    .replace(/\\\{V\\\}/g, "([^\\r\\n]+)");
+}
+
+function ruleMatchesText(ruleKo, matchType, text) {
+  const ko = String(ruleKo ?? "").trim();
+  if (!ko) return false;
+
+  const mt = String(matchType ?? "").trim().toLowerCase();
+
+  if (!mt || mt === "exact") {
+    // MVP: exact라도 '완전일치' 대신 '포함'으로 시작 (실데이터 변형 대응)
+    return text.includes(ko);
+  }
+
+  if (mt === "regex") {
+    try {
+      const re = new RegExp(ko, "m");
+      return re.test(text);
+    } catch {
+      return false;
+    }
+  }
+
+  if (mt === "pattern") {
+    try {
+      const reSrc = tokenizePatternToRegex(ko);
+      const re = new RegExp(reSrc, "m");
+      return re.test(text);
+    } catch {
+      return false;
+    }
+  }
+
+  return text.includes(ko);
+}
+
+function buildRuleLogs({ text, categoryKey, targetLangKey, rulesCache }) {
+  // 항상 배열 반환(0건 가능)
+  const out = [];
+  if (!text) return out;
+  if (categoryKey !== "item") return out;
+
+  const rules = rulesCache?.itemEntries ?? [];
+  if (!rules.length) return out;
+
+  for (const r of rules) {
+    const from = String(r.translations?.["ko-kr"] ?? "").trim();
+    if (!from) continue;
+
+    const matched = ruleMatchesText(from, r.matchType, text);
+    if (!matched) continue;
+
+    const to = String(r.translations?.[targetLangKey] ?? "").trim();
+
+    out.push({
+      ruleKey: r.key || `row:${r._rowIndex}`,
+      from,
+      to: to || "",
+    });
+  }
+
+  // 중복 제거
+  const uniq = [];
+  const seen = new Set();
+  for (const x of out) {
+    const k = `${x.ruleKey}@@${x.from}@@${x.to}`;
+    if (seen.has(k)) continue;
+    seen.add(k);
+    uniq.push(x);
+  }
+  return uniq;
+}
+
 // ---------------- Shared Cache (REST + MCP) ----------------
 /**
  * globalCache = { loadedAt, header, rawRows, entries, rawRowCount, langIndex, byCategoryBySource }
@@ -326,7 +426,7 @@ async function ensureGlobalLoaded(forceReload = false) {
 
 // ---------------- Phase 1.5 Rules Cache ----------------
 /**
- * globalRulesCache = { loadedAt, header, rawRows, entries, rawRowCount, itemEntries }
+ * globalRulesCache = { loadedAt, header, rawRows, entries, rawRowCount, langIndex, itemEntries }
  */
 let globalRulesCache = null;
 
@@ -334,7 +434,12 @@ async function ensureRulesLoaded(forceReload = false) {
   if (globalRulesCache && !forceReload) return globalRulesCache;
 
   const loaded = await loadRulesAll();
-  const itemEntries = loaded.entries.filter((e) => e.category === "item" && e.ko);
+
+  const itemEntries = loaded.entries.filter((e) => {
+    if (e.category !== "item") return false;
+    const ko = String(e.translations?.["ko-kr"] ?? "").trim();
+    return Boolean(ko);
+  });
 
   globalRulesCache = {
     loadedAt: loaded.loadedAt,
@@ -342,6 +447,7 @@ async function ensureRulesLoaded(forceReload = false) {
     rawRows: loaded.rawRows,
     entries: loaded.entries,
     rawRowCount: loaded.rawRowCount,
+    langIndex: loaded.langIndex,
     itemEntries,
   };
 
@@ -503,11 +609,15 @@ app.post("/v1/session/init", async (req, res) => {
  * POST /v1/translate/replace
  * - Phase 1 치환 + 로그 반환
  * - ✅ sessionId 없이도 사용 가능 (category optional, 없으면 ALL)
+ * - ✅ Phase 1.5 룰 사용 로그(ruleLogs)도 항상 반환(빈 배열 가능)
  */
 app.post("/v1/translate/replace", async (req, res) => {
   try {
     const { sessionId, texts, includeLogs, category, sourceLang, targetLang } = ReplaceSchema.parse(req.body);
     const wantLogs = includeLogs ?? true;
+
+    // Phase 1.5 rules cache (process-level)
+    const rulesCache = await ensureRulesLoaded(false);
 
     // 1) session 기반 (기존)
     if (sessionId) {
@@ -524,6 +634,7 @@ app.post("/v1/translate/replace", async (req, res) => {
 
       const outTexts = [];
       const perLineLogs = [];
+      const perLineRuleLogs = [];
       let replacedTotalAll = 0;
       let matchedTermsAll = 0;
 
@@ -541,6 +652,15 @@ app.post("/v1/translate/replace", async (req, res) => {
         matchedTermsAll += logs.length;
 
         if (wantLogs) perLineLogs.push({ index: i, replacedTotal, logs });
+
+        // Phase 1.5 rule logs (always returned)
+        const ruleLogs = buildRuleLogs({
+          text: out,
+          categoryKey: s.categoryKey,
+          targetLangKey: s.targetLangKey,
+          rulesCache,
+        });
+        perLineRuleLogs.push({ index: i, logs: ruleLogs });
       }
 
       return res.status(200).json({
@@ -559,6 +679,7 @@ app.post("/v1/translate/replace", async (req, res) => {
           rawRowCount: s.glossary.rawRowCount,
         },
         logs: wantLogs ? perLineLogs : undefined,
+        ruleLogs: perLineRuleLogs, // ✅ 항상 존재(빈 배열 가능)
       });
     }
 
@@ -577,28 +698,30 @@ app.post("/v1/translate/replace", async (req, res) => {
     }
 
     let categories = [];
+    let categoryKeyForRules = "ALL";
     if (category && String(category).trim()) {
       const catKey = String(category).trim().toLowerCase();
       if (!cache.byCategoryBySource.has(catKey)) {
         return res.status(400).json({ ok: false, error: `Category not found: ${category}` });
       }
       categories = [catKey];
+      categoryKeyForRules = catKey;
     } else {
       categories = Array.from(cache.byCategoryBySource.keys());
+      categoryKeyForRules = "ALL";
     }
 
     const sourceTextMap = mergeSourceTextMapsFromCache(cache, sourceLangKey, categories);
     if (!sourceTextMap || sourceTextMap.size === 0) {
       return res.status(400).json({
         ok: false,
-        error: `No source texts found for sourceLang='${sourceLangKey}' (category=${
-          category ? String(category) : "ALL"
-        }).`,
+        error: `No source texts found for sourceLang='${sourceLangKey}' (category=${category ? String(category) : "ALL"}).`,
       });
     }
 
     const outTexts = [];
     const perLineLogs = [];
+    const perLineRuleLogs = [];
     let replacedTotalAll = 0;
     let matchedTermsAll = 0;
 
@@ -616,6 +739,14 @@ app.post("/v1/translate/replace", async (req, res) => {
       matchedTermsAll += logs.length;
 
       if (wantLogs) perLineLogs.push({ index: i, replacedTotal, logs });
+
+      const ruleLogs = buildRuleLogs({
+        text: out,
+        categoryKey: categoryKeyForRules,
+        targetLangKey,
+        rulesCache,
+      });
+      perLineRuleLogs.push({ index: i, logs: ruleLogs });
     }
 
     return res.status(200).json({
@@ -636,6 +767,7 @@ app.post("/v1/translate/replace", async (req, res) => {
         uniqueTermsInIndex: sourceTextMap.size,
       },
       logs: wantLogs ? perLineLogs : undefined,
+      ruleLogs: perLineRuleLogs, // ✅ 항상 존재(빈 배열 가능)
     });
   } catch (e) {
     const status = e?.status ?? 500;
@@ -663,7 +795,7 @@ app.post("/v1/glossary/update", async (req, res) => {
         const sourceLangKey = s.sourceLangKey;
 
         if (sourceLangKey === "en-us" && cache.langIndex["en-us"] == null) {
-          // 유지하되 이후 replace 호출 시 오류 가능
+          // 해당 세션은 유지하되, 번역은 이후 replace 호출 시 오류 가능
         }
 
         if (!cache.byCategoryBySource.has(categoryKey)) {
@@ -999,7 +1131,7 @@ app.listen(PORT, () => {
   console.log(`Sheet range: ${SHEET_RANGE} (TERM ignored)`);
   console.log(`Rule range: ${RULE_SHEET_RANGE}`);
   console.log(
-    `REST: /v1/session/init, /v1/translate/replace(+logs, stateless ok), /v1/glossary/update(session optional), /v1/rules/update, /v1/glossary/raw`
+    `REST: /v1/session/init, /v1/translate/replace(+logs, stateless ok, +ruleLogs), /v1/glossary/update(session optional), /v1/rules/update, /v1/glossary/raw`
   );
   console.log(`MCP: /mcp (replace_texts, glossary_update)`);
 });
