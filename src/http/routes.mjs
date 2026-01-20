@@ -160,6 +160,11 @@ async function resolveReplaceContext({
 // ---------------- Routes ----------------
 export function registerRoutes(app) {
   // health/basic
+  // NOTE:
+  // - /healthz 는 Cloud Run/프런트 레이어에서 간헐적으로 컨테이너까지 전달되지 않는 케이스가 있어
+  //   외부 확인용으로 /health 를 추가로 제공합니다.
+  // - 내부적으로는 둘 다 동일 응답입니다.
+  app.get("/health", (_req, res) => res.status(200).json({ ok: true }));
   app.get("/healthz", (_req, res) => res.status(200).json({ ok: true }));
   app.get("/", (_req, res) => res.status(200).send("ok"));
 
@@ -536,8 +541,6 @@ export function registerRoutes(app) {
 
   /**
    * ✅ NEW: Step 2-1 프레임: POST /v1/glossary/candidates/batch
-   * - 아직 실제 후보 수집은 하지 않음
-   * - 하지만 응답 계약/구조 + fallbackNeeded 계산은 완성
    */
   app.post("/v1/glossary/candidates/batch", async (req, res) => {
     try {
