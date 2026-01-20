@@ -2,6 +2,10 @@
  * src/candidates/batch.mjs
  * - Production policy: Divine Pride ONLY
  * - If candidate text is identical to sourceText => treated as "no useful candidate"
+ *
+ * 🔧 변경:
+ * - category 필수 제거 (en-US anchor 기반으로만 후보 조회)
+ * - category가 들어오면 meta/필터 용도로만 유지 (현재 DP 수집에는 영향 거의 없음)
  */
 
 import { normalizeLang, nowIso, isLikelyEnglish } from "../utils/common.mjs";
@@ -115,7 +119,7 @@ function mapDpCandidateToBatchCandidate(dpCand) {
  * Step 2 candidates/batch (Divine Pride only)
  */
 export async function runCandidatesBatch({
-  category,
+  category, // ✅ optional
   sourceLang,
   sourceTexts,
   targetLangs,
@@ -125,14 +129,19 @@ export async function runCandidatesBatch({
 }) {
   const startedAt = nowIso();
 
-  const categoryKey = String(category ?? "").trim().toLowerCase();
-  const sourceLangKey = normalizeLang(sourceLang || "en-US");
+  const categoryKeyRaw = String(category ?? "").trim().toLowerCase();
+  const categoryKey = categoryKeyRaw || "ALL";
 
-  if (categoryKey !== "item") {
-    const err = new Error("Only category='item' is supported for now.");
+  // ✅ category는 더 이상 식별/필수 조건이 아님
+  // 다만 기존 운영 전제(item 중심)와의 정합을 위해:
+  // - category가 지정된 경우에만 "item" 외 값은 거부(선택적 필터 정책)
+  if (categoryKeyRaw && categoryKeyRaw !== "item") {
+    const err = new Error("Only category='item' is supported when category is provided.");
     err.status = 400;
     throw err;
   }
+
+  const sourceLangKey = normalizeLang(sourceLang || "en-US");
   if (sourceLangKey !== "en-us") {
     const err = new Error("sourceLang must be en-US (anchor) for candidates/batch.");
     err.status = 400;
@@ -215,7 +224,7 @@ export async function runCandidatesBatch({
         candidates: candidatesByLang[lk],
       });
 
-      // 안전장치(실질 영향 거의 없음): 영어로 보이고 normalize 동일이면 제거
+      // 안전장치: 영어로 보이고 normalize 동일이면 제거
       if (sourceLooksEnglish) {
         filtered = filtered.filter((c) => {
           const t = String(c?.text ?? "").trim();
@@ -242,7 +251,7 @@ export async function runCandidatesBatch({
 
   return {
     ok: true,
-    category: categoryKey,
+    category: categoryKey, // ✅ "ALL" or "item"
     sourceLang: "en-US",
     targetLangs,
     sourcesUsed: ["divinePride"],
@@ -255,6 +264,7 @@ export async function runCandidatesBatch({
     results,
     notes: [
       "Divine Pride only: candidates are collected from Divine Pride; identical-to-source candidates are treated as no useful candidate.",
+      "category is optional; when omitted, server treats scope as ALL (metadata only for this endpoint).",
     ],
     warnings: [],
   };
