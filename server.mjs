@@ -65,16 +65,40 @@ function isLikelyEnglish(s) {
   return ratio > 0.95;
 }
 
-// ---------------- Google Sheets Read (Generic) ----------------
-async function readSheetRange(range) {
+function colIndexToA1(colIndex0) {
+  // 0 -> A, 1 -> B ...
+  let n = Number(colIndex0) + 1;
+  let s = "";
+  while (n > 0) {
+    const r = (n - 1) % 26;
+    s = String.fromCharCode(65 + r) + s;
+    n = Math.floor((n - 1) / 26);
+  }
+  return s;
+}
+
+// ---------------- Google Sheets Client (Read/Write) ----------------
+let _sheetsClient = null;
+
+function getSheetsClient() {
+  if (_sheetsClient) return _sheetsClient;
+
   const serviceAccount = JSON.parse(process.env.GOOGLE_SERVICE_ACCOUNT_JSON);
 
   const auth = new google.auth.GoogleAuth({
     credentials: serviceAccount,
-    scopes: ["https://www.googleapis.com/auth/spreadsheets.readonly"],
+    // ✅ Write 지원 스코프
+    scopes: ["https://www.googleapis.com/auth/spreadsheets"],
   });
 
   const sheets = google.sheets({ version: "v4", auth });
+  _sheetsClient = sheets;
+  return sheets;
+}
+
+// ---------------- Google Sheets Read (Generic) ----------------
+async function readSheetRange(range) {
+  const sheets = getSheetsClient();
 
   const res = await sheets.spreadsheets.values.get({
     spreadsheetId: SPREADSHEET_ID,
@@ -88,6 +112,28 @@ async function readSheetRange(range) {
   const rows = values.slice(1);
 
   return { header, rows };
+}
+
+async function batchUpdateValuesA1(updates) {
+  // updates: [{ range: "Glossary!K12", values: [[...]] }]
+  const sheets = getSheetsClient();
+
+  if (!updates || updates.length === 0) {
+    return { updatedCells: 0, updatedRanges: [] };
+  }
+
+  const res = await sheets.spreadsheets.values.batchUpdate({
+    spreadsheetId: SPREADSHEET_ID,
+    requestBody: {
+      valueInputOption: "RAW",
+      data: updates,
+    },
+  });
+
+  const totalUpdatedCells = res.data.totalUpdatedCells ?? 0;
+  const updatedRanges = (res.data.responses || []).map((r) => r.updatedRange).filter(Boolean);
+
+  return { updatedCells: totalUpdatedCells, updatedRanges };
 }
 
 /**
@@ -105,6 +151,7 @@ async function loadGlossaryAll() {
       entries: [],
       rawRowCount: 0,
       langIndex: {},
+      idx: {},
     };
   }
 
@@ -156,7 +203,7 @@ async function loadGlossaryAll() {
     }
 
     return {
-      _rowIndex: rowIdx + 2,
+      _rowIndex: rowIdx + 2, // sheet row index (1-based + header)
       key,
       category,
       translations,
@@ -170,6 +217,7 @@ async function loadGlossaryAll() {
     entries,
     rawRowCount: rows.length,
     langIndex,
+    idx: { key: idxKey, category: idxCategory },
   };
 }
 
@@ -416,6 +464,7 @@ async function ensureGlobalLoaded(forceReload = false) {
     rawRowCount: loaded.rawRowCount,
     langIndex: loaded.langIndex,
     byCategoryBySource,
+    idx: loaded.idx,
   };
   return globalCache;
 }
@@ -521,13 +570,33 @@ const SuggestSchema = z.object({
   generateTargets: z.boolean().optional().default(false),
 });
 
-// ✅ Step 3A-1: candidates endpoint schema
+// ✅ candidates endpoint schema (MVP 유지)
 const CandidatesSchema = z.object({
   category: z.string().min(1),
   sourceText: z.string().min(1),
   sourceLang: z.string().optional().default("en-US"),
   targetLangs: z.array(z.string()).min(1).max(20),
   sources: z.array(z.enum(["iroWikiDb", "rateMyServer", "divinePride"])).optional(),
+});
+
+// ✅ NEW: apply endpoint schema (en-US row match -> write only target language columns)
+const ApplySchema = z.object({
+  category: z.string().min(1),
+  sourceLang: z.string().optional().default("en-US"),
+  // en-US는 이미 채워져 있으므로, sourceText(en-US)로 행을 찾는다.
+  entries: z
+    .array(
+      z.object({
+        sourceText: z.string().min(1), // en-US text
+        translations: z.record(z.string().min(1)), // { "ko-KR": "...", "de-DE": "...", ... }
+      })
+    )
+    .min(1)
+    .max(500),
+  // 기본: 빈 셀만 채움
+  fillOnlyEmpty: z.boolean().optional().default(true),
+  // 옵션: 특정 언어만 제한하고 싶을 때 (미지정이면 entries.translations의 키를 그대로 사용)
+  targetLangs: z.array(z.string().min(1)).optional(),
 });
 
 // ---------------- HTTP App ----------------
@@ -917,7 +986,6 @@ app.post("/v1/glossary/suggest", async (req, res) => {
     }
 
     const includeEvidence = Boolean(body.includeEvidence);
-    const _sources = body.sources ?? ["iroWikiDb", "rateMyServer", "divinePride"];
 
     const results = body.terms.map((termRaw) => {
       const input = String(termRaw ?? "").trim();
@@ -1010,6 +1078,129 @@ app.post("/v1/glossary/candidates", async (req, res) => {
 });
 
 /**
+ * ✅ NEW: POST /v1/glossary/apply
+ * - en-US(sourceText) + category 로 기존 행을 찾고
+ * - 해당 언어 컬럼만 채워 넣는다
+ * - 기본: 빈 셀만 채움(fillOnlyEmpty=true)
+ */
+app.post("/v1/glossary/apply", async (req, res) => {
+  try {
+    const body = ApplySchema.parse(req.body ?? {});
+    const categoryKey = String(body.category).trim().toLowerCase();
+
+    const sourceLangKey = normalizeLang(body.sourceLang ?? "en-US");
+    if (sourceLangKey !== "en-us") {
+      return res.status(400).json({ ok: false, error: "sourceLang must be en-US (anchor) for apply." });
+    }
+
+    // 최신 Glossary 로드(쓰기 반영은 최신 기준이 안전)
+    const cache = await ensureGlobalLoaded(true);
+
+    if (cache.langIndex["en-us"] == null) {
+      return res.status(400).json({
+        ok: false,
+        error: "Header does not include en-US column. Cannot apply by en-US anchor.",
+      });
+    }
+
+    // category 매칭은 시트의 '분류' 셀 값 기준. 인덱스는 이미 entries.category로 로드됨.
+    // targetLangs가 지정되면 그 언어만, 아니면 entries.translations의 키 그대로 사용
+    const targetLangAllow = body.targetLangs ? new Set(body.targetLangs.map(normalizeLang)) : null;
+
+    const updates = [];
+    const notFound = [];
+    const skipped = [];
+    let matchedRows = 0;
+
+    // 빠른 검색용: categoryLower + en-us text -> entry
+    const mapByCatAndEn = new Map();
+    for (const e of cache.entries) {
+      const cat = String(e.category ?? "").trim().toLowerCase();
+      const en = String(e.translations?.["en-us"] ?? "").trim();
+      if (!cat || !en) continue;
+      const k = `${cat}@@${en}`;
+      if (!mapByCatAndEn.has(k)) mapByCatAndEn.set(k, e);
+    }
+
+    for (const item of body.entries) {
+      const sourceText = String(item.sourceText ?? "").trim();
+      if (!sourceText) continue;
+
+      const key = `${categoryKey}@@${sourceText}`;
+      const rowEntry = mapByCatAndEn.get(key);
+
+      if (!rowEntry) {
+        notFound.push({ sourceText, reason: "Row not found by category+en-US" });
+        continue;
+      }
+
+      matchedRows += 1;
+
+      const rowIndex = rowEntry._rowIndex;
+
+      for (const [langRaw, textRaw] of Object.entries(item.translations || {})) {
+        const langKey = normalizeLang(langRaw);
+        if (!langKey) continue;
+
+        // sourceLang(en-us)은 기준키이므로 쓰지 않는다 (요구사항)
+        if (langKey === "en-us") continue;
+
+        if (targetLangAllow && !targetLangAllow.has(langKey)) continue;
+
+        const colIdx = cache.langIndex[langKey];
+        if (colIdx == null) {
+          skipped.push({ sourceText, lang: langRaw, reason: "Language column not found in header" });
+          continue;
+        }
+
+        const newText = String(textRaw ?? "").trim();
+        if (!newText) continue;
+
+        // fillOnlyEmpty=true면, 기존 값이 있으면 스킵
+        if (body.fillOnlyEmpty) {
+          const existing = String(rowEntry.translations?.[langKey] ?? "").trim();
+          if (existing) {
+            skipped.push({ sourceText, lang: langKey, reason: "Cell already has value (fillOnlyEmpty=true)" });
+            continue;
+          }
+        }
+
+        const colA1 = colIndexToA1(colIdx);
+        const a1 = `${SHEET_NAME}!${colA1}${rowIndex}`;
+        updates.push({ range: a1, values: [[newText]] });
+      }
+    }
+
+    // 실제 반영
+    const { updatedCells, updatedRanges } = await batchUpdateValuesA1(updates);
+
+    // 캐시 갱신(반영 후 최신화)
+    await ensureGlobalLoaded(true);
+
+    return res.status(200).json({
+      ok: true,
+      category: categoryKey,
+      sourceLang: "en-US",
+      fillOnlyEmpty: Boolean(body.fillOnlyEmpty),
+      inputCount: body.entries.length,
+      matchedRows,
+      writePlan: {
+        intendedUpdates: updates.length,
+      },
+      result: {
+        updatedCells,
+        updatedRangesCount: updatedRanges.length,
+      },
+      notFound,
+      skipped,
+    });
+  } catch (e) {
+    const status = e?.status ?? 500;
+    return res.status(status).json({ ok: false, error: e?.message ?? String(e) });
+  }
+});
+
+/**
  * GET /v1/glossary/raw?sessionId=...&offset=0&limit=200
  */
 app.get("/v1/glossary/raw", (req, res) => {
@@ -1049,7 +1240,7 @@ app.get("/v1/glossary/raw", (req, res) => {
 // ---------------- MCP (ONLY 2 TOOLS) ----------------
 const mcp = new McpServer({
   name: "sheets-glossary-mcp",
-  version: "2.4.1",
+  version: "2.4.2",
 });
 
 /**
@@ -1235,7 +1426,7 @@ app.listen(PORT, () => {
   console.log(`Sheet range: ${SHEET_RANGE} (TERM ignored)`);
   console.log(`Rule range: ${RULE_SHEET_RANGE}`);
   console.log(
-    `REST: /v1/session/init, /v1/translate/replace(+logs, stateless ok, +ruleLogs), /v1/glossary/update(session optional), /v1/rules/update, /v1/glossary/suggest, /v1/glossary/candidates, /v1/glossary/raw`
+    `REST: /v1/session/init, /v1/translate/replace(+logs, stateless ok, +ruleLogs), /v1/glossary/update(session optional), /v1/rules/update, /v1/glossary/suggest, /v1/glossary/candidates, /v1/glossary/apply, /v1/glossary/raw`
   );
   console.log(`MCP: /mcp (replace_texts, glossary_update)`);
 });
