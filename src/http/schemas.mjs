@@ -56,11 +56,9 @@ export const CandidatesSchema = z.object({
 });
 
 // ✅ candidates/batch endpoint schema (운영 고정: divinePride만 허용)
-// 🔧 변경: category optional (미지정 허용)
 export const CandidatesBatchSchema = z.object({
-  category: z.string().optional(), // ✅ optional
-
-  sourceLang: z.string().optional().default("en-US"), // anchor 고정 예정
+  category: z.string().min(1),
+  sourceLang: z.string().optional().default("en-US"), // anchor 고정
   sourceTexts: z.array(z.string().min(1)).min(1).max(500),
   targetLangs: z.array(z.string().min(1)).min(1).max(20),
 
@@ -73,8 +71,11 @@ export const CandidatesBatchSchema = z.object({
 
 // ✅ apply endpoint schema (en-US row match -> write only target language columns)
 export const ApplySchema = z.object({
-  category: z.string().optional(), // (이미 optional로 바꾼 상태라면 그대로)
+  // ✅ category optional (필터)
+  category: z.string().optional(),
+
   sourceLang: z.string().optional().default("en-US"),
+
   entries: z
     .array(
       z.object({
@@ -87,6 +88,11 @@ export const ApplySchema = z.object({
     )
     .min(1)
     .max(500),
+
   fillOnlyEmpty: z.boolean().optional().default(true),
+
   targetLangs: z.array(z.string().min(1)).optional(),
+
+  // ✅ NEW: en-US(anchor) 컬럼 업데이트 허용 플래그 (기본 false)
+  allowAnchorUpdate: z.boolean().optional().default(false),
 });

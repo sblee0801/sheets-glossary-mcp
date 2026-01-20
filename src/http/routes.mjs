@@ -160,10 +160,6 @@ async function resolveReplaceContext({
 // ---------------- Routes ----------------
 export function registerRoutes(app) {
   // health/basic
-  // NOTE:
-  // - /healthz 는 Cloud Run/프런트 레이어에서 간헐적으로 컨테이너까지 전달되지 않는 케이스가 있어
-  //   외부 확인용으로 /health 를 추가로 제공합니다.
-  // - 내부적으로는 둘 다 동일 응답입니다.
   app.get("/health", (_req, res) => res.status(200).json({ ok: true }));
   app.get("/healthz", (_req, res) => res.status(200).json({ ok: true }));
   app.get("/", (_req, res) => res.status(200).send("ok"));
@@ -499,8 +495,6 @@ export function registerRoutes(app) {
 
   /**
    * Step 3A-1 (MVP): POST /v1/glossary/candidates
-   * - 후보 수집은 아직 하지 않음
-   * - 언어별 candidates=[], fallbackNeededByLang=true 로 반환
    */
   app.post("/v1/glossary/candidates", async (req, res) => {
     try {
@@ -540,7 +534,7 @@ export function registerRoutes(app) {
   });
 
   /**
-   * ✅ NEW: Step 2-1 프레임: POST /v1/glossary/candidates/batch
+   * POST /v1/glossary/candidates/batch
    */
   app.post("/v1/glossary/candidates/batch", async (req, res) => {
     try {
@@ -555,22 +549,24 @@ export function registerRoutes(app) {
 
   /**
    * POST /v1/glossary/apply
-   * - ✅ 변경: en-US(sourceText) 단독으로 기존 행을 찾는다 (Anchor)
+   * - en-US(sourceText) 단독으로 기존 행을 찾는다 (Anchor)
    * - category는 선택적 필터(검색 범위 축소)로만 사용
-   * - 해당 언어 컬럼만 채워 넣는다
-   * - 기본: 빈 셀만 채움(fillOnlyEmpty=true)
+   * - allowAnchorUpdate=true일 때만 en-US 컬럼 업데이트 허용
+   * - 기본: fillOnlyEmpty=true (덮어쓰기 금지)
    */
   app.post("/v1/glossary/apply", async (req, res) => {
     try {
       const body = ApplySchema.parse(req.body ?? {});
 
-      // ✅ category optional
+      // category optional
       const categoryKey = body.category ? String(body.category).trim().toLowerCase() : "";
 
       const sourceLangKey = normalizeLang(body.sourceLang ?? "en-US");
       if (sourceLangKey !== "en-us") {
         return res.status(400).json({ ok: false, error: "sourceLang must be en-US (anchor) for apply." });
       }
+
+      const allowAnchorUpdate = Boolean(body.allowAnchorUpdate);
 
       // 최신 Glossary 로드(쓰기 반영은 최신 기준이 안전)
       const cache = await ensureGlossaryLoaded({ forceReload: true });
@@ -582,7 +578,7 @@ export function registerRoutes(app) {
         });
       }
 
-      // category 필터가 들어온 경우, 존재 여부만 검증(선택)
+      // category 필터가 들어온 경우, 존재 여부만 검증
       if (categoryKey && !cache.byCategoryBySource.has(categoryKey)) {
         return res.status(400).json({
           ok: false,
@@ -597,7 +593,7 @@ export function registerRoutes(app) {
       const skipped = [];
       let matchedRows = 0;
 
-      // ✅ 빠른 검색용: en-us text -> entry[] (중복 보존)
+      // 빠른 검색용: en-us text -> entry[] (중복 보존)
       const mapByEn = new Map(); // Map<enUS, entry[]>
       for (const e of cache.entries) {
         const en = String(e.translations?.["en-us"] ?? "").trim();
@@ -627,7 +623,7 @@ export function registerRoutes(app) {
           continue;
         }
 
-        // ✅ en-US 단독 식별자 정책: 중복은 충돌로 취급
+        // en-US 단독 식별자 정책: 중복은 충돌로 취급
         if (filtered.length > 1) {
           const err = new Error(
             `Duplicate en-US rows found for '${sourceText}'${
@@ -647,9 +643,13 @@ export function registerRoutes(app) {
           const langKey = normalizeLang(langRaw);
           if (!langKey) continue;
 
-          // sourceLang(en-us)은 기준키이므로 쓰지 않는다
-          if (langKey === "en-us") continue;
+          // ✅ en-US(anchor) 업데이트는 allowAnchorUpdate=true일 때만 허용
+          if (langKey === "en-us" && !allowAnchorUpdate) {
+            skipped.push({ sourceText, lang: langKey, reason: "Anchor update not allowed (allowAnchorUpdate=false)" });
+            continue;
+          }
 
+          // allow list (targetLangs)가 있으면, en-us도 동일하게 필터 적용
           if (targetLangAllow && !targetLangAllow.has(langKey)) continue;
 
           const colIdx = cache.langIndex[langKey];
@@ -686,6 +686,7 @@ export function registerRoutes(app) {
         category: categoryKey || "ALL",
         sourceLang: "en-US",
         fillOnlyEmpty: Boolean(body.fillOnlyEmpty),
+        allowAnchorUpdate,
         inputCount: body.entries.length,
         matchedRows,
         writePlan: {
