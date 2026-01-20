@@ -546,219 +546,282 @@ export function registerRoutes(app) {
   });
 
   /**
-   * POST /v1/glossary/apply
-   * - NEW: sourceLang can be en-US or ko-KR
-   * - Row match uses sourceLang text (with optional category filter)
-   * - Writing en-US column still requires allowAnchorUpdate=true
-   */
-  app.post("/v1/glossary/apply", async (req, res) => {
-    try {
-      const body = ApplySchema.parse(req.body ?? {});
+ * POST /v1/glossary/apply
+ * - sourceLang(en-US | ko-KR) 기준으로 기존 행을 찾고
+ * - 번역 컬럼만 채워 넣는다
+ * - 기본: 빈 셀만 채움(fillOnlyEmpty=true)
+ *
+ * 안정화 정책:
+ * - 중복 매칭(동일 sourceText가 여러 row에 존재) 시, rowIndex가 가장 낮은 row만 적용하고 conflicts에 기록
+ * - 대상 셀이 이미 값이 있으면 덮어쓰지 않고 skipped에 기록, 작업은 계속 진행
+ * - 부분 성공(partial_success) / no_op를 status로 반환
+ */
+app.post("/v1/glossary/apply", async (req, res) => {
+  try {
+    const body = ApplySchema.parse(req.body ?? {});
 
-      const categoryKey = body.category && String(body.category).trim()
+    const categoryKey =
+      body.category && String(body.category).trim()
         ? String(body.category).trim().toLowerCase()
         : null; // null => ALL
 
-      const sourceLangKey = normalizeLang(body.sourceLang ?? "en-US");
-      if (sourceLangKey !== "en-us" && sourceLangKey !== "ko-kr") {
-        return res.status(400).json({ ok: false, error: "sourceLang must be en-US or ko-KR for apply." });
+    const sourceLangKey = normalizeLang(body.sourceLang ?? "en-US");
+    if (sourceLangKey !== "en-us" && sourceLangKey !== "ko-kr") {
+      return res.status(400).json({
+        ok: false,
+        error: "sourceLang must be en-US or ko-KR for apply.",
+      });
+    }
+
+    const fillOnlyEmpty = Boolean(body.fillOnlyEmpty);
+    const allowAnchorUpdate = Boolean(body.allowAnchorUpdate);
+
+    // 최신 Glossary 로드(쓰기 반영은 최신 기준이 안전)
+    const cache = await ensureGlossaryLoaded({ forceReload: true });
+
+    // category 범위 결정
+    const categoriesToSearch = categoryKey
+      ? [categoryKey]
+      : Array.from(cache.byCategoryBySource.keys());
+
+    // sourceLang 기준 term -> entry[] merged map 구성
+    // (중복 보존: 동일 term이 여러 entry로 들어올 수 있음)
+    const sourceTextMap = mergeSourceTextMapsFromCache(
+      cache,
+      sourceLangKey,
+      categoriesToSearch
+    );
+
+    const targetLangAllow = body.targetLangs
+      ? new Set(body.targetLangs.map(normalizeLang))
+      : null;
+
+    const updates = [];
+
+    // 기존 필드 호환 유지용
+    const notFound = [];
+    const skipped = [];
+
+    // 개선 포맷용
+    const resultsApplied = [];
+    const resultsSkipped = [];
+    const resultsConflicts = [];
+    const resultsNotFound = [];
+
+    let matchedRows = 0;
+    let updatedCellsPlanned = 0;
+    let skippedCellsCount = 0;
+    let conflictAnchorsCount = 0;
+
+    // helper: 가장 낮은 row entry 선택
+    function pickLowestRowEntry(entries) {
+      let best = null;
+      for (const e of entries || []) {
+        const ri = Number(e?._rowIndex);
+        if (!Number.isFinite(ri)) continue;
+        if (!best || ri < Number(best._rowIndex)) best = e;
+      }
+      return best;
+    }
+
+    for (const item of body.entries) {
+      const sourceText = String(item.sourceText ?? "").trim();
+      if (!sourceText) continue;
+
+      const candidates = sourceTextMap.get(sourceText);
+
+      if (!candidates || candidates.length === 0) {
+        const nf = {
+          sourceText,
+          reason: `Row not found by ${sourceLangKey} within ${
+            categoryKey ? categoryKey : "ALL categories"
+          }`,
+        };
+        notFound.push(nf);
+        resultsNotFound.push(nf);
+        continue;
       }
 
-      const allowAnchorUpdate = Boolean(body.allowAnchorUpdate);
+      matchedRows += 1;
 
-      // 최신 Glossary 로드(쓰기 반영은 최신 기준이 안전)
-      const cache = await ensureGlossaryLoaded({ forceReload: true });
+      // 중복 처리: 가장 낮은 row만 적용
+      let chosen = candidates;
+      let chosenEntry = null;
 
-      // 소스 언어 컬럼 존재 확인
-      if (cache.langIndex[sourceLangKey] == null) {
-        return res.status(400).json({
-          ok: false,
-          error: `Header does not include ${body.sourceLang} column. Cannot apply by sourceLang=${body.sourceLang}.`,
+      if (candidates.length === 1) {
+        chosenEntry = candidates[0];
+      } else {
+        chosenEntry = pickLowestRowEntry(candidates);
+        conflictAnchorsCount += 1;
+
+        const rowIndices = candidates
+          .map((e) => Number(e?._rowIndex))
+          .filter((n) => Number.isFinite(n))
+          .sort((a, b) => a - b);
+
+        resultsConflicts.push({
+          sourceText,
+          rowIndices,
+          resolution: "lowest_row_applied",
+          appliedRowIndex: chosenEntry?._rowIndex ?? null,
         });
       }
 
-      // en-US 컬럼 쓰기 가능 여부
-      if (!allowAnchorUpdate && Object.values(body.entries || []).some((e) => e?.translations && e.translations["en-US"])) {
-        // 스키마는 통과하지만 정책상 막는다(안전)
-        // 실제로는 normalizeLang로 en-us 체크를 아래 write loop에서 하므로,
-        // 여기서는 명확한 에러 메시지를 제공하기 위함.
+      if (!chosenEntry) {
+        const nf = {
+          sourceText,
+          reason: "Row candidates exist but no valid rowIndex found.",
+        };
+        notFound.push(nf);
+        resultsNotFound.push(nf);
+        continue;
       }
 
-      const targetLangAllow = body.targetLangs ? new Set(body.targetLangs.map(normalizeLang)) : null;
+      const rowIndex = chosenEntry._rowIndex;
 
-      const updates = [];
-      const notFound = [];
-      const skipped = [];
-      const conflicts = [];
-      let matchedRows = 0;
+      // 번역 업데이트 계획 생성
+      const updatedLangs = [];
+      const skippedLangs = [];
 
-      /**
-       * Build lookup:
-       * - If categoryKey provided: search only that category
-       * - Else: search ALL categories
-       * Use cache.byCategoryBySource: Map<cat, Map<srcLangKey, Map<sourceText, entry[]>>>
-       */
-      const categoriesToSearch = categoryKey
-        ? [categoryKey]
-        : Array.from(cache.byCategoryBySource.keys());
+      for (const [langRaw, textRaw] of Object.entries(item.translations || {})) {
+        const langKey = normalizeLang(langRaw);
+        if (!langKey) continue;
 
-      // Precheck: category existence if specified
-      if (categoryKey && !cache.byCategoryBySource.has(categoryKey)) {
-        return res.status(400).json({ ok: false, error: `Category not found: ${body.category}` });
-      }
+        if (targetLangAllow && !targetLangAllow.has(langKey)) continue;
 
-      for (const item of body.entries) {
-        const sourceText = String(item.sourceText ?? "").trim();
-        if (!sourceText) continue;
+        const newText = String(textRaw ?? "").trim();
+        if (!newText) continue;
 
-        // Collect matched entries across chosen categories
-        const matchedEntries = [];
-        for (const cat of categoriesToSearch) {
-          const bySource = cache.byCategoryBySource.get(cat);
-          const map = bySource?.get(sourceLangKey);
-          const arr = map?.get(sourceText);
-          if (Array.isArray(arr) && arr.length) matchedEntries.push(...arr);
-        }
-
-        if (matchedEntries.length === 0) {
-          notFound.push({
+        // en-US 컬럼 업데이트는 allowAnchorUpdate=true일 때만 허용
+        if (langKey === "en-us" && !allowAnchorUpdate) {
+          // 그냥 스킵 처리(명확히 기록)
+          const sk = {
             sourceText,
-            reason: `Row not found by ${sourceLangKey} within ${categoryKey ? "category filter" : "ALL categories"}`,
-          });
+            rowIndex,
+            lang: langKey,
+            reason: "en-US update blocked (allowAnchorUpdate=false)",
+          };
+          skipped.push({ sourceText, lang: langKey, reason: sk.reason });
+          resultsSkipped.push(sk);
+          skippedCellsCount += 1;
+          skippedLangs.push(langKey);
           continue;
         }
 
-        // Detect conflict: same sourceText matches multiple different rows
-        const rowSet = new Set(matchedEntries.map((e) => e?._rowIndex).filter(Boolean));
-        if (rowSet.size > 1) {
-          conflicts.push({
+        // 헤더에 해당 언어 컬럼이 있는지
+        const colIdx = cache.langIndex[langKey];
+        if (colIdx == null) {
+          const sk = {
             sourceText,
-            reason: "Multiple rows matched for the same sourceText",
-            matchedRowIndexes: Array.from(rowSet).sort((a, b) => a - b),
-          });
+            rowIndex,
+            lang: langKey,
+            reason: "Language column not found in header",
+          };
+          skipped.push({ sourceText, lang: langKey, reason: sk.reason });
+          resultsSkipped.push(sk);
+          skippedCellsCount += 1;
+          skippedLangs.push(langKey);
           continue;
         }
 
-        const rowEntry = matchedEntries[0];
-        const rowIndex = rowEntry._rowIndex;
-        matchedRows += 1;
-
-        for (const [langRaw, textRaw] of Object.entries(item.translations || {})) {
-          const langKey = normalizeLang(langRaw);
-          if (!langKey) continue;
-
-          // sourceLang은 '키'일 뿐, 기본적으로는 쓰지 않음.
-          // 단 allowAnchorUpdate=true일 때 en-us 쓰기 허용.
-          if (langKey === sourceLangKey) {
-            // 같은 언어 컬럼에 덮어쓰는 건 기본 금지(정책상)
-            skipped.push({ sourceText, lang: langKey, reason: "Skipping update to sourceLang column (identifier field)" });
+        // fillOnlyEmpty=true면, 기존 값이 있으면 스킵
+        if (fillOnlyEmpty) {
+          const existing = String(chosenEntry.translations?.[langKey] ?? "").trim();
+          if (existing) {
+            const sk = {
+              sourceText,
+              rowIndex,
+              lang: langKey,
+              reason: "cell_already_has_value",
+            };
+            skipped.push({ sourceText, lang: langKey, reason: "Cell already has value (fillOnlyEmpty=true)" });
+            resultsSkipped.push(sk);
+            skippedCellsCount += 1;
+            skippedLangs.push(langKey);
             continue;
           }
-
-          if (langKey === "en-us" && !allowAnchorUpdate) {
-            skipped.push({ sourceText, lang: "en-us", reason: "en-US update blocked (allowAnchorUpdate=false)" });
-            continue;
-          }
-
-          if (targetLangAllow && !targetLangAllow.has(langKey)) continue;
-
-          const colIdx = cache.langIndex[langKey];
-          if (colIdx == null) {
-            skipped.push({ sourceText, lang: langRaw, reason: "Language column not found in header" });
-            continue;
-          }
-
-          const newText = String(textRaw ?? "").trim();
-          if (!newText) continue;
-
-          // fillOnlyEmpty=true면, 기존 값이 있으면 스킵
-          if (body.fillOnlyEmpty) {
-            const existing = String(rowEntry.translations?.[langKey] ?? "").trim();
-            if (existing) {
-              skipped.push({ sourceText, lang: langKey, reason: "Cell already has value (fillOnlyEmpty=true)" });
-              continue;
-            }
-          }
-
-          const colA1 = colIndexToA1(colIdx);
-          const a1 = `${SHEET_NAME}!${colA1}${rowIndex}`;
-          updates.push({ range: a1, values: [[newText]] });
         }
+
+        const colA1 = colIndexToA1(colIdx);
+        const a1 = `${SHEET_NAME}!${colA1}${rowIndex}`;
+        updates.push({ range: a1, values: [[newText]] });
+        updatedCellsPlanned += 1;
+        updatedLangs.push(langKey);
       }
 
-      if (conflicts.length > 0) {
-        return res.status(409).json({
-          ok: false,
-          error: "Duplicate sourceText rows found (conflict). Refine with category or resolve duplicates.",
-          conflicts,
-          notFound,
-          skipped,
-        });
+      // applied 기록(“계획” 기준; 실제 updatedCells는 Google 응답으로 확정)
+      resultsApplied.push({
+        sourceText,
+        rowIndex,
+        updatedLangs,
+        skippedLangs,
+        reason: candidates.length > 1 ? "applied_to_lowest_row" : "applied",
+      });
+    }
+
+    // 실제 반영
+    const { updatedCells, updatedRanges } = await batchUpdateValuesA1(updates);
+
+    // 캐시 갱신(반영 후 최신화)
+    await ensureGlossaryLoaded({ forceReload: true });
+
+    // status 계산
+    let status = "success";
+    if (updatedCells === 0) {
+      // 아무 것도 안 써졌으면, 스킵/충돌/미발견 여부로 구분
+      if (resultsNotFound.length > 0 || resultsConflicts.length > 0) status = "partial_success";
+      else status = "no_op";
+    } else {
+      if (resultsNotFound.length > 0 || resultsConflicts.length > 0 || resultsSkipped.length > 0) {
+        status = "partial_success";
       }
-
-      const { updatedCells, updatedRanges } = await batchUpdateValuesA1(updates);
-
-      // 캐시 갱신(반영 후 최신화)
-      await ensureGlossaryLoaded({ forceReload: true });
-
-      return res.status(200).json({
-        ok: true,
-        category: categoryKey ?? "ALL",
-        sourceLang: body.sourceLang ?? "en-US",
-        fillOnlyEmpty: Boolean(body.fillOnlyEmpty),
-        allowAnchorUpdate,
-        inputCount: body.entries.length,
-        matchedRows,
-        writePlan: {
-          intendedUpdates: updates.length,
-        },
-        result: {
-          updatedCells,
-          updatedRangesCount: updatedRanges.length,
-        },
-        notFound,
-        skipped,
-      });
-    } catch (e) {
-      const status = e?.status ?? 500;
-      return res.status(status).json({ ok: false, error: e?.message ?? String(e) });
     }
-  });
 
-  /**
-   * GET /v1/glossary/raw?sessionId=...&offset=0&limit=200
-   */
-  app.get("/v1/glossary/raw", (req, res) => {
-    try {
-      const sessionId = String(req.query?.sessionId ?? "").trim();
-      if (!sessionId) return res.status(400).json({ ok: false, error: "sessionId is required" });
+    return res.status(200).json({
+      // ===== 기존 응답 호환 필드 =====
+      ok: true,
+      category: categoryKey ? categoryKey : "ALL",
+      sourceLang: sourceLangKey === "ko-kr" ? "ko-KR" : "en-US",
+      fillOnlyEmpty,
+      allowAnchorUpdate,
+      inputCount: body.entries.length,
+      matchedRows,
+      writePlan: { intendedUpdates: updates.length },
+      result: {
+        updatedCells,
+        updatedRangesCount: updatedRanges.length,
+      },
+      notFound,
+      skipped,
 
-      const offset = Math.max(0, Number(req.query?.offset ?? 0));
-      const limit = Math.min(2000, Math.max(1, Number(req.query?.limit ?? 200)));
+      // ===== 개선 포맷(추가) =====
+      status,
+      anchorLang: "en-US",
+      summary: {
+        inputEntries: body.entries.length,
+        matchedAnchors: matchedRows,
+        processedRows: resultsApplied.length,
+        updatedCells,
+        skippedCells: skippedCellsCount,
+        conflictAnchors: conflictAnchorsCount,
+      },
+      results: {
+        applied: resultsApplied,
+        skipped: resultsSkipped,
+        conflicts: resultsConflicts,
+        notFound: resultsNotFound,
+      },
+      notes: [
+        "Apply supports partial success: already-filled cells are preserved (fillOnlyEmpty).",
+        "If duplicate rows match the same sourceText, the lowest rowIndex is applied and recorded in conflicts.",
+      ],
+      warnings: resultsConflicts.length
+        ? ["Duplicate anchors detected. Data cleanup is recommended."]
+        : [],
+    });
+  } catch (e) {
+    const status = e?.status ?? 500;
+    return res.status(status).json({ ok: false, error: e?.message ?? String(e) });
+  }
+});
 
-      const s = getSessionOrThrow(sessionId);
-      const header = s.glossary.header || [];
-      const rawRows = s.glossary.rawRows || [];
-
-      const slice = rawRows.slice(offset, offset + limit).map((cells, i) => ({
-        rowIndex: offset + i + 2,
-        cells,
-      }));
-
-      return res.status(200).json({
-        ok: true,
-        sessionId,
-        loadedAt: s.glossary.loadedAt,
-        rawRowCount: rawRows.length,
-        header,
-        offset,
-        limit,
-        count: slice.length,
-        rows: slice,
-      });
-    } catch (e) {
-      const status = e?.status ?? 500;
-      return res.status(status).json({ ok: false, error: e?.message ?? String(e) });
-    }
-  });
-}
