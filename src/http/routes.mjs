@@ -236,8 +236,6 @@ export function registerRoutes(app) {
 
   /**
    * POST /v1/translate/replace
-   * - Phase 1 치환 + 로그 반환
-   * - Phase 1.5 룰 사용 로그(ruleLogs)도 항상 반환(빈 배열 가능)
    */
   app.post("/v1/translate/replace", async (req, res) => {
     try {
@@ -430,7 +428,7 @@ export function registerRoutes(app) {
   });
 
   /**
-   * Step G2 (B안 기본): POST /v1/glossary/suggest
+   * POST /v1/glossary/suggest
    */
   app.post("/v1/glossary/suggest", async (req, res) => {
     try {
@@ -494,7 +492,7 @@ export function registerRoutes(app) {
   });
 
   /**
-   * Step 3A-1 (MVP): POST /v1/glossary/candidates
+   * POST /v1/glossary/candidates
    */
   app.post("/v1/glossary/candidates", async (req, res) => {
     try {
@@ -549,21 +547,21 @@ export function registerRoutes(app) {
 
   /**
    * POST /v1/glossary/apply
-   * - en-US(sourceText) 단독으로 기존 행을 찾는다 (Anchor)
-   * - category는 선택적 필터(검색 범위 축소)로만 사용
-   * - allowAnchorUpdate=true일 때만 en-US 컬럼 업데이트 허용
-   * - 기본: fillOnlyEmpty=true (덮어쓰기 금지)
+   * - NEW: sourceLang can be en-US or ko-KR
+   * - Row match uses sourceLang text (with optional category filter)
+   * - Writing en-US column still requires allowAnchorUpdate=true
    */
   app.post("/v1/glossary/apply", async (req, res) => {
     try {
       const body = ApplySchema.parse(req.body ?? {});
 
-      // category optional
-      const categoryKey = body.category ? String(body.category).trim().toLowerCase() : "";
+      const categoryKey = body.category && String(body.category).trim()
+        ? String(body.category).trim().toLowerCase()
+        : null; // null => ALL
 
       const sourceLangKey = normalizeLang(body.sourceLang ?? "en-US");
-      if (sourceLangKey !== "en-us") {
-        return res.status(400).json({ ok: false, error: "sourceLang must be en-US (anchor) for apply." });
+      if (sourceLangKey !== "en-us" && sourceLangKey !== "ko-kr") {
+        return res.status(400).json({ ok: false, error: "sourceLang must be en-US or ko-KR for apply." });
       }
 
       const allowAnchorUpdate = Boolean(body.allowAnchorUpdate);
@@ -571,19 +569,19 @@ export function registerRoutes(app) {
       // 최신 Glossary 로드(쓰기 반영은 최신 기준이 안전)
       const cache = await ensureGlossaryLoaded({ forceReload: true });
 
-      if (cache.langIndex["en-us"] == null) {
+      // 소스 언어 컬럼 존재 확인
+      if (cache.langIndex[sourceLangKey] == null) {
         return res.status(400).json({
           ok: false,
-          error: "Header does not include en-US column. Cannot apply by en-US anchor.",
+          error: `Header does not include ${body.sourceLang} column. Cannot apply by sourceLang=${body.sourceLang}.`,
         });
       }
 
-      // category 필터가 들어온 경우, 존재 여부만 검증
-      if (categoryKey && !cache.byCategoryBySource.has(categoryKey)) {
-        return res.status(400).json({
-          ok: false,
-          error: `Category not found in glossary index: ${categoryKey}`,
-        });
+      // en-US 컬럼 쓰기 가능 여부
+      if (!allowAnchorUpdate && Object.values(body.entries || []).some((e) => e?.translations && e.translations["en-US"])) {
+        // 스키마는 통과하지만 정책상 막는다(안전)
+        // 실제로는 normalizeLang로 en-us 체크를 아래 write loop에서 하므로,
+        // 여기서는 명확한 에러 메시지를 제공하기 위함.
       }
 
       const targetLangAllow = body.targetLangs ? new Set(body.targetLangs.map(normalizeLang)) : null;
@@ -591,65 +589,77 @@ export function registerRoutes(app) {
       const updates = [];
       const notFound = [];
       const skipped = [];
+      const conflicts = [];
       let matchedRows = 0;
 
-      // 빠른 검색용: en-us text -> entry[] (중복 보존)
-      const mapByEn = new Map(); // Map<enUS, entry[]>
-      for (const e of cache.entries) {
-        const en = String(e.translations?.["en-us"] ?? "").trim();
-        if (!en) continue;
-        if (!mapByEn.has(en)) mapByEn.set(en, []);
-        mapByEn.get(en).push(e);
+      /**
+       * Build lookup:
+       * - If categoryKey provided: search only that category
+       * - Else: search ALL categories
+       * Use cache.byCategoryBySource: Map<cat, Map<srcLangKey, Map<sourceText, entry[]>>>
+       */
+      const categoriesToSearch = categoryKey
+        ? [categoryKey]
+        : Array.from(cache.byCategoryBySource.keys());
+
+      // Precheck: category existence if specified
+      if (categoryKey && !cache.byCategoryBySource.has(categoryKey)) {
+        return res.status(400).json({ ok: false, error: `Category not found: ${body.category}` });
       }
 
       for (const item of body.entries) {
         const sourceText = String(item.sourceText ?? "").trim();
         if (!sourceText) continue;
 
-        const candidates = mapByEn.get(sourceText) || [];
+        // Collect matched entries across chosen categories
+        const matchedEntries = [];
+        for (const cat of categoriesToSearch) {
+          const bySource = cache.byCategoryBySource.get(cat);
+          const map = bySource?.get(sourceLangKey);
+          const arr = map?.get(sourceText);
+          if (Array.isArray(arr) && arr.length) matchedEntries.push(...arr);
+        }
 
-        // category가 있으면 필터로만 사용
-        const filtered = categoryKey
-          ? candidates.filter((e) => String(e.category ?? "").trim().toLowerCase() === categoryKey)
-          : candidates;
-
-        if (filtered.length === 0) {
+        if (matchedEntries.length === 0) {
           notFound.push({
             sourceText,
-            reason: categoryKey
-              ? "Row not found by en-US within category filter"
-              : "Row not found by en-US",
+            reason: `Row not found by ${sourceLangKey} within ${categoryKey ? "category filter" : "ALL categories"}`,
           });
           continue;
         }
 
-        // en-US 단독 식별자 정책: 중복은 충돌로 취급
-        if (filtered.length > 1) {
-          const err = new Error(
-            `Duplicate en-US rows found for '${sourceText}'${
-              categoryKey ? ` in category='${categoryKey}'` : ""
-            }. Resolve duplicates before apply.`
-          );
-          err.status = 409;
-          throw err;
+        // Detect conflict: same sourceText matches multiple different rows
+        const rowSet = new Set(matchedEntries.map((e) => e?._rowIndex).filter(Boolean));
+        if (rowSet.size > 1) {
+          conflicts.push({
+            sourceText,
+            reason: "Multiple rows matched for the same sourceText",
+            matchedRowIndexes: Array.from(rowSet).sort((a, b) => a - b),
+          });
+          continue;
         }
 
-        const rowEntry = filtered[0];
-        matchedRows += 1;
-
+        const rowEntry = matchedEntries[0];
         const rowIndex = rowEntry._rowIndex;
+        matchedRows += 1;
 
         for (const [langRaw, textRaw] of Object.entries(item.translations || {})) {
           const langKey = normalizeLang(langRaw);
           if (!langKey) continue;
 
-          // ✅ en-US(anchor) 업데이트는 allowAnchorUpdate=true일 때만 허용
-          if (langKey === "en-us" && !allowAnchorUpdate) {
-            skipped.push({ sourceText, lang: langKey, reason: "Anchor update not allowed (allowAnchorUpdate=false)" });
+          // sourceLang은 '키'일 뿐, 기본적으로는 쓰지 않음.
+          // 단 allowAnchorUpdate=true일 때 en-us 쓰기 허용.
+          if (langKey === sourceLangKey) {
+            // 같은 언어 컬럼에 덮어쓰는 건 기본 금지(정책상)
+            skipped.push({ sourceText, lang: langKey, reason: "Skipping update to sourceLang column (identifier field)" });
             continue;
           }
 
-          // allow list (targetLangs)가 있으면, en-us도 동일하게 필터 적용
+          if (langKey === "en-us" && !allowAnchorUpdate) {
+            skipped.push({ sourceText, lang: "en-us", reason: "en-US update blocked (allowAnchorUpdate=false)" });
+            continue;
+          }
+
           if (targetLangAllow && !targetLangAllow.has(langKey)) continue;
 
           const colIdx = cache.langIndex[langKey];
@@ -676,6 +686,16 @@ export function registerRoutes(app) {
         }
       }
 
+      if (conflicts.length > 0) {
+        return res.status(409).json({
+          ok: false,
+          error: "Duplicate sourceText rows found (conflict). Refine with category or resolve duplicates.",
+          conflicts,
+          notFound,
+          skipped,
+        });
+      }
+
       const { updatedCells, updatedRanges } = await batchUpdateValuesA1(updates);
 
       // 캐시 갱신(반영 후 최신화)
@@ -683,8 +703,8 @@ export function registerRoutes(app) {
 
       return res.status(200).json({
         ok: true,
-        category: categoryKey || "ALL",
-        sourceLang: "en-US",
+        category: categoryKey ?? "ALL",
+        sourceLang: body.sourceLang ?? "en-US",
         fillOnlyEmpty: Boolean(body.fillOnlyEmpty),
         allowAnchorUpdate,
         inputCount: body.entries.length,

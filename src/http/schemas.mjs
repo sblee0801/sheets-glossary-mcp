@@ -1,11 +1,6 @@
 /**
  * src/http/schemas.mjs
  * - REST/MCP 공용 Zod Schemas 모음
- *
- * NOTE (v3.1):
- * - candidates/batch: sourceLang은 en-US 또는 ko-KR 허용
- * - candidates/batch: category는 optional (없으면 ALL categories로 처리)
- * - apply: allowAnchorUpdate 지원(기존 유지)
  */
 
 import { z } from "zod";
@@ -60,32 +55,24 @@ export const CandidatesSchema = z.object({
   sources: z.array(z.enum(["iroWikiDb", "rateMyServer", "divinePride"])).optional(),
 });
 
-// ✅ candidates/batch endpoint schema
-// - category: optional (omit => ALL categories)
-// - sourceLang: en-US or ko-KR
-// - sources: divinePride only (운영 고정)
+// ✅ candidates/batch endpoint schema (운영 고정: divinePride만 허용)
 export const CandidatesBatchSchema = z.object({
-  category: z.string().optional(), // ✅ optional now
-  sourceLang: z.string().optional().default("en-US"), // ✅ allow en-US/ko-KR (server validates normalized)
+  category: z.string().optional(), // optional filter (ALL if omitted)
+  sourceLang: z.enum(["en-US", "ko-KR"]).optional().default("en-US"),
   sourceTexts: z.array(z.string().min(1)).min(1).max(500),
   targetLangs: z.array(z.string().min(1)).min(1).max(20),
 
-  // ✅ 운영 정책: divinePride만 사용
-  // - 생략 시 서버가 ["divinePride"]로 처리
-  // - 지정 시에도 divinePride만 허용
   sources: z.array(z.enum(["divinePride"])).optional(),
-
   maxCandidatesPerLang: z.number().int().min(1).max(5).optional().default(2),
   includeEvidence: z.boolean().optional().default(true),
 });
 
 // ✅ apply endpoint schema
-// - en-US anchor 기반 row match
-// - category: optional filter
-// - allowAnchorUpdate: en-US column update gate
+// - NEW: sourceLang can be en-US or ko-KR (row match will follow sourceLang)
+// - allowAnchorUpdate controls writing to en-US column
 export const ApplySchema = z.object({
-  category: z.string().optional(), // ✅ optional filter
-  sourceLang: z.string().optional().default("en-US"),
+  category: z.string().optional(), // optional filter; omit => ALL
+  sourceLang: z.enum(["en-US", "ko-KR"]).optional().default("en-US"),
   entries: z
     .array(
       z.object({
@@ -100,7 +87,5 @@ export const ApplySchema = z.object({
     .max(500),
   fillOnlyEmpty: z.boolean().optional().default(true),
   targetLangs: z.array(z.string().min(1)).optional(),
-
-  // ✅ NEW: en-US(Anchor) 컬럼 수정 게이트
   allowAnchorUpdate: z.boolean().optional().default(false),
 });
