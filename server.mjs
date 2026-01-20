@@ -57,6 +57,14 @@ function assertAllowedSourceLang(sourceLangKey) {
     throw err;
   }
 }
+function isLikelyEnglish(s) {
+  // Heuristic: mostly ASCII letters/numbers/common punctuation and spaces
+  const t = String(s ?? "").trim();
+  if (!t) return false;
+  const ascii = t.replace(/[^\x00-\x7F]/g, "");
+  const ratio = ascii.length / Math.max(1, t.length);
+  return ratio > 0.95;
+}
 
 // ---------------- Google Sheets Read (Generic) ----------------
 async function readSheetRange(range) {
@@ -364,7 +372,6 @@ function ruleMatchesText(ruleKo, matchType, text) {
 }
 
 function buildRuleLogs({ text, categoryKey, targetLangKey, rulesCache }) {
-  // 항상 배열 반환(0건 가능)
   const out = [];
   if (!text) return out;
   if (categoryKey !== "item") return out;
@@ -507,11 +514,13 @@ const ReplaceSchema = z
     targetLang: z.string().min(1).optional(), // sessionId 없을 때 필요
     texts: z.array(z.string()).min(1),
     includeLogs: z.boolean().optional(), // default true
+    // limit/debug 는 OpenAPI에 있으나 서버에서는 현재 미사용/무시 가능
+    limit: z.number().int().min(1).max(200).optional(),
+    debug: z.boolean().optional(),
   })
   .refine(
     (v) => {
       if (v.sessionId) return true;
-      // sessionId 없으면 sourceLang/targetLang 있어야 함
       return Boolean(v.sourceLang) && Boolean(v.targetLang);
     },
     { message: "If sessionId is not provided, sourceLang and targetLang are required." }
@@ -519,6 +528,23 @@ const ReplaceSchema = z
 
 const UpdateSchema = z.object({
   sessionId: z.string().min(1).optional(),
+});
+
+/**
+ * Step G2: suggest-only endpoint schema (B안 기본)
+ * - 다국어 후보는 기본 생성하지 않음
+ * - generateTargets=true 같은 옵션은 추후 확장용(현재는 경고만 반환)
+ */
+const SuggestSchema = z.object({
+  category: z.string().min(1),
+  terms: z.array(z.string()).min(1).max(200),
+  anchorLang: z.string().optional().default("en-US"),
+  targetLangs: z.array(z.string()).min(1).max(20),
+  sources: z.array(z.enum(["iroWikiDb", "rateMyServer", "divinePride"])).optional(),
+  includeEvidence: z.boolean().optional().default(true),
+  maxCandidatesPerLang: z.number().int().min(1).max(5).optional().default(2),
+  // Optional extension (not in OpenAPI yet / safe to ignore by clients)
+  generateTargets: z.boolean().optional().default(false),
 });
 
 // ---------------- HTTP App ----------------
@@ -619,7 +645,7 @@ app.post("/v1/translate/replace", async (req, res) => {
     // Phase 1.5 rules cache (process-level)
     const rulesCache = await ensureRulesLoaded(false);
 
-    // 1) session 기반 (기존)
+    // 1) session 기반
     if (sessionId) {
       const s = getSessionOrThrow(sessionId);
 
@@ -653,7 +679,6 @@ app.post("/v1/translate/replace", async (req, res) => {
 
         if (wantLogs) perLineLogs.push({ index: i, replacedTotal, logs });
 
-        // Phase 1.5 rule logs (always returned)
         const ruleLogs = buildRuleLogs({
           text: out,
           categoryKey: s.categoryKey,
@@ -679,11 +704,11 @@ app.post("/v1/translate/replace", async (req, res) => {
           rawRowCount: s.glossary.rawRowCount,
         },
         logs: wantLogs ? perLineLogs : undefined,
-        ruleLogs: perLineRuleLogs, // ✅ 항상 존재(빈 배열 가능)
+        ruleLogs: perLineRuleLogs,
       });
     }
 
-    // 2) sessionId 없는 경우 (API 단독 사용)
+    // 2) stateless
     const sourceLangKey = normalizeLang(sourceLang);
     const targetLangKey = normalizeLang(targetLang);
     assertAllowedSourceLang(sourceLangKey);
@@ -767,7 +792,7 @@ app.post("/v1/translate/replace", async (req, res) => {
         uniqueTermsInIndex: sourceTextMap.size,
       },
       logs: wantLogs ? perLineLogs : undefined,
-      ruleLogs: perLineRuleLogs, // ✅ 항상 존재(빈 배열 가능)
+      ruleLogs: perLineRuleLogs,
     });
   } catch (e) {
     const status = e?.status ?? 500;
@@ -777,15 +802,11 @@ app.post("/v1/translate/replace", async (req, res) => {
 
 /**
  * POST /v1/glossary/update
- * - ✅ sessionId optional
- *   - 없으면: globalCache force reload + 현재 프로세스의 모든 세션 갱신
- *   - 있으면: 해당 세션만 갱신(기존 동작 유지)
  */
 app.post("/v1/glossary/update", async (req, res) => {
   try {
     const { sessionId } = UpdateSchema.parse(req.body ?? {});
 
-    // 1) sessionId 없으면: 전체 갱신
     if (!sessionId) {
       const cache = await ensureGlobalLoaded(true);
 
@@ -795,7 +816,7 @@ app.post("/v1/glossary/update", async (req, res) => {
         const sourceLangKey = s.sourceLangKey;
 
         if (sourceLangKey === "en-us" && cache.langIndex["en-us"] == null) {
-          // 해당 세션은 유지하되, 번역은 이후 replace 호출 시 오류 가능
+          // keep session
         }
 
         if (!cache.byCategoryBySource.has(categoryKey)) {
@@ -825,9 +846,7 @@ app.post("/v1/glossary/update", async (req, res) => {
       });
     }
 
-    // 2) sessionId 있으면: 해당 세션만 갱신
     const s = getSessionOrThrow(sessionId);
-
     const cache = await ensureGlobalLoaded(true);
 
     if (s.sourceLangKey === "en-us" && cache.langIndex["en-us"] == null) {
@@ -895,6 +914,80 @@ app.post("/v1/rules/update", async (_req, res) => {
       rawRowCount: cache.rawRowCount,
       itemRulesCount: cache.itemEntries.length,
       range: RULE_SHEET_RANGE,
+    });
+  } catch (e) {
+    const status = e?.status ?? 500;
+    return res.status(status).json({ ok: false, error: e?.message ?? String(e) });
+  }
+});
+
+/**
+ * Step G2 (B안 기본): POST /v1/glossary/suggest
+ * - suggest-only (절대 Glossary 갱신/반영하지 않음)
+ * - en-US canonical 은 현재는 입력 기반 + 추후 Step G3에서 3개 소스 검증을 얹음
+ * - 다국어 후보는 기본 생성하지 않음 (빈 배열 반환 + 경고)
+ */
+app.post("/v1/glossary/suggest", async (req, res) => {
+  try {
+    const body = SuggestSchema.parse(req.body ?? {});
+    const categoryKey = String(body.category).trim().toLowerCase();
+    const anchorLangKey = normalizeLang(body.anchorLang || "en-US"); // expected en-us
+    const targetLangKeys = body.targetLangs.map(normalizeLang);
+
+    // Step G2 scope: allow item only (can relax later)
+    if (categoryKey !== "item") {
+      return res.status(400).json({ ok: false, error: "Only category='item' is supported in Step G2." });
+    }
+    if (anchorLangKey !== "en-us") {
+      // We anchor on en-US in this workflow
+      return res.status(400).json({ ok: false, error: "anchorLang must be en-US for now." });
+    }
+
+    const includeEvidence = Boolean(body.includeEvidence);
+    const sources = body.sources ?? ["iroWikiDb", "rateMyServer", "divinePride"];
+
+    const results = body.terms.map((termRaw) => {
+      const input = String(termRaw ?? "").trim();
+
+      const canonicalText = input;
+      const conf = isLikelyEnglish(canonicalText) ? "medium" : "low";
+
+      const candidatesByLang = {};
+      for (const t of targetLangKeys) {
+        candidatesByLang[t] = []; // B안 기본: 생성하지 않음
+      }
+
+      const warnings = [];
+      if (!body.generateTargets) {
+        warnings.push("Target-language candidates are not generated in Step G2 (suggest-only MVP).");
+      } else {
+        warnings.push("generateTargets=true is not implemented yet. Candidates are returned as empty arrays.");
+      }
+
+      // Evidence is not collected in Step G2 (added in Step G3)
+      const notes = [];
+      if (includeEvidence) notes.push("Evidence collection is not enabled in Step G2.");
+
+      return {
+        input,
+        canonical: {
+          lang: "en-US",
+          text: canonicalText,
+          confidence: conf, // high/medium/low
+          matchedSources: [], // filled in Step G3
+        },
+        candidatesByLang,
+        notes,
+        warnings,
+      };
+    });
+
+    return res.status(200).json({
+      ok: true,
+      category: categoryKey,
+      anchorLang: "en-US",
+      targetLangs: body.targetLangs,
+      results,
     });
   } catch (e) {
     const status = e?.status ?? 500;
@@ -1131,7 +1224,7 @@ app.listen(PORT, () => {
   console.log(`Sheet range: ${SHEET_RANGE} (TERM ignored)`);
   console.log(`Rule range: ${RULE_SHEET_RANGE}`);
   console.log(
-    `REST: /v1/session/init, /v1/translate/replace(+logs, stateless ok, +ruleLogs), /v1/glossary/update(session optional), /v1/rules/update, /v1/glossary/raw`
+    `REST: /v1/session/init, /v1/translate/replace(+logs, stateless ok, +ruleLogs), /v1/glossary/update(session optional), /v1/rules/update, /v1/glossary/suggest, /v1/glossary/raw`
   );
   console.log(`MCP: /mcp (replace_texts, glossary_update)`);
 });
