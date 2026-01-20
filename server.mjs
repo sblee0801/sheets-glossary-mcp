@@ -583,21 +583,22 @@ const CandidatesSchema = z.object({
 const ApplySchema = z.object({
   category: z.string().min(1),
   sourceLang: z.string().optional().default("en-US"),
-  // en-US는 이미 채워져 있으므로, sourceText(en-US)로 행을 찾는다.
   entries: z
     .array(
       z.object({
-        sourceText: z.string().min(1), // en-US text
-        translations: z.record(z.string().min(1)), // { "ko-KR": "...", "de-DE": "...", ... }
+        sourceText: z.string().min(1),
+        translations: z.record(
+          z.string(),                // key: "ko-KR", "de-DE" 등
+          z.string().trim().min(1)   // value: 번역 문자열
+        ),
       })
     )
     .min(1)
     .max(500),
-  // 기본: 빈 셀만 채움
   fillOnlyEmpty: z.boolean().optional().default(true),
-  // 옵션: 특정 언어만 제한하고 싶을 때 (미지정이면 entries.translations의 키를 그대로 사용)
   targetLangs: z.array(z.string().min(1)).optional(),
 });
+
 
 // ---------------- HTTP App ----------------
 const app = express();
