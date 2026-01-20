@@ -225,11 +225,7 @@ export async function runCandidatesBatch({
   const categoryKey = String(category ?? "").trim().toLowerCase();
   const sourceLangKey = normalizeLang(sourceLang || "en-US");
 
-  if (categoryKey !== "item") {
-    const err = new Error("Only category='item' is supported for now.");
-    err.status = 400;
-    throw err;
-  }
+
   if (sourceLangKey !== "en-us") {
     const err = new Error("sourceLang must be en-US (anchor) for candidates/batch.");
     err.status = 400;
