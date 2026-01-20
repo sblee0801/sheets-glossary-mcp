@@ -73,7 +73,9 @@ export const CandidatesBatchSchema = z.object({
 
 // ✅ apply endpoint schema (en-US row match -> write only target language columns)
 export const ApplySchema = z.object({
-  category: z.string().min(1),
+  // ✅ 변경: category를 optional로 (en-US 단독 매칭 확장 준비)
+  category: z.string().optional(),
+
   sourceLang: z.string().optional().default("en-US"),
   entries: z
     .array(

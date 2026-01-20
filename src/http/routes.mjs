@@ -555,14 +555,17 @@ export function registerRoutes(app) {
 
   /**
    * POST /v1/glossary/apply
-   * - en-US(sourceText) + category 로 기존 행을 찾고
+   * - ✅ 변경: en-US(sourceText) 단독으로 기존 행을 찾는다 (Anchor)
+   * - category는 선택적 필터(검색 범위 축소)로만 사용
    * - 해당 언어 컬럼만 채워 넣는다
    * - 기본: 빈 셀만 채움(fillOnlyEmpty=true)
    */
   app.post("/v1/glossary/apply", async (req, res) => {
     try {
       const body = ApplySchema.parse(req.body ?? {});
-      const categoryKey = String(body.category).trim().toLowerCase();
+
+      // ✅ category optional
+      const categoryKey = body.category ? String(body.category).trim().toLowerCase() : "";
 
       const sourceLangKey = normalizeLang(body.sourceLang ?? "en-US");
       if (sourceLangKey !== "en-us") {
@@ -579,6 +582,14 @@ export function registerRoutes(app) {
         });
       }
 
+      // category 필터가 들어온 경우, 존재 여부만 검증(선택)
+      if (categoryKey && !cache.byCategoryBySource.has(categoryKey)) {
+        return res.status(400).json({
+          ok: false,
+          error: `Category not found in glossary index: ${categoryKey}`,
+        });
+      }
+
       const targetLangAllow = body.targetLangs ? new Set(body.targetLangs.map(normalizeLang)) : null;
 
       const updates = [];
@@ -586,28 +597,48 @@ export function registerRoutes(app) {
       const skipped = [];
       let matchedRows = 0;
 
-      // 빠른 검색용: categoryLower + en-us text -> entry
-      const mapByCatAndEn = new Map();
+      // ✅ 빠른 검색용: en-us text -> entry[] (중복 보존)
+      const mapByEn = new Map(); // Map<enUS, entry[]>
       for (const e of cache.entries) {
-        const cat = String(e.category ?? "").trim().toLowerCase();
         const en = String(e.translations?.["en-us"] ?? "").trim();
-        if (!cat || !en) continue;
-        const k = `${cat}@@${en}`;
-        if (!mapByCatAndEn.has(k)) mapByCatAndEn.set(k, e);
+        if (!en) continue;
+        if (!mapByEn.has(en)) mapByEn.set(en, []);
+        mapByEn.get(en).push(e);
       }
 
       for (const item of body.entries) {
         const sourceText = String(item.sourceText ?? "").trim();
         if (!sourceText) continue;
 
-        const key = `${categoryKey}@@${sourceText}`;
-        const rowEntry = mapByCatAndEn.get(key);
+        const candidates = mapByEn.get(sourceText) || [];
 
-        if (!rowEntry) {
-          notFound.push({ sourceText, reason: "Row not found by category+en-US" });
+        // category가 있으면 필터로만 사용
+        const filtered = categoryKey
+          ? candidates.filter((e) => String(e.category ?? "").trim().toLowerCase() === categoryKey)
+          : candidates;
+
+        if (filtered.length === 0) {
+          notFound.push({
+            sourceText,
+            reason: categoryKey
+              ? "Row not found by en-US within category filter"
+              : "Row not found by en-US",
+          });
           continue;
         }
 
+        // ✅ en-US 단독 식별자 정책: 중복은 충돌로 취급
+        if (filtered.length > 1) {
+          const err = new Error(
+            `Duplicate en-US rows found for '${sourceText}'${
+              categoryKey ? ` in category='${categoryKey}'` : ""
+            }. Resolve duplicates before apply.`
+          );
+          err.status = 409;
+          throw err;
+        }
+
+        const rowEntry = filtered[0];
         matchedRows += 1;
 
         const rowIndex = rowEntry._rowIndex;
@@ -652,7 +683,7 @@ export function registerRoutes(app) {
 
       return res.status(200).json({
         ok: true,
-        category: categoryKey,
+        category: categoryKey || "ALL",
         sourceLang: "en-US",
         fillOnlyEmpty: Boolean(body.fillOnlyEmpty),
         inputCount: body.entries.length,
