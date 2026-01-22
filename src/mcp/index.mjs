@@ -1,7 +1,7 @@
 /**
  * src/mcp/index.mjs
  * - MCP 서버/툴 등록 + /mcp 엔드포인트 핸들러
- * - 기존 server.mjs의 MCP 동작(2 tools) 유지
+ * - sheet 파라미터 추가 지원
  */
 
 import { z } from "zod";
@@ -14,18 +14,15 @@ import { replaceByGlossaryWithLogs } from "../replace/replace.mjs";
 import { normalizeLang, assertAllowedSourceLang, getParsedBody } from "../utils/common.mjs";
 
 export function registerMcp(app) {
-  // ---------------- MCP (ONLY 2 TOOLS) ----------------
   const mcp = new McpServer({
     name: "sheets-glossary-mcp",
-    version: "2.4.2",
+    version: "2.5.0",
   });
 
-  /**
-   * MCP Tool #1: replace_texts
-   */
   mcp.tool(
     "replace_texts",
     {
+      sheet: z.string().optional(), // ✅ NEW
       texts: z.array(z.string()).min(1).max(2000),
       category: z.string().optional(),
       sourceLang: z.string().min(1),
@@ -33,8 +30,11 @@ export function registerMcp(app) {
       includeLogs: z.boolean().optional(),
       forceReload: z.boolean().optional(),
     },
-    async ({ texts, category, sourceLang, targetLang, includeLogs, forceReload }) => {
-      const cache = await ensureGlossaryLoaded({ forceReload: Boolean(forceReload) });
+    async ({ sheet, texts, category, sourceLang, targetLang, includeLogs, forceReload }) => {
+      const cache = await ensureGlossaryLoaded({
+        sheetName: sheet || "Glossary",
+        forceReload: Boolean(forceReload),
+      });
 
       const sourceLangKey = normalizeLang(sourceLang);
       const targetLangKey = normalizeLang(targetLang);
@@ -61,12 +61,7 @@ export function registerMcp(app) {
         const catKey = String(category).trim().toLowerCase();
         if (!cache.byCategoryBySource.has(catKey)) {
           return {
-            content: [
-              {
-                type: "text",
-                text: JSON.stringify({ ok: false, error: `Category not found: ${category}` }, null, 2),
-              },
-            ],
+            content: [{ type: "text", text: JSON.stringify({ ok: false, error: `Category not found: ${category}` }, null, 2) }],
           };
         }
         categories = [catKey];
@@ -125,6 +120,7 @@ export function registerMcp(app) {
             text: JSON.stringify(
               {
                 ok: true,
+                sheet: cache.sheetName,
                 category: category ? String(category).trim().toLowerCase() : "ALL",
                 sourceLang: sourceLangKey,
                 targetLang: targetLangKey,
@@ -149,16 +145,17 @@ export function registerMcp(app) {
     }
   );
 
-  /**
-   * MCP Tool #2: glossary_update
-   */
   mcp.tool(
     "glossary_update",
     {
+      sheet: z.string().optional(), // ✅ NEW
       forceReload: z.boolean().optional(),
     },
-    async ({ forceReload }) => {
-      const cache = await ensureGlossaryLoaded({ forceReload: forceReload ?? true });
+    async ({ sheet, forceReload }) => {
+      const cache = await ensureGlossaryLoaded({
+        sheetName: sheet || "Glossary",
+        forceReload: forceReload ?? true,
+      });
 
       return {
         content: [
@@ -167,6 +164,7 @@ export function registerMcp(app) {
             text: JSON.stringify(
               {
                 ok: true,
+                sheet: cache.sheetName,
                 glossaryLoadedAt: cache.loadedAt,
                 rawRowCount: cache.rawRowCount,
                 categoriesCount: cache.byCategoryBySource.size,
@@ -180,7 +178,6 @@ export function registerMcp(app) {
     }
   );
 
-  // MCP endpoint
   app.all("/mcp", async (req, res) => {
     const transport = new StreamableHTTPServerTransport({
       enableJsonResponse: true,

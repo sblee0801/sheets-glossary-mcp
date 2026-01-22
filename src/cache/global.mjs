@@ -1,19 +1,19 @@
 /**
  * src/cache/global.mjs
  * - 프로세스 전역 캐시(Glossary / Rules)
+ * - Glossary는 sheetName별 캐시로 확장
  * - 강제 리로드 지원
- * - server.mjs(REST/MCP)가 공통으로 사용
  *
  * 의도:
- * - server.mjs의 줄 수를 줄이기 위해, "캐시 관리"를 별도 모듈로 분리한다.
- * - 실제 로딩 로직은 glossary/load.mjs, rules/load.mjs로 위임한다.
+ * - "시트 선택형 Glossary" 지원 (Glossary + Trans1~5)
  */
 
+import { DEFAULT_SHEET_NAME } from "../config/env.mjs";
 import { loadGlossaryAll } from "../glossary/load.mjs";
 import { buildIndexBySourcePreserveDuplicates } from "../glossary/index.mjs";
 import { loadRulesAll } from "../rules/load.mjs";
 
-let _glossaryCache = null;
+const _glossaryCaches = new Map(); // Map<sheetName, cache>
 let _rulesCache = null;
 
 function nowIso() {
@@ -24,25 +24,34 @@ function freezeShallow(obj) {
   return Object.freeze(obj);
 }
 
+function normSheetName(sheetName) {
+  return String(sheetName ?? "").trim() || DEFAULT_SHEET_NAME;
+}
+
 /**
- * Glossary 캐시 로드/갱신
+ * Glossary 캐시 로드/갱신 (sheetName별)
  * @param {object} opts
+ * @param {string} [opts.sheetName]
  * @param {boolean} [opts.forceReload=false]
  */
 export async function ensureGlossaryLoaded(opts = {}) {
+  const sheetName = normSheetName(opts.sheetName);
   const forceReload = Boolean(opts.forceReload);
 
-  if (_glossaryCache && !forceReload) return _glossaryCache;
+  const existing = _glossaryCaches.get(sheetName);
+  if (existing && !forceReload) return existing;
 
-  const loaded = await loadGlossaryAll();
+  const loaded = await loadGlossaryAll({ sheetName });
 
   const byCategoryBySource = buildIndexBySourcePreserveDuplicates(
     loaded.entries,
     ["ko-kr", "en-us"]
   );
 
-  _glossaryCache = freezeShallow({
+  const cache = freezeShallow({
     loadedAt: loaded.loadedAt || nowIso(),
+    sheetName: loaded.sheetName,
+    range: loaded.range,
     header: loaded.header,
     rawRows: loaded.rawRows,
     entries: loaded.entries,
@@ -52,11 +61,12 @@ export async function ensureGlossaryLoaded(opts = {}) {
     idx: loaded.idx,
   });
 
-  return _glossaryCache;
+  _glossaryCaches.set(sheetName, cache);
+  return cache;
 }
 
 /**
- * Rules 캐시 로드/갱신
+ * Rules 캐시 로드/갱신 (기존 그대로)
  * @param {object} opts
  * @param {boolean} [opts.forceReload=false]
  */
@@ -90,7 +100,7 @@ export async function ensureRulesLoaded(opts = {}) {
  * 캐시 강제 초기화(디버깅/테스트 용)
  */
 export function resetGlobalCaches() {
-  _glossaryCache = null;
+  _glossaryCaches.clear();
   _rulesCache = null;
 }
 
@@ -98,14 +108,18 @@ export function resetGlobalCaches() {
  * 상태 확인(health/diagnostics 용)
  */
 export function getGlobalCacheStatus() {
+  const glossarySheets = [];
+  for (const [sheetName, cache] of _glossaryCaches.entries()) {
+    glossarySheets.push({
+      sheetName,
+      loadedAt: cache.loadedAt,
+      rawRowCount: cache.rawRowCount,
+      categoriesCount: cache.byCategoryBySource?.size ?? 0,
+    });
+  }
+
   return {
-    glossary: _glossaryCache
-      ? {
-          loadedAt: _glossaryCache.loadedAt,
-          rawRowCount: _glossaryCache.rawRowCount,
-          categoriesCount: _glossaryCache.byCategoryBySource?.size ?? 0,
-        }
-      : null,
+    glossary: glossarySheets.length ? glossarySheets : null,
     rules: _rulesCache
       ? {
           loadedAt: _rulesCache.loadedAt,

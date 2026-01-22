@@ -1,436 +1,455 @@
 /**
  * src/http/routes.mjs
- * - REST endpoints only
- * - Server is the single source of truth
+ * - REST endpoints (sheet-aware)
+ * - Targets: replaceGlossaryTerms, glossaryPendingNext, updateGlossary, glossaryApply
  */
 
-import { SHEET_NAME } from "../config/env.mjs";
-import {
-  normalizeLang,
-  assertAllowedSourceLang,
-  newSessionId,
-} from "../utils/common.mjs";
-
+import { normalizeLang, assertAllowedSourceLang, newSessionId, nowIso, getParsedBody } from "../utils/common.mjs";
 import { ensureGlossaryLoaded, ensureRulesLoaded } from "../cache/global.mjs";
-
-import {
-  InitSchema,
-  ReplaceSchema,
-  UpdateSchema,
-  CandidatesBatchSchema,
-  ApplySchema,
-  PendingNextSchema,
-} from "./schemas.mjs";
-
 import { mergeSourceTextMapsFromCache } from "../glossary/index.mjs";
 import { replaceByGlossaryWithLogs, buildRuleLogs } from "../replace/replace.mjs";
-import { batchUpdateValuesA1, colIndexToA1 } from "../google/sheets.mjs";
-import { runCandidatesBatch } from "../candidates/batch.mjs";
+import { colIndexToA1, batchUpdateValuesA1 } from "../google/sheets.mjs";
 
-// ---------------- Session Cache (optional legacy) ----------------
-const sessions = new Map();
+import { InitSchema, ReplaceSchema, UpdateSchema, PendingNextSchema, ApplySchema } from "./schemas.mjs";
 
-// ---------------- Pending Cursor (Preview / Commit) ----------------
-const previewCursors = new Map(); // next 호출 시 이동
-const committedCursors = new Map(); // apply 성공 시 확정
+// ---------------- In-memory sessions (lightweight) ----------------
+const _sessions = new Map(); // sessionId -> { sheet, category, sourceLangKey, targetLangKey, createdAt }
 
-function makeCursorKey({ sourceLangKey, categoryKey, targetLangKeys }) {
-  const cat = categoryKey ?? "ALL";
-  const langs = (targetLangKeys || []).slice().sort().join(",");
-  return `${sourceLangKey}::${cat}::${langs}`;
+function httpError(status, message, extra) {
+  const err = new Error(message);
+  err.status = status;
+  err.extra = extra;
+  return err;
 }
 
-// ---------------- Routes ----------------
+function toJson(res, status, payload) {
+  res.status(status).json(payload);
+}
+
+function handleErr(res, e) {
+  const status = Number(e?.status) || 500;
+  toJson(res, status, { ok: false, error: String(e?.message ?? e), extra: e?.extra });
+}
+
+function pickSheet(v) {
+  return String(v?.sheet ?? "Glossary").trim() || "Glossary";
+}
+
+// ---------------- Endpoint registration ----------------
 export function registerRoutes(app) {
-  // ✅ basic routes
-  app.get("/health", (_req, res) => res.status(200).json({ ok: true }));
-  app.get("/healthz", (_req, res) => res.status(200).json({ ok: true }));
-  app.get("/", (_req, res) => res.status(200).send("ok"));
+  // Health
+  app.get("/healthz", (req, res) => {
+    res.status(200).json({ ok: true, at: nowIso() });
+  });
 
   /**
-   * (Optional legacy) POST /v1/session/init
-   * - Not required by your OpenAPI but safe to keep if existing clients use it.
+   * Session init (optional but kept for compatibility)
+   * POST /v1/session/init
    */
   app.post("/v1/session/init", async (req, res) => {
     try {
-      const { category, sourceLang, targetLang } = InitSchema.parse(req.body);
+      const body = getParsedBody(req);
+      const v = InitSchema.parse(body);
 
-      const categoryKey = String(category).trim().toLowerCase();
-      const sourceLangKey = normalizeLang(sourceLang);
-      const targetLangKey = normalizeLang(targetLang);
+      const sheet = pickSheet(v);
+      const sourceLangKey = normalizeLang(v.sourceLang);
+      const targetLangKey = normalizeLang(v.targetLang);
+      const category = String(v.category ?? "").trim();
 
       assertAllowedSourceLang(sourceLangKey);
 
-      const cache = await ensureGlossaryLoaded({ forceReload: false });
+      // Ensure cache exists for that sheet (validates headers)
+      const cache = await ensureGlossaryLoaded({ sheetName: sheet, forceReload: false });
+      if (sourceLangKey === "en-us" && cache.langIndex["en-us"] == null) {
+        throw httpError(400, `Sheet '${sheet}' does not include en-US column; cannot init with sourceLang=en-US.`);
+      }
 
       const sessionId = newSessionId();
-      sessions.set(sessionId, { sessionId, categoryKey, sourceLangKey, targetLangKey });
+      _sessions.set(sessionId, {
+        sheet,
+        category,
+        sourceLangKey,
+        targetLangKey,
+        createdAt: nowIso(),
+      });
 
-      return res.status(200).json({
+      toJson(res, 200, {
         ok: true,
         sessionId,
-        category: categoryKey,
+        sheet,
+        category,
         sourceLang: sourceLangKey,
         targetLang: targetLangKey,
-        glossaryLoadedAt: cache.loadedAt ?? null,
       });
     } catch (e) {
-      return res.status(e?.status ?? 500).json({ ok: false, error: e?.message });
+      handleErr(res, e);
     }
   });
 
   /**
+   * replaceGlossaryTerms
    * POST /v1/translate/replace
-   * - Phase 1 glossary replacement + Phase 1.5 ruleLogs
    */
   app.post("/v1/translate/replace", async (req, res) => {
     try {
-      const body = ReplaceSchema.parse(req.body ?? {});
-      const wantLogs = body.includeLogs ?? true;
+      const body = getParsedBody(req);
+      const v = ReplaceSchema.parse(body);
 
-      // NOTE: sessionId mode is optional; if not provided, require sourceLang/targetLang
-      const sourceLangKey = normalizeLang(body.sourceLang);
-      const targetLangKey = normalizeLang(body.targetLang);
+      const sheet = pickSheet(v);
+
+      // Resolve config either from session or from request
+      let cfg = null;
+      if (v.sessionId) {
+        cfg = _sessions.get(v.sessionId) || null;
+        if (!cfg) throw httpError(400, `Unknown sessionId: ${v.sessionId}`);
+      }
+
+      const category = String(v.category ?? cfg?.category ?? "").trim();
+      const sourceLangKey = normalizeLang(v.sourceLang ?? cfg?.sourceLangKey ?? "");
+      const targetLangKey = normalizeLang(v.targetLang ?? cfg?.targetLangKey ?? "");
+
+      if (!sourceLangKey || !targetLangKey) {
+        throw httpError(400, "sourceLang and targetLang are required (or provide sessionId).");
+      }
 
       assertAllowedSourceLang(sourceLangKey);
 
-      const cache = await ensureGlossaryLoaded({ forceReload: false });
+      const cache = await ensureGlossaryLoaded({ sheetName: sheet, forceReload: false });
 
-      const categories = body.category
-        ? [String(body.category).trim().toLowerCase()]
-        : Array.from(cache.byCategoryBySource.keys());
+      if (sourceLangKey === "en-us" && cache.langIndex["en-us"] == null) {
+        throw httpError(400, `Sheet '${sheet}' does not include en-US column; cannot use sourceLang=en-US.`);
+      }
+
+      let categories = [];
+      if (category && String(category).trim()) {
+        const catKey = String(category).trim().toLowerCase();
+        if (!cache.byCategoryBySource.has(catKey)) {
+          throw httpError(400, `Category not found: ${category}`, { sheet });
+        }
+        categories = [catKey];
+      } else {
+        categories = Array.from(cache.byCategoryBySource.keys());
+      }
 
       const sourceTextMap = mergeSourceTextMapsFromCache(cache, sourceLangKey, categories);
+      if (!sourceTextMap || sourceTextMap.size === 0) {
+        throw httpError(400, `No source texts found for sheet='${sheet}', sourceLang='${sourceLangKey}', category='${category || "ALL"}'.`);
+      }
+
+      const wantLogs = v.includeLogs ?? true;
 
       const rulesCache = await ensureRulesLoaded({ forceReload: false });
+      const categoryKey = (category ? String(category).trim().toLowerCase() : (categories[0] || ""));
 
       const outTexts = [];
       const perLineLogs = [];
-      const ruleLogs = [];
+      const perLineRuleLogs = [];
 
-      for (let i = 0; i < body.texts.length; i++) {
-        const { out, logs } = replaceByGlossaryWithLogs({
-          text: body.texts[i],
+      let replacedTotalAll = 0;
+      let matchedTermsAll = 0;
+      let matchedRulesAll = 0;
+
+      for (let i = 0; i < v.texts.length; i++) {
+        const input = v.texts[i];
+
+        const { out, replacedTotal, logs } = replaceByGlossaryWithLogs({
+          text: input,
           sourceLangKey,
           targetLangKey,
           sourceTextMap,
         });
 
-        outTexts.push(out);
-        if (wantLogs) perLineLogs.push({ index: i, logs });
-
-        const rLogs = buildRuleLogs({
+        const ruleLogs = buildRuleLogs({
           text: out,
-          categoryKey: body.category ?? "ALL",
+          categoryKey: String(categoryKey || "").toLowerCase(),
           targetLangKey,
           rulesCache,
         });
-        ruleLogs.push({ index: i, logs: rLogs });
+
+        outTexts.push(out);
+        replacedTotalAll += replacedTotal;
+        matchedTermsAll += logs.length;
+        matchedRulesAll += ruleLogs.length;
+
+        if (wantLogs) {
+          perLineLogs.push({ index: i, replacedTotal, logs });
+          perLineRuleLogs.push({ index: i, ruleLogs });
+        }
       }
 
-      return res.status(200).json({
+      toJson(res, 200, {
         ok: true,
-        mode: "stateless",
-        category: body.category ?? "ALL",
+        sheet: cache.sheetName,
+        category: category ? String(category).trim().toLowerCase() : "ALL",
         sourceLang: sourceLangKey,
         targetLang: targetLangKey,
         texts: outTexts,
-        logs: wantLogs ? perLineLogs : null,
-        ruleLogs,
+        summary: {
+          lines: v.texts.length,
+          replacedTotal: replacedTotalAll,
+          matchedTerms: matchedTermsAll,
+          matchedRules: matchedRulesAll,
+          glossaryLoadedAt: cache.loadedAt,
+          rawRowCount: cache.rawRowCount,
+          categoriesUsedCount: categories.length,
+          uniqueTermsInIndex: sourceTextMap.size,
+        },
+        logs: wantLogs ? perLineLogs : undefined,
+        ruleLogs: wantLogs ? perLineRuleLogs : undefined,
       });
     } catch (e) {
-      return res.status(e?.status ?? 500).json({ ok: false, error: e?.message });
+      handleErr(res, e);
     }
   });
 
   /**
+   * updateGlossary
    * POST /v1/glossary/update
-   * - Reload glossary cache (read-only)
    */
   app.post("/v1/glossary/update", async (req, res) => {
     try {
-      const _body = UpdateSchema.parse(req.body ?? {});
-      const cache = await ensureGlossaryLoaded({ forceReload: true });
+      const body = getParsedBody(req);
+      const v = UpdateSchema.parse(body);
 
-      return res.status(200).json({
+      const sheet = pickSheet(v);
+      const cache = await ensureGlossaryLoaded({ sheetName: sheet, forceReload: true });
+
+      toJson(res, 200, {
         ok: true,
-        mode: "process",
-        glossaryLoadedAt: cache.loadedAt ?? null,
-        rawRowCount: cache.rawRowCount ?? null,
+        sheet: cache.sheetName,
+        glossaryLoadedAt: cache.loadedAt,
+        rawRowCount: cache.rawRowCount,
+        categoriesCount: cache.byCategoryBySource.size,
       });
     } catch (e) {
-      return res.status(e?.status ?? 500).json({ ok: false, error: e?.message });
+      handleErr(res, e);
     }
   });
 
   /**
-   * POST /v1/rules/update
-   * - Reload rules cache (read-only)
-   */
-  app.post("/v1/rules/update", async (_req, res) => {
-    try {
-      const rules = await ensureRulesLoaded({ forceReload: true });
-      return res.status(200).json({
-        ok: true,
-        mode: "process",
-        rulesLoadedAt: rules.loadedAt ?? null,
-        rawRowCount: rules.rawRowCount ?? null,
-        itemRulesCount: rules.itemRulesCount ?? null,
-      });
-    } catch (e) {
-      return res.status(e?.status ?? 500).json({ ok: false, error: e?.message });
-    }
-  });
-
-  /**
-   * POST /v1/glossary/candidates/batch
-   * - Divine Pride candidate lookup (read-only)
-   */
-  app.post("/v1/glossary/candidates/batch", async (req, res) => {
-    try {
-      const body = CandidatesBatchSchema.parse(req.body ?? {});
-      const out = await runCandidatesBatch(body);
-      return res.status(200).json(out);
-    } catch (e) {
-      return res.status(e?.status ?? 500).json({ ok: false, error: e?.message });
-    }
-  });
-
-  /**
+   * glossaryPendingNext
    * POST /v1/glossary/pending/next
-   * - committedCursor 기준으로 스캔
-   * - previewCursor만 이동
+   *
+   * 정책:
+   * - sheet 기준으로, targetLangs 중 하나라도 빈 칸인 row를 다음 N개 반환
+   * - Trans 시트는 category가 sheetName으로 강제 주입되어 있으므로 category 필터가 필요하면 사용 가능
    */
   app.post("/v1/glossary/pending/next", async (req, res) => {
     try {
-      const body = PendingNextSchema.parse(req.body ?? {});
-      const sourceLangKey = normalizeLang(body.sourceLang ?? "en-US");
+      const body = getParsedBody(req);
+      const v = PendingNextSchema.parse(body);
 
-      const cache = await ensureGlossaryLoaded({ forceReload: Boolean(body.forceReload) });
+      const sheet = pickSheet(v);
+      const cache = await ensureGlossaryLoaded({ sheetName: sheet, forceReload: Boolean(v.forceReload) });
 
-      const categoryKey =
-        body.category && String(body.category).trim()
-          ? String(body.category).trim().toLowerCase()
-          : null;
-
-      const targetLangKeysRaw = (body.targetLangs || []).map(normalizeLang).filter(Boolean);
-      const targetLangKeys = Array.from(new Set(targetLangKeysRaw));
-
-      if (targetLangKeys.length === 0) {
-        return res.status(400).json({ ok: false, error: "targetLangs is required." });
+      const sourceLangKey = normalizeLang(v.sourceLang);
+      if (sourceLangKey !== "en-us" && sourceLangKey !== "ko-kr") {
+        throw httpError(400, "pending/next sourceLang must be en-US or ko-KR.");
       }
 
-      const validTargetLangKeys = targetLangKeys.filter((k) => cache.langIndex?.[k] != null);
-      if (validTargetLangKeys.length === 0) {
-        return res.status(400).json({
-          ok: false,
-          error: "None of targetLangs exist in sheet header (langIndex).",
-        });
+      const targetLangKeys = (v.targetLangs || []).map(normalizeLang).filter(Boolean);
+      if (!targetLangKeys.length) throw httpError(400, "targetLangs must have at least 1 language.");
+
+      // Validate target columns exist
+      for (const lk of targetLangKeys) {
+        if (cache.langIndex[lk] == null) {
+          throw httpError(400, `Sheet '${sheet}' does not include target language column: ${lk}`);
+        }
       }
 
-      const cursorKey = makeCursorKey({
-        sourceLangKey,
-        categoryKey,
-        targetLangKeys: validTargetLangKeys,
-      });
+      const srcCol = cache.langIndex[sourceLangKey];
+      if (srcCol == null) throw httpError(400, `Sheet '${sheet}' does not include source language column: ${sourceLangKey}`);
 
-      const committed = committedCursors.get(cursorKey) ?? 0;
-      const limit = body.limit ?? 100;
+      const limit = Number(v.limit || 100);
+      const out = [];
 
-      const items = [];
-      let scanned = 0;
+      // rawRows: header 제외한 rows. entries는 rowIndex=+2.
+      for (let i = 0; i < cache.rawRows.length; i++) {
+        const row = cache.rawRows[i];
+        const rowIndex = i + 2;
 
-      for (const entry of cache.entries || []) {
-        scanned++;
+        const srcText = String(row[srcCol] ?? "").trim();
+        if (!srcText) continue;
 
-        if ((entry._rowIndex ?? 0) <= committed) continue;
-
-        if (categoryKey) {
-          const eCat = String(entry.category ?? "").trim().toLowerCase();
-          if (eCat !== categoryKey) continue;
+        // category 필터(옵션): entries 기반으로 category 확인
+        if (v.category && String(v.category).trim()) {
+          const catKey = String(v.category).trim().toLowerCase();
+          const e = cache.entries[i];
+          const eCat = String(e?.category ?? "").trim().toLowerCase();
+          if (eCat !== catKey) continue;
         }
 
-        const src = String(entry.translations?.[sourceLangKey] ?? "").trim();
-        if (!src) continue;
+        // targetLangs 중 하나라도 비어있으면 pending
+        let isPending = false;
+        const missing = [];
 
-        let needs = false;
-        for (const tKey of validTargetLangKeys) {
-          const tv = String(entry.translations?.[tKey] ?? "").trim();
-          if (!tv) {
-            needs = true;
-            break;
+        for (const lk of targetLangKeys) {
+          const col = cache.langIndex[lk];
+          const cur = String(row[col] ?? "").trim();
+          if (!cur) {
+            isPending = true;
+            missing.push(lk);
           }
         }
-        if (!needs) continue;
 
-        items.push({
-          sourceText: src,
-          category: entry.category ?? null,
-          rowIndex: entry._rowIndex ?? null,
+        if (!isPending) continue;
+
+        out.push({
+          rowIndex,
+          sourceText: srcText,
+          missingLangs: missing,
         });
 
-        if (items.length >= limit) break;
+        if (out.length >= limit) break;
       }
 
-      // preview cursor 이동 (업로드 성공 전에는 committed 변경 없음)
-      if (items.length > 0) {
-        previewCursors.set(cursorKey, items[items.length - 1].rowIndex);
-      }
-
-      return res.status(200).json({
+      toJson(res, 200, {
         ok: true,
-        category: categoryKey ?? "ALL",
-        sourceLang: sourceLangKey === "ko-kr" ? "ko-KR" : "en-US",
-        targetLangs: validTargetLangKeys,
-        items,
-        cursor: {
-          committed,
-          preview: previewCursors.get(cursorKey) ?? committed,
+        sheet: cache.sheetName,
+        sourceLang: sourceLangKey === "en-us" ? "en-US" : "ko-KR",
+        targetLangs: v.targetLangs,
+        limit,
+        count: out.length,
+        items: out,
+        meta: {
+          glossaryLoadedAt: cache.loadedAt,
+          rawRowCount: cache.rawRowCount,
         },
-        meta: { returned: items.length, scanned },
       });
     } catch (e) {
-      return res.status(e?.status ?? 500).json({ ok: false, error: e?.message });
+      handleErr(res, e);
     }
   });
 
   /**
+   * glossaryApply
    * POST /v1/glossary/apply
-   * - conflict-safe, fillOnlyEmpty, partial_success/no_op 지원
-   * - 성공 시 previewCursor → committedCursor 확정
+   *
+   * 정책:
+   * - sheet 기준으로 row를 찾고, 해당 row의 targetLang 셀만 업데이트
+   * - fillOnlyEmpty=true면 기존 값이 있는 셀은 건드리지 않음
+   * - allowAnchorUpdate=false면 en-us 컬럼 write 금지
    */
   app.post("/v1/glossary/apply", async (req, res) => {
     try {
-      const body = ApplySchema.parse(req.body ?? {});
-      const sourceLangKey = normalizeLang(body.sourceLang ?? "en-US");
+      const body = getParsedBody(req);
+      const v = ApplySchema.parse(body);
 
-      const cache = await ensureGlossaryLoaded({ forceReload: true });
+      const sheet = pickSheet(v);
+      const cache = await ensureGlossaryLoaded({ sheetName: sheet, forceReload: false });
 
-      const categoryKey =
-        body.category && String(body.category).trim()
-          ? String(body.category).trim().toLowerCase()
-          : null;
+      const sourceLangKey = normalizeLang(v.sourceLang);
+      if (sourceLangKey !== "en-us" && sourceLangKey !== "ko-kr") {
+        throw httpError(400, "apply sourceLang must be en-US or ko-KR.");
+      }
 
-      const categories = categoryKey
-        ? [categoryKey]
-        : Array.from(cache.byCategoryBySource.keys());
+      const srcCol = cache.langIndex[sourceLangKey];
+      if (srcCol == null) throw httpError(400, `Sheet '${sheet}' does not include source language column: ${sourceLangKey}`);
 
+      // category filter
+      let categories = null;
+      if (v.category && String(v.category).trim()) {
+        const catKey = String(v.category).trim().toLowerCase();
+        if (!cache.byCategoryBySource.has(catKey)) {
+          throw httpError(400, `Category not found: ${v.category}`, { sheet });
+        }
+        categories = [catKey];
+      } else {
+        categories = Array.from(cache.byCategoryBySource.keys());
+      }
+
+      // Prepare a fast lookup: sourceText -> entries[] (preserve duplicates)
       const sourceTextMap = mergeSourceTextMapsFromCache(cache, sourceLangKey, categories);
 
-      // apply에 포함된 targetLangKeys(커서 key 계산용)
-      const unionTargetLangKeys = Array.from(
-        new Set(
-          body.entries
-            .flatMap((e) => Object.keys(e.translations || {}))
-            .map((k) => normalizeLang(k))
-            .filter(Boolean)
-        )
-      ).filter((k) => cache.langIndex?.[k] != null);
-
-      const cursorKey = makeCursorKey({
-        sourceLangKey,
-        categoryKey,
-        targetLangKeys: unionTargetLangKeys,
-      });
+      const fillOnlyEmpty = Boolean(v.fillOnlyEmpty);
+      const allowAnchorUpdate = Boolean(v.allowAnchorUpdate);
 
       const updates = [];
-      const skipped = [];
-      const notFound = [];
-      const conflicts = [];
+      const results = [];
 
-      let updatedPlanned = 0;
-
-      const pickLowestRow = (entries) =>
-        entries.reduce((min, e) => (!min || e._rowIndex < min._rowIndex ? e : min), null);
-
-      for (const item of body.entries) {
-        const sourceText = String(item.sourceText ?? "").trim();
-        const matches = sourceTextMap.get(sourceText);
-
-        if (!matches || matches.length === 0) {
-          notFound.push({ sourceText });
+      for (const entry of v.entries) {
+        const sourceText = String(entry?.sourceText ?? "").trim();
+        if (!sourceText) {
+          results.push({ sourceText: "", status: "skipped", reason: "empty sourceText" });
           continue;
         }
 
-        const entry = matches.length === 1 ? matches[0] : pickLowestRow(matches);
-
-        if (matches.length > 1) {
-          conflicts.push({
-            sourceText,
-            rowIndices: matches.map((m) => m._rowIndex),
-            appliedRowIndex: entry._rowIndex,
-          });
+        const hits = sourceTextMap.get(sourceText) || [];
+        if (!hits.length) {
+          results.push({ sourceText, status: "skipped", reason: "not_found" });
+          continue;
         }
 
-        for (const [langRaw, valRaw] of Object.entries(item.translations || {})) {
-          const langKey = normalizeLang(langRaw);
-          if (!langKey) continue;
+        // pick lowest rowIndex
+        let chosen = hits[0];
+        for (const h of hits) {
+          if (Number(h?._rowIndex) < Number(chosen?._rowIndex)) chosen = h;
+        }
 
-          if (langKey === "en-us" && !body.allowAnchorUpdate) {
-            skipped.push({ sourceText, lang: langKey, reason: "anchor_update_blocked" });
+        const rowIndex = Number(chosen._rowIndex);
+        const rawRow = cache.rawRows[rowIndex - 2] || [];
+
+        let updated = 0;
+        let skipped = 0;
+        const conflicts = [];
+
+        for (const [rawLang, rawVal] of Object.entries(entry.translations || {})) {
+          const langKey = normalizeLang(rawLang);
+          const val = String(rawVal ?? "").trim();
+          if (!langKey || !val) continue;
+
+          if (langKey === "en-us" && !allowAnchorUpdate) {
+            skipped += 1;
             continue;
           }
 
-          const colIdx = cache.langIndex?.[langKey];
+          const colIdx = cache.langIndex[langKey];
           if (colIdx == null) {
-            skipped.push({ sourceText, lang: langKey, reason: "lang_column_not_found" });
+            // column not present in this sheet
+            skipped += 1;
+            conflicts.push({ lang: langKey, reason: "missing_column" });
             continue;
           }
 
-          const existing = String(entry.translations?.[langKey] ?? "").trim();
-          if (body.fillOnlyEmpty && existing) {
-            skipped.push({ sourceText, lang: langKey, reason: "cell_already_has_value" });
+          const cur = String(rawRow[colIdx] ?? "").trim();
+          if (fillOnlyEmpty && cur) {
+            skipped += 1;
             continue;
           }
 
-          const val = String(valRaw ?? "").trim();
-          if (!val) {
-            skipped.push({ sourceText, lang: langKey, reason: "empty_translation_value" });
-            continue;
-          }
-
-          const a1 = `${SHEET_NAME}!${colIndexToA1(colIdx)}${entry._rowIndex}`;
-          updates.push({ range: a1, values: [[val]] });
-          updatedPlanned += 1;
+          const cellA1 = `${sheet}!${colIndexToA1(colIdx)}${rowIndex}`;
+          updates.push({ range: cellA1, values: [[val]] });
+          updated += 1;
         }
+
+        let status = "no_op";
+        if (updated > 0 && skipped > 0) status = "partial_success";
+        else if (updated > 0) status = "success";
+
+        results.push({
+          sourceText,
+          chosen: { rowIndex, key: chosen.key || undefined },
+          updatedCellsPlanned: updated,
+          skippedCells: skipped,
+          conflicts,
+          status,
+        });
       }
 
-      const { updatedCells } = await batchUpdateValuesA1(updates);
+      const writeRes = await batchUpdateValuesA1(updates);
 
-      // 최신화
-      await ensureGlossaryLoaded({ forceReload: true });
-
-      // cursor commit (apply 성공 시점에만)
-      if (previewCursors.has(cursorKey)) {
-        committedCursors.set(cursorKey, previewCursors.get(cursorKey));
-      }
-
-      const status =
-        updatedCells > 0
-          ? skipped.length || conflicts.length || notFound.length
-            ? "partial_success"
-            : "success"
-          : "no_op";
-
-      return res.status(200).json({
+      toJson(res, 200, {
         ok: true,
-        status,
-        category: categoryKey ?? "ALL",
-        sourceLang: sourceLangKey === "ko-kr" ? "ko-KR" : "en-US",
-        fillOnlyEmpty: Boolean(body.fillOnlyEmpty),
-        allowAnchorUpdate: Boolean(body.allowAnchorUpdate),
-        writePlan: { intendedUpdates: updatedPlanned },
-        result: { updatedCells },
-        notFound,
-        skipped,
-        conflicts,
-        cursor: {
-          committed: committedCursors.get(cursorKey) ?? 0,
-          preview: previewCursors.get(cursorKey) ?? (committedCursors.get(cursorKey) ?? 0),
-        },
+        sheet,
+        fillOnlyEmpty,
+        allowAnchorUpdate,
+        plannedUpdates: updates.length,
+        updatedCells: writeRes.updatedCells,
+        updatedRanges: writeRes.updatedRanges,
+        results,
       });
     } catch (e) {
-      return res.status(e?.status ?? 500).json({ ok: false, error: e?.message });
+      handleErr(res, e);
     }
   });
 }

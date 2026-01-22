@@ -5,8 +5,12 @@
 
 import { z } from "zod";
 
+// 공통: sheet 파라미터 (생략 시 Glossary)
+const SheetSchema = z.string().trim().min(1).optional().default("Glossary");
+
 // ---------------- REST Schemas ----------------
 export const InitSchema = z.object({
+  sheet: SheetSchema,
   category: z.string().min(1),
   sourceLang: z.string().min(1),
   targetLang: z.string().min(1),
@@ -14,11 +18,14 @@ export const InitSchema = z.object({
 
 export const ReplaceSchema = z
   .object({
+    sheet: SheetSchema,
+
     sessionId: z.string().min(1).optional(),
     category: z.string().optional(),
     sourceLang: z.string().min(1).optional(),
     targetLang: z.string().min(1).optional(),
     texts: z.array(z.string()).min(1),
+
     includeLogs: z.boolean().optional(),
     limit: z.number().int().min(1).max(200).optional(),
     debug: z.boolean().optional(),
@@ -32,6 +39,7 @@ export const ReplaceSchema = z
   );
 
 export const UpdateSchema = z.object({
+  sheet: SheetSchema,
   sessionId: z.string().min(1).optional(),
 });
 
@@ -68,9 +76,9 @@ export const CandidatesBatchSchema = z.object({
 });
 
 // ✅ apply endpoint schema
-// - sourceLang can be en-US or ko-KR (row match will follow sourceLang)
-// - allowAnchorUpdate controls writing to en-US column
 export const ApplySchema = z.object({
+  sheet: SheetSchema,
+
   category: z.string().optional(), // optional filter; omit => ALL
   sourceLang: z.enum(["en-US", "ko-KR"]).optional().default("en-US"),
   entries: z
@@ -91,8 +99,9 @@ export const ApplySchema = z.object({
 });
 
 // ✅ pending/next endpoint schema (read-only)
-// - Spreadsheet에서 "번역이 비어있는 다음 N개"를 가져오기 위한 요청 스키마
 export const PendingNextSchema = z.object({
+  sheet: SheetSchema,
+
   category: z.string().optional(), // optional filter; omit => ALL
   sourceLang: z.enum(["en-US", "ko-KR"]).optional().default("en-US"),
   targetLangs: z.array(z.string().min(1)).min(1).max(20),

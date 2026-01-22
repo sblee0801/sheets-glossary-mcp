@@ -1,48 +1,60 @@
 /**
  * src/glossary/load.mjs
- * - Glossary 시트를 로드해서 entries 구조로 변환
+ * - Glossary-like 시트를 로드해서 entries 구조로 변환
  * - "언어 컬럼 인덱스(langIndex)"를 자동 구성
  *
+ * 지원 형식:
+ * 1) Glossary형: KEY + 분류 + 언어 컬럼들 (기존)
+ * 2) Trans형: ID + 언어 컬럼들 (분류 없음)
+ *
  * 정책:
- * - TERM(V열)은 무시하고 A:U 범위를 읽는 전제를 유지 (SHEET_RANGE로 제어)
- * - KEY(A열), 분류(I열)는 필수
+ * - 언어 컬럼은 헤더 기반 자동 탐지
+ * - ko-KR 컬럼은 필수
+ * - category(분류)가 없으면 sheetName을 category로 강제 주입 (인덱스 생성 안정화)
  */
 
-import { SHEET_RANGE } from "../config/env.mjs";
+import { DEFAULT_SHEET_NAME, buildSheetRange } from "../config/env.mjs";
 import { readSheetRange } from "../google/sheets.mjs";
 import { normalizeHeader, nowIso } from "../utils/common.mjs";
 
-export async function loadGlossaryAll() {
-  const { header, rows } = await readSheetRange(SHEET_RANGE);
+function normSheetCategory(sheetName) {
+  return String(sheetName ?? "").trim().toLowerCase();
+}
+
+export async function loadGlossaryAll(opts = {}) {
+  const sheetName = String(opts.sheetName ?? "").trim() || DEFAULT_SHEET_NAME;
+  const range = buildSheetRange(sheetName);
+
+  const { header, rows } = await readSheetRange(range);
   const loadedAt = nowIso();
 
   if (!header.length) {
     return {
       loadedAt,
+      sheetName,
+      range,
       header: [],
       rawRows: [],
       entries: [],
       rawRowCount: 0,
       langIndex: {},
-      idx: {},
+      idx: { key: -1, category: -1 },
     };
   }
 
   const norm = header.map(normalizeHeader);
 
-  const idxKey = norm.indexOf("key");
-  const idxCategory = norm.indexOf("분류"); // 확정 구조
+  // ✅ key 컬럼: "key" 우선, 없으면 "id" 사용, 둘 다 없으면 -1 허용
+  const idxKey = norm.indexOf("key") >= 0 ? norm.indexOf("key") : norm.indexOf("id");
 
-  if (idxKey < 0) {
-    throw new Error("헤더에 KEY가 없습니다. A열 헤더가 'KEY'인지 확인하세요.");
-  }
-  if (idxCategory < 0) {
-    throw new Error("헤더에 분류가 없습니다. I열 헤더가 '분류'인지 확인하세요.");
-  }
+  // ✅ category 컬럼: "분류" 또는 "category" 사용, 없으면 -1 허용 (Trans형)
+  const idxCategory =
+    norm.indexOf("분류") >= 0 ? norm.indexOf("분류") : norm.indexOf("category");
 
   // 언어 컬럼으로 보지 않을 헤더들
   const excluded = new Set([
     "key",
+    "id",
     "분류",
     "category",
     "term",
@@ -67,13 +79,25 @@ export async function loadGlossaryAll() {
     langIndex[h] = i;
   }
 
+  // 최소 요구: ko-KR 존재
   if (langIndex["ko-kr"] == null) {
-    throw new Error("헤더에 ko-KR이 없습니다. 언어 컬럼 헤더가 'ko-KR'인지 확인하세요.");
+    throw new Error(
+      `Sheet '${sheetName}' header must include 'ko-KR' (language column header must be 'ko-KR').`
+    );
   }
 
+  const fallbackCategory = normSheetCategory(sheetName) || "default";
+
   const entries = rows.map((r, rowIdx) => {
-    const key = String(r[idxKey] ?? "").trim();
-    const category = String(r[idxCategory] ?? "").trim();
+    const rowIndex = rowIdx + 2; // sheet row index (1-based + header)
+
+    const key =
+      idxKey >= 0 ? String(r[idxKey] ?? "").trim() : `row:${rowIndex}`;
+
+    const category =
+      idxCategory >= 0
+        ? String(r[idxCategory] ?? "").trim() || fallbackCategory
+        : fallbackCategory;
 
     const translations = {};
     for (const [langKey, colIdx] of Object.entries(langIndex)) {
@@ -82,7 +106,7 @@ export async function loadGlossaryAll() {
     }
 
     return {
-      _rowIndex: rowIdx + 2, // sheet row index (1-based + header)
+      _rowIndex: rowIndex,
       key,
       category,
       translations,
@@ -91,6 +115,8 @@ export async function loadGlossaryAll() {
 
   return {
     loadedAt,
+    sheetName,
+    range,
     header,
     rawRows: rows,
     entries,
