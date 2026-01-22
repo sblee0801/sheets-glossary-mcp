@@ -68,7 +68,7 @@ export const CandidatesBatchSchema = z.object({
 });
 
 // ✅ apply endpoint schema
-// - NEW: sourceLang can be en-US or ko-KR (row match will follow sourceLang)
+// - sourceLang can be en-US or ko-KR (row match will follow sourceLang)
 // - allowAnchorUpdate controls writing to en-US column
 export const ApplySchema = z.object({
   category: z.string().optional(), // optional filter; omit => ALL
@@ -88,4 +88,14 @@ export const ApplySchema = z.object({
   fillOnlyEmpty: z.boolean().optional().default(true),
   targetLangs: z.array(z.string().min(1)).optional(),
   allowAnchorUpdate: z.boolean().optional().default(false),
+});
+
+// ✅ pending/next endpoint schema (read-only)
+// - Spreadsheet에서 "번역이 비어있는 다음 N개"를 가져오기 위한 요청 스키마
+export const PendingNextSchema = z.object({
+  category: z.string().optional(), // optional filter; omit => ALL
+  sourceLang: z.enum(["en-US", "ko-KR"]).optional().default("en-US"),
+  targetLangs: z.array(z.string().min(1)).min(1).max(20),
+  limit: z.number().int().min(1).max(500).optional().default(100),
+  forceReload: z.boolean().optional().default(false),
 });
