@@ -4,13 +4,26 @@
  * - Targets: replaceGlossaryTerms, glossaryPendingNext, updateGlossary, glossaryApply
  */
 
-import { normalizeLang, assertAllowedSourceLang, newSessionId, nowIso, getParsedBody } from "../utils/common.mjs";
+import {
+  normalizeLang,
+  assertAllowedSourceLang,
+  newSessionId,
+  nowIso,
+  getParsedBody,
+} from "../utils/common.mjs";
+
 import { ensureGlossaryLoaded, ensureRulesLoaded } from "../cache/global.mjs";
 import { mergeSourceTextMapsFromCache } from "../glossary/index.mjs";
 import { replaceByGlossaryWithLogs, buildRuleLogs } from "../replace/replace.mjs";
 import { colIndexToA1, batchUpdateValuesA1 } from "../google/sheets.mjs";
 
-import { InitSchema, ReplaceSchema, UpdateSchema, PendingNextSchema, ApplySchema } from "./schemas.mjs";
+import {
+  InitSchema,
+  ReplaceSchema,
+  UpdateSchema,
+  PendingNextSchema,
+  ApplySchema,
+} from "./schemas.mjs";
 
 // ---------------- In-memory sessions (lightweight) ----------------
 const _sessions = new Map(); // sessionId -> { sheet, category, sourceLangKey, targetLangKey, createdAt }
@@ -28,7 +41,11 @@ function toJson(res, status, payload) {
 
 function handleErr(res, e) {
   const status = Number(e?.status) || 500;
-  toJson(res, status, { ok: false, error: String(e?.message ?? e), extra: e?.extra });
+  toJson(res, status, {
+    ok: false,
+    error: String(e?.message ?? e),
+    extra: e?.extra,
+  });
 }
 
 function pickSheet(v) {
@@ -37,10 +54,10 @@ function pickSheet(v) {
 
 // ---------------- Endpoint registration ----------------
 export function registerRoutes(app) {
-  // Health
-  app.get("/healthz", (req, res) => {
-    res.status(200).json({ ok: true, at: nowIso() });
-  });
+  // ✅ basic routes (원본과 동일하게 복구)
+  app.get("/health", (_req, res) => res.status(200).json({ ok: true }));
+  app.get("/healthz", (_req, res) => res.status(200).json({ ok: true }));
+  app.get("/", (_req, res) => res.status(200).send("ok"));
 
   /**
    * Session init (optional but kept for compatibility)
@@ -59,9 +76,16 @@ export function registerRoutes(app) {
       assertAllowedSourceLang(sourceLangKey);
 
       // Ensure cache exists for that sheet (validates headers)
-      const cache = await ensureGlossaryLoaded({ sheetName: sheet, forceReload: false });
+      const cache = await ensureGlossaryLoaded({
+        sheetName: sheet,
+        forceReload: false,
+      });
+
       if (sourceLangKey === "en-us" && cache.langIndex["en-us"] == null) {
-        throw httpError(400, `Sheet '${sheet}' does not include en-US column; cannot init with sourceLang=en-US.`);
+        throw httpError(
+          400,
+          `Sheet '${sheet}' does not include en-US column; cannot init with sourceLang=en-US.`
+        );
       }
 
       const sessionId = newSessionId();
@@ -109,7 +133,10 @@ export function registerRoutes(app) {
       const targetLangKey = normalizeLang(v.targetLang ?? cfg?.targetLangKey ?? "");
 
       if (!sourceLangKey || !targetLangKey) {
-        throw httpError(400, "sourceLang and targetLang are required (or provide sessionId).");
+        throw httpError(
+          400,
+          "sourceLang and targetLang are required (or provide sessionId)."
+        );
       }
 
       assertAllowedSourceLang(sourceLangKey);
@@ -117,7 +144,10 @@ export function registerRoutes(app) {
       const cache = await ensureGlossaryLoaded({ sheetName: sheet, forceReload: false });
 
       if (sourceLangKey === "en-us" && cache.langIndex["en-us"] == null) {
-        throw httpError(400, `Sheet '${sheet}' does not include en-US column; cannot use sourceLang=en-US.`);
+        throw httpError(
+          400,
+          `Sheet '${sheet}' does not include en-US column; cannot use sourceLang=en-US.`
+        );
       }
 
       let categories = [];
@@ -133,13 +163,18 @@ export function registerRoutes(app) {
 
       const sourceTextMap = mergeSourceTextMapsFromCache(cache, sourceLangKey, categories);
       if (!sourceTextMap || sourceTextMap.size === 0) {
-        throw httpError(400, `No source texts found for sheet='${sheet}', sourceLang='${sourceLangKey}', category='${category || "ALL"}'.`);
+        throw httpError(
+          400,
+          `No source texts found for sheet='${sheet}', sourceLang='${sourceLangKey}', category='${category || "ALL"}'.`
+        );
       }
 
       const wantLogs = v.includeLogs ?? true;
 
       const rulesCache = await ensureRulesLoaded({ forceReload: false });
-      const categoryKey = (category ? String(category).trim().toLowerCase() : (categories[0] || ""));
+      const categoryKey = category
+        ? String(category).trim().toLowerCase()
+        : categories[0] || "";
 
       const outTexts = [];
       const perLineLogs = [];
@@ -229,10 +264,6 @@ export function registerRoutes(app) {
   /**
    * glossaryPendingNext
    * POST /v1/glossary/pending/next
-   *
-   * 정책:
-   * - sheet 기준으로, targetLangs 중 하나라도 빈 칸인 row를 다음 N개 반환
-   * - Trans 시트는 category가 sheetName으로 강제 주입되어 있으므로 category 필터가 필요하면 사용 가능
    */
   app.post("/v1/glossary/pending/next", async (req, res) => {
     try {
@@ -240,7 +271,10 @@ export function registerRoutes(app) {
       const v = PendingNextSchema.parse(body);
 
       const sheet = pickSheet(v);
-      const cache = await ensureGlossaryLoaded({ sheetName: sheet, forceReload: Boolean(v.forceReload) });
+      const cache = await ensureGlossaryLoaded({
+        sheetName: sheet,
+        forceReload: Boolean(v.forceReload),
+      });
 
       const sourceLangKey = normalizeLang(v.sourceLang);
       if (sourceLangKey !== "en-us" && sourceLangKey !== "ko-kr") {
@@ -250,7 +284,6 @@ export function registerRoutes(app) {
       const targetLangKeys = (v.targetLangs || []).map(normalizeLang).filter(Boolean);
       if (!targetLangKeys.length) throw httpError(400, "targetLangs must have at least 1 language.");
 
-      // Validate target columns exist
       for (const lk of targetLangKeys) {
         if (cache.langIndex[lk] == null) {
           throw httpError(400, `Sheet '${sheet}' does not include target language column: ${lk}`);
@@ -258,12 +291,13 @@ export function registerRoutes(app) {
       }
 
       const srcCol = cache.langIndex[sourceLangKey];
-      if (srcCol == null) throw httpError(400, `Sheet '${sheet}' does not include source language column: ${sourceLangKey}`);
+      if (srcCol == null) {
+        throw httpError(400, `Sheet '${sheet}' does not include source language column: ${sourceLangKey}`);
+      }
 
       const limit = Number(v.limit || 100);
       const out = [];
 
-      // rawRows: header 제외한 rows. entries는 rowIndex=+2.
       for (let i = 0; i < cache.rawRows.length; i++) {
         const row = cache.rawRows[i];
         const rowIndex = i + 2;
@@ -271,7 +305,6 @@ export function registerRoutes(app) {
         const srcText = String(row[srcCol] ?? "").trim();
         if (!srcText) continue;
 
-        // category 필터(옵션): entries 기반으로 category 확인
         if (v.category && String(v.category).trim()) {
           const catKey = String(v.category).trim().toLowerCase();
           const e = cache.entries[i];
@@ -279,7 +312,6 @@ export function registerRoutes(app) {
           if (eCat !== catKey) continue;
         }
 
-        // targetLangs 중 하나라도 비어있으면 pending
         let isPending = false;
         const missing = [];
 
@@ -294,12 +326,7 @@ export function registerRoutes(app) {
 
         if (!isPending) continue;
 
-        out.push({
-          rowIndex,
-          sourceText: srcText,
-          missingLangs: missing,
-        });
-
+        out.push({ rowIndex, sourceText: srcText, missingLangs: missing });
         if (out.length >= limit) break;
       }
 
@@ -324,11 +351,6 @@ export function registerRoutes(app) {
   /**
    * glossaryApply
    * POST /v1/glossary/apply
-   *
-   * 정책:
-   * - sheet 기준으로 row를 찾고, 해당 row의 targetLang 셀만 업데이트
-   * - fillOnlyEmpty=true면 기존 값이 있는 셀은 건드리지 않음
-   * - allowAnchorUpdate=false면 en-us 컬럼 write 금지
    */
   app.post("/v1/glossary/apply", async (req, res) => {
     try {
@@ -344,9 +366,10 @@ export function registerRoutes(app) {
       }
 
       const srcCol = cache.langIndex[sourceLangKey];
-      if (srcCol == null) throw httpError(400, `Sheet '${sheet}' does not include source language column: ${sourceLangKey}`);
+      if (srcCol == null) {
+        throw httpError(400, `Sheet '${sheet}' does not include source language column: ${sourceLangKey}`);
+      }
 
-      // category filter
       let categories = null;
       if (v.category && String(v.category).trim()) {
         const catKey = String(v.category).trim().toLowerCase();
@@ -358,7 +381,6 @@ export function registerRoutes(app) {
         categories = Array.from(cache.byCategoryBySource.keys());
       }
 
-      // Prepare a fast lookup: sourceText -> entries[] (preserve duplicates)
       const sourceTextMap = mergeSourceTextMapsFromCache(cache, sourceLangKey, categories);
 
       const fillOnlyEmpty = Boolean(v.fillOnlyEmpty);
@@ -380,7 +402,6 @@ export function registerRoutes(app) {
           continue;
         }
 
-        // pick lowest rowIndex
         let chosen = hits[0];
         for (const h of hits) {
           if (Number(h?._rowIndex) < Number(chosen?._rowIndex)) chosen = h;
@@ -405,7 +426,6 @@ export function registerRoutes(app) {
 
           const colIdx = cache.langIndex[langKey];
           if (colIdx == null) {
-            // column not present in this sheet
             skipped += 1;
             conflicts.push({ lang: langKey, reason: "missing_column" });
             continue;
