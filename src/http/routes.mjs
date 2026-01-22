@@ -42,6 +42,8 @@ function makeCursorKey({ sourceLangKey, categoryKey, targetLangKeys }) {
 // ---------------- Routes ----------------
 export function registerRoutes(app) {
   app.get("/health", (_req, res) => res.json({ ok: true }));
+app.get("/", (_req, res) => res.status(200).send("ok"));
+app.get("/healthz", (_req, res) => res.status(200).json({ ok: true }));
 
   /**
    * POST /v1/glossary/pending/next
