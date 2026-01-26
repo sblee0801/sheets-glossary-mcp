@@ -20,11 +20,11 @@ export const DEFAULT_SHEET_NAME = process.env.SHEET_NAME || "Glossary";
  * - 예전 코드가 SHEET_RANGE를 직접 쓰는 경우를 위해 남겨둔다.
  * - 다중 시트 지원 이후에는, loadGlossaryAll({ sheetName })가 sheetName에 맞는 range를 생성한다.
  */
-export const SHEET_RANGE = process.env.SHEET_RANGE || `${DEFAULT_SHEET_NAME}!A:U`;
+export const SHEET_RANGE = process.env.SHEET_RANGE || `${DEFAULT_SHEET_NAME}!A:Z`;
 
 // Phase 1.5 Rules sheet (separate from Glossary)
 export const RULE_SHEET_NAME = process.env.RULE_SHEET_NAME || "Rules";
-export const RULE_SHEET_RANGE = process.env.RULE_SHEET_RANGE || `${RULE_SHEET_NAME}!A:U`;
+export const RULE_SHEET_RANGE = process.env.RULE_SHEET_RANGE || `${RULE_SHEET_NAME}!A:Z`;
 
 /**
  * Google Service Account JSON
@@ -48,7 +48,7 @@ export function buildSheetRange(sheetName) {
   }
 
   const isTrans = /^trans\d+$/i.test(sn);
-  return `${sn}!${isTrans ? "A:H" : "A:U"}`;
+  return `${sn}!${isTrans ? "A:Z" : "A:Z"}`;
 }
 
 /**
