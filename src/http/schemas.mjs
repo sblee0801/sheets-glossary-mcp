@@ -46,7 +46,6 @@ export const SuggestSchema = z.object({
   generateTargets: z.boolean().optional().default(false),
 });
 
-// ✅ candidates endpoint schema (MVP 유지)
 export const CandidatesSchema = z.object({
   category: z.string().min(1),
   sourceText: z.string().min(1),
@@ -55,34 +54,25 @@ export const CandidatesSchema = z.object({
   sources: z.array(z.enum(["iroWikiDb", "rateMyServer", "divinePride"])).optional(),
 });
 
-// ✅ candidates/batch endpoint schema (운영 고정: divinePride만 허용)
 export const CandidatesBatchSchema = z.object({
-  category: z.string().optional(), // optional filter (ALL if omitted)
+  category: z.string().optional(),
   sourceLang: z.enum(["en-US", "ko-KR"]).optional().default("en-US"),
   sourceTexts: z.array(z.string().min(1)).min(1).max(500),
   targetLangs: z.array(z.string().min(1)).min(1).max(20),
-
   sources: z.array(z.enum(["divinePride"])).optional(),
   maxCandidatesPerLang: z.number().int().min(1).max(5).optional().default(2),
   includeEvidence: z.boolean().optional().default(true),
 });
 
-// ✅ apply endpoint schema
-// - sourceLang can be en-US or ko-KR (row match will follow sourceLang)
-// - allowAnchorUpdate controls writing to en-US column
 export const ApplySchema = z.object({
-  category: z.string().optional(), // optional filter; omit => ALL
+  category: z.string().optional(),
   sourceLang: z.enum(["en-US", "ko-KR"]).optional().default("en-US"),
   entries: z
     .array(
       z.object({
-        // ✅ rowIndex optional (backward compatibility); recommended to send for deterministic apply
         rowIndex: z.number().int().min(2).optional(),
         sourceText: z.string().min(1),
-        translations: z.record(
-          z.string(), // key: "ko-KR", "de-DE" 등
-          z.string().trim().min(1) // value: 번역 문자열
-        ),
+        translations: z.record(z.string(), z.string().trim().min(1)),
       })
     )
     .min(1)
@@ -92,10 +82,8 @@ export const ApplySchema = z.object({
   allowAnchorUpdate: z.boolean().optional().default(false),
 });
 
-// ✅ pending/next endpoint schema (read-only)
-// - Spreadsheet에서 "번역이 비어있는 다음 N개"를 가져오기 위한 요청 스키마
 export const PendingNextSchema = z.object({
-  category: z.string().optional(), // optional filter; omit => ALL
+  category: z.string().optional(),
   sourceLang: z.enum(["en-US", "ko-KR"]).optional().default("en-US"),
   targetLangs: z.array(z.string().min(1)).min(1).max(20),
   limit: z.number().int().min(1).max(500).optional().default(100),
@@ -104,11 +92,35 @@ export const PendingNextSchema = z.object({
 
 // ✅ glossary QA (read-only): already-translated rows paging
 export const GlossaryQaNextSchema = z.object({
-  sheet: z.string().optional(), // default handled by pickSheet()
-  category: z.string().optional(), // optional filter
+  sheet: z.string().optional(),
+  category: z.string().optional(),
+  sourceLang: z.enum(["en-US", "ko-KR"]).optional().default("en-US"),
+  targetLang: z.string().min(1),
+  limit: z.number().int().min(1).max(500).optional().default(100),
+  cursor: z.string().optional(),
+  forceReload: z.boolean().optional().default(false),
+});
+
+// ✅ NEW: mask endpoint schema (read-only/processing)
+export const MaskSchema = z.object({
+  sheet: z.string().optional(), // where caller is operating (Trans5 etc); used only for reporting
+  glossarySheet: z.string().optional().default("Glossary"),
+
+  category: z.string().optional(), // optional filter; omit => ALL
   sourceLang: z.enum(["en-US", "ko-KR"]).optional().default("en-US"),
   targetLang: z.string().min(1), // e.g. "id-ID"
-  limit: z.number().int().min(1).max(500).optional().default(100),
-  cursor: z.string().optional(), // "start offset" as string
+
+  texts: z.array(z.string()).min(1).max(500),
+
+  // token style
+  maskStyle: z.enum(["braces"]).optional().default("braces"), // {mask:N}
+
+  // restoreStrategy A (recommended): glossaryTarget
+  restoreStrategy: z.enum(["glossaryTarget", "anchor"]).optional().default("glossaryTarget"),
+
+  // matching policy
+  caseSensitive: z.boolean().optional().default(true),
+  wordBoundary: z.boolean().optional().default(true),
+
   forceReload: z.boolean().optional().default(false),
 });
