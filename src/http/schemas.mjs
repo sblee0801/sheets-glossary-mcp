@@ -76,10 +76,8 @@ export const ApplySchema = z.object({
   entries: z
     .array(
       z.object({
-        // ✅ NEW: rowIndex is optional for backward compatibility.
-        // When provided, server can target that exact sheet row without sourceText-based matching.
+        // ✅ rowIndex optional (backward compatibility); recommended to send for deterministic apply
         rowIndex: z.number().int().min(2).optional(),
-
         sourceText: z.string().min(1),
         translations: z.record(
           z.string(), // key: "ko-KR", "de-DE" 등
@@ -101,5 +99,16 @@ export const PendingNextSchema = z.object({
   sourceLang: z.enum(["en-US", "ko-KR"]).optional().default("en-US"),
   targetLangs: z.array(z.string().min(1)).min(1).max(20),
   limit: z.number().int().min(1).max(500).optional().default(100),
+  forceReload: z.boolean().optional().default(false),
+});
+
+// ✅ glossary QA (read-only): already-translated rows paging
+export const GlossaryQaNextSchema = z.object({
+  sheet: z.string().optional(), // default handled by pickSheet()
+  category: z.string().optional(), // optional filter
+  sourceLang: z.enum(["en-US", "ko-KR"]).optional().default("en-US"),
+  targetLang: z.string().min(1), // e.g. "id-ID"
+  limit: z.number().int().min(1).max(500).optional().default(100),
+  cursor: z.string().optional(), // "start offset" as string
   forceReload: z.boolean().optional().default(false),
 });

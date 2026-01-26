@@ -23,6 +23,7 @@ import {
   UpdateSchema,
   PendingNextSchema,
   ApplySchema,
+  GlossaryQaNextSchema, // ✅ NEW
 } from "./schemas.mjs";
 
 // ---------------- In-memory sessions (lightweight) ----------------
@@ -54,7 +55,7 @@ function pickSheet(v) {
 
 // ---------------- Endpoint registration ----------------
 export function registerRoutes(app) {
-  // ✅ basic routes (원본과 동일하게 복구)
+  // ✅ basic routes
   app.get("/health", (_req, res) => res.status(200).json({ ok: true }));
   app.get("/healthz", (_req, res) => res.status(200).json({ ok: true }));
   app.get("/", (_req, res) => res.status(200).send("ok"));
@@ -349,13 +350,123 @@ export function registerRoutes(app) {
   });
 
   /**
+   * glossaryQaNext (read-only)
+   * POST /v1/glossary/qa/next
+   *
+   * - 이미 번역이 채워진(targetLang non-empty) 행을 N개씩 가져온다.
+   * - GPT가 en-US vs targetLang QA를 수행할 수 있도록 rowIndex/sourceText/targetText를 제공한다.
+   * - cursor 기반 페이지네이션(간단 offset string)
+   */
+  app.post("/v1/glossary/qa/next", async (req, res) => {
+    try {
+      const body = getParsedBody(req);
+      const v = GlossaryQaNextSchema.parse(body);
+
+      const sheet = pickSheet(v);
+
+      const cache = await ensureGlossaryLoaded({
+        sheetName: sheet,
+        forceReload: Boolean(v.forceReload),
+      });
+
+      const sourceLangKey = normalizeLang(v.sourceLang);
+      if (sourceLangKey !== "en-us" && sourceLangKey !== "ko-kr") {
+        throw httpError(400, "qa/next sourceLang must be en-US or ko-KR.");
+      }
+
+      const targetLangKey = normalizeLang(v.targetLang);
+      if (!targetLangKey) {
+        throw httpError(400, "qa/next targetLang is required.");
+      }
+
+      const srcCol = cache.langIndex[sourceLangKey];
+      if (srcCol == null) {
+        throw httpError(
+          400,
+          `Sheet '${sheet}' does not include source language column: ${sourceLangKey}`
+        );
+      }
+
+      const tgtCol = cache.langIndex[targetLangKey];
+      if (tgtCol == null) {
+        throw httpError(
+          400,
+          `Sheet '${sheet}' does not include target language column: ${targetLangKey}`
+        );
+      }
+
+      const categoryKey =
+        v.category && String(v.category).trim()
+          ? String(v.category).trim().toLowerCase()
+          : null;
+
+      const limit = Number(v.limit || 100);
+
+      // cursor: 0-based index over cache.entries
+      let start = 0;
+      if (v.cursor && String(v.cursor).trim()) {
+        const n = Number(String(v.cursor).trim());
+        if (!Number.isFinite(n) || n < 0) {
+          throw httpError(400, "cursor must be a non-negative integer string.");
+        }
+        start = Math.floor(n);
+      }
+
+      const items = [];
+      let i = start;
+
+      for (; i < cache.entries.length; i++) {
+        const entry = cache.entries[i];
+        const row = cache.rawRows[i] || [];
+        const rowIndex = i + 2;
+
+        if (categoryKey) {
+          const eCat = String(entry?.category ?? "").trim().toLowerCase();
+          if (eCat !== categoryKey) continue;
+        }
+
+        const sourceText = String(row[srcCol] ?? "").trim();
+        if (!sourceText) continue;
+
+        const targetText = String(row[tgtCol] ?? "").trim();
+        if (!targetText) continue; // ✅ already translated only
+
+        items.push({ rowIndex, sourceText, targetText });
+        if (items.length >= limit) {
+          i += 1;
+          break;
+        }
+      }
+
+      const cursorNext = i < cache.entries.length ? String(i) : null;
+
+      toJson(res, 200, {
+        ok: true,
+        sheet: cache.sheetName,
+        category: categoryKey || "ALL",
+        sourceLang: sourceLangKey === "en-us" ? "en-US" : "ko-KR",
+        targetLang: v.targetLang,
+        limit,
+        count: items.length,
+        cursor: String(start),
+        cursorNext,
+        items,
+        meta: {
+          glossaryLoadedAt: cache.loadedAt,
+          rawRowCount: cache.rawRowCount,
+        },
+      });
+    } catch (e) {
+      handleErr(res, e);
+    }
+  });
+
+  /**
    * glossaryApply
    * POST /v1/glossary/apply
    *
-   * Step 2 변경 요약:
-   * - entries[].rowIndex가 오면 그 rowIndex를 "우선 타겟"으로 사용 (sourceText 중복 체크/선택 로직 우회)
-   * - rowIndex가 오면, (1) 범위 체크, (2) category 일치 체크, (3) row의 sourceLang 셀 값이 sourceText와 일치하는지 체크
-   * - rowIndex가 없으면 기존 legacy 로직 유지(= sourceTextMap에서 hits[0]~최상단 rowIndex 선택)
+   * - rowIndex가 있으면 그 rowIndex를 우선 타겟으로 사용 (중복 sourceText redirect 방지)
+   * - rowIndex가 없으면 legacy(sourceText 매칭) 유지
    */
   app.post("/v1/glossary/apply", async (req, res) => {
     try {
@@ -372,7 +483,10 @@ export function registerRoutes(app) {
 
       const srcCol = cache.langIndex[sourceLangKey];
       if (srcCol == null) {
-        throw httpError(400, `Sheet '${sheet}' does not include source language column: ${sourceLangKey}`);
+        throw httpError(
+          400,
+          `Sheet '${sheet}' does not include source language column: ${sourceLangKey}`
+        );
       }
 
       let categories = null;
@@ -402,14 +516,12 @@ export function registerRoutes(app) {
           continue;
         }
 
-        // ✅ rowIndex 우선 타겟팅
         const hasRowIndex = entry?.rowIndex != null && Number.isFinite(Number(entry.rowIndex));
         let chosen = null;
 
         if (hasRowIndex) {
           const rowIndex = Number(entry.rowIndex);
 
-          // 1) rowIndex 범위 체크
           if (rowIndex < 2 || rowIndex > cache.rawRows.length + 1) {
             results.push({
               sourceText,
@@ -423,7 +535,6 @@ export function registerRoutes(app) {
           const chosenEntry = cache.entries[rowArrIdx];
           const rawRow = cache.rawRows[rowArrIdx] || [];
 
-          // 2) category 필터가 지정된 경우, 해당 row가 그 category인지 체크
           if (categoryKey) {
             const eCat = String(chosenEntry?.category ?? "").trim().toLowerCase();
             if (eCat !== categoryKey) {
@@ -436,7 +547,6 @@ export function registerRoutes(app) {
             }
           }
 
-          // 3) 행 오지정 방지: 해당 row의 sourceLang 셀 값이 sourceText와 다르면 skip
           const actualSrc = String(rawRow[srcCol] ?? "").trim();
           if (actualSrc !== sourceText) {
             results.push({
@@ -447,12 +557,8 @@ export function registerRoutes(app) {
             continue;
           }
 
-          chosen = {
-            _rowIndex: rowIndex,
-            key: chosenEntry?.key,
-          };
+          chosen = { _rowIndex: rowIndex, key: chosenEntry?.key };
         } else {
-          // legacy: sourceText로 전체 카테고리 범위에서 매칭 후 "가장 위 rowIndex" 선택
           const hits = sourceTextMap.get(sourceText) || [];
           if (!hits.length) {
             results.push({ sourceText, status: "skipped", reason: "not_found" });
