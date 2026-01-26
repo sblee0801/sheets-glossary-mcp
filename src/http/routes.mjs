@@ -351,6 +351,11 @@ export function registerRoutes(app) {
   /**
    * glossaryApply
    * POST /v1/glossary/apply
+   *
+   * Step 2 변경 요약:
+   * - entries[].rowIndex가 오면 그 rowIndex를 "우선 타겟"으로 사용 (sourceText 중복 체크/선택 로직 우회)
+   * - rowIndex가 오면, (1) 범위 체크, (2) category 일치 체크, (3) row의 sourceLang 셀 값이 sourceText와 일치하는지 체크
+   * - rowIndex가 없으면 기존 legacy 로직 유지(= sourceTextMap에서 hits[0]~최상단 rowIndex 선택)
    */
   app.post("/v1/glossary/apply", async (req, res) => {
     try {
@@ -371,12 +376,13 @@ export function registerRoutes(app) {
       }
 
       let categories = null;
+      let categoryKey = null;
       if (v.category && String(v.category).trim()) {
-        const catKey = String(v.category).trim().toLowerCase();
-        if (!cache.byCategoryBySource.has(catKey)) {
+        categoryKey = String(v.category).trim().toLowerCase();
+        if (!cache.byCategoryBySource.has(categoryKey)) {
           throw httpError(400, `Category not found: ${v.category}`, { sheet });
         }
-        categories = [catKey];
+        categories = [categoryKey];
       } else {
         categories = Array.from(cache.byCategoryBySource.keys());
       }
@@ -396,15 +402,67 @@ export function registerRoutes(app) {
           continue;
         }
 
-        const hits = sourceTextMap.get(sourceText) || [];
-        if (!hits.length) {
-          results.push({ sourceText, status: "skipped", reason: "not_found" });
-          continue;
-        }
+        // ✅ rowIndex 우선 타겟팅
+        const hasRowIndex = entry?.rowIndex != null && Number.isFinite(Number(entry.rowIndex));
+        let chosen = null;
 
-        let chosen = hits[0];
-        for (const h of hits) {
-          if (Number(h?._rowIndex) < Number(chosen?._rowIndex)) chosen = h;
+        if (hasRowIndex) {
+          const rowIndex = Number(entry.rowIndex);
+
+          // 1) rowIndex 범위 체크
+          if (rowIndex < 2 || rowIndex > cache.rawRows.length + 1) {
+            results.push({
+              sourceText,
+              status: "skipped",
+              reason: `rowIndex_out_of_range(${rowIndex})`,
+            });
+            continue;
+          }
+
+          const rowArrIdx = rowIndex - 2;
+          const chosenEntry = cache.entries[rowArrIdx];
+          const rawRow = cache.rawRows[rowArrIdx] || [];
+
+          // 2) category 필터가 지정된 경우, 해당 row가 그 category인지 체크
+          if (categoryKey) {
+            const eCat = String(chosenEntry?.category ?? "").trim().toLowerCase();
+            if (eCat !== categoryKey) {
+              results.push({
+                sourceText,
+                status: "skipped",
+                reason: `row_category_mismatch(${rowIndex})`,
+              });
+              continue;
+            }
+          }
+
+          // 3) 행 오지정 방지: 해당 row의 sourceLang 셀 값이 sourceText와 다르면 skip
+          const actualSrc = String(rawRow[srcCol] ?? "").trim();
+          if (actualSrc !== sourceText) {
+            results.push({
+              sourceText,
+              status: "skipped",
+              reason: `row_source_mismatch(rowIndex=${rowIndex})`,
+            });
+            continue;
+          }
+
+          chosen = {
+            _rowIndex: rowIndex,
+            key: chosenEntry?.key,
+          };
+        } else {
+          // legacy: sourceText로 전체 카테고리 범위에서 매칭 후 "가장 위 rowIndex" 선택
+          const hits = sourceTextMap.get(sourceText) || [];
+          if (!hits.length) {
+            results.push({ sourceText, status: "skipped", reason: "not_found" });
+            continue;
+          }
+
+          chosen = hits[0];
+          for (const h of hits) {
+            if (Number(h?._rowIndex) < Number(chosen?._rowIndex)) chosen = h;
+          }
         }
 
         const rowIndex = Number(chosen._rowIndex);
