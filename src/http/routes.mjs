@@ -34,6 +34,26 @@ const _sessions = new Map(); // sessionId -> { sheet, category, sourceLangKey, t
 const _MSK_L = "\uE000";
 const _MSK_R = "\uE001";
 
+/**
+ * ✅ 핵심: CustomGPT/Actions는 optional 필드를 null로 보내는 경우가 많다.
+ * Zod 스키마에서 커버해도, 다른 레이어/검증이 먼저 터질 수 있으므로
+ * 라우트 레벨에서 request body의 null을 "필드 제거"로 정규화한다.
+ */
+function stripNullsDeep(v) {
+  if (v === null) return undefined;
+  if (Array.isArray(v)) return v.map(stripNullsDeep);
+  if (typeof v === "object" && v) {
+    const out = {};
+    for (const [k, val] of Object.entries(v)) {
+      const next = stripNullsDeep(val);
+      if (next === undefined) continue; // null -> drop key
+      out[k] = next;
+    }
+    return out;
+  }
+  return v;
+}
+
 function httpError(status, message, extra) {
   const err = new Error(message);
   err.status = status;
@@ -140,7 +160,7 @@ export function registerRoutes(app) {
    */
   app.post("/v1/session/init", async (req, res) => {
     try {
-      const body = getParsedBody(req);
+      const body = stripNullsDeep(getParsedBody(req));
       const v = InitSchema.parse(body);
 
       const sheet = pickSheet(v);
@@ -190,7 +210,7 @@ export function registerRoutes(app) {
    */
   app.post("/v1/translate/replace", async (req, res) => {
     try {
-      const body = getParsedBody(req);
+      const body = stripNullsDeep(getParsedBody(req));
       const v = ReplaceSchema.parse(body);
 
       const sheet = pickSheet(v);
@@ -311,7 +331,7 @@ export function registerRoutes(app) {
    */
   app.post("/v1/translate/mask", async (req, res) => {
     try {
-      const body = getParsedBody(req);
+      const body = stripNullsDeep(getParsedBody(req));
       const v = MaskSchema.parse(body);
 
       const operatingSheet = pickSheet(v);
@@ -393,7 +413,6 @@ export function registerRoutes(app) {
         return { restore: anchor, rowIndex };
       }
 
-      // Mask each text using INTERNAL tokens
       const textsMaskedInternal = [];
       for (const original of v.texts) {
         const maskedInternal = maskOneText({
@@ -407,7 +426,6 @@ export function registerRoutes(app) {
         textsMaskedInternal.push(maskedInternal);
       }
 
-      // Fill masksById only for allocated ids
       for (const [anchor, id] of termToMaskId.entries()) {
         if (masksById.get(id)) continue;
         const { restore, rowIndex } = computeRestore(anchor);
@@ -417,7 +435,6 @@ export function registerRoutes(app) {
       const usedIds = extractUsedIdsFromInternal(textsMaskedInternal);
       const textsMasked = textsMaskedInternal.map(internalToExternalTokens);
 
-      // ✅ response minimization
       const matchedMaskIds = Array.from(usedIds).sort((a, b) => a - b);
 
       let masks = undefined;
@@ -447,14 +464,14 @@ export function registerRoutes(app) {
         maskStyle: v.maskStyle,
         restoreStrategy: v.restoreStrategy,
         textsMasked,
-        masks, // undefined 가능 (includeMasks=false)
+        masks,
         meta: {
           glossaryLoadedAt: cache.loadedAt,
           rawRowCount: cache.rawRowCount,
           categoriesUsedCount: categories.length,
           uniqueTermsInIndex: anchors.length,
           matchedMaskIdsCount: matchedMaskIds.length,
-          matchedMaskIds, // ✅ 최소 응답에서도 복원/검증 가능
+          matchedMaskIds,
           includeMasks: Boolean(v.includeMasks),
           includeRestore: Boolean(v.includeRestore),
           includeAnchor: Boolean(v.includeAnchor),
@@ -471,7 +488,7 @@ export function registerRoutes(app) {
    */
   app.post("/v1/translate/mask/apply", async (req, res) => {
     try {
-      const body = getParsedBody(req);
+      const body = stripNullsDeep(getParsedBody(req));
       const v = MaskApplySchema.parse(body);
 
       const sheet = String(v.sheet).trim();
@@ -532,7 +549,7 @@ export function registerRoutes(app) {
    */
   app.post("/v1/glossary/update", async (req, res) => {
     try {
-      const body = getParsedBody(req);
+      const body = stripNullsDeep(getParsedBody(req));
       const v = UpdateSchema.parse(body);
 
       const sheet = pickSheet(v);
@@ -556,7 +573,7 @@ export function registerRoutes(app) {
    */
   app.post("/v1/glossary/pending/next", async (req, res) => {
     try {
-      const body = getParsedBody(req);
+      const body = stripNullsDeep(getParsedBody(req));
       const v = PendingNextSchema.parse(body);
 
       const sheet = pickSheet(v);
@@ -647,7 +664,7 @@ export function registerRoutes(app) {
    */
   app.post("/v1/glossary/qa/next", async (req, res) => {
     try {
-      const body = getParsedBody(req);
+      const body = stripNullsDeep(getParsedBody(req));
       const v = GlossaryQaNextSchema.parse(body);
 
       const sheet = pickSheet(v);
@@ -753,7 +770,7 @@ export function registerRoutes(app) {
    */
   app.post("/v1/glossary/apply", async (req, res) => {
     try {
-      const body = getParsedBody(req);
+      const body = stripNullsDeep(getParsedBody(req));
       const v = ApplySchema.parse(body);
 
       const sheet = pickSheet(v);
