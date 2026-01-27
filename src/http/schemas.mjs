@@ -1,18 +1,13 @@
 /**
  * src/http/schemas.mjs
- * - REST/MCP 공용 Zod Schemas 모음
+ * - REST 공용 Zod Schemas 모음
  */
 
 import { z } from "zod";
 
-/**
- * 공통: 멀티 시트 지원을 위해 모든 endpoint schema에 sheet를 optional로 받는다.
- * (Zod 기본 동작상 정의되지 않은 키는 strip되므로, sheet를 스키마에 넣지 않으면 서버에서 항상 Glossary로 fallback됨)
- */
-
 // ---------------- REST Schemas ----------------
 export const InitSchema = z.object({
-  sheet: z.string().optional(), // ✅ FIX: allow sheet
+  sheet: z.string().optional(),
   category: z.string().min(1),
   sourceLang: z.string().min(1),
   targetLang: z.string().min(1),
@@ -20,7 +15,7 @@ export const InitSchema = z.object({
 
 export const ReplaceSchema = z
   .object({
-    sheet: z.string().optional(), // ✅ FIX: allow sheet
+    sheet: z.string().optional(),
     sessionId: z.string().min(1).optional(),
     category: z.string().optional(),
     sourceLang: z.string().min(1).optional(),
@@ -39,7 +34,7 @@ export const ReplaceSchema = z
   );
 
 export const UpdateSchema = z.object({
-  sheet: z.string().optional(), // ✅ FIX: allow sheet
+  sheet: z.string().optional(),
   sessionId: z.string().min(1).optional(),
 });
 
@@ -76,7 +71,7 @@ export const CandidatesBatchSchema = z.object({
 });
 
 export const ApplySchema = z.object({
-  sheet: z.string().optional(), // ✅ Trans sheet apply 가능
+  sheet: z.string().optional(),
   category: z.string().optional(),
   sourceLang: z.enum(["en-US", "ko-KR"]).optional().default("en-US"),
   entries: z
@@ -95,7 +90,7 @@ export const ApplySchema = z.object({
 });
 
 export const PendingNextSchema = z.object({
-  sheet: z.string().optional(), // ✅ 핵심 (Trans6 조회 문제 해결)
+  sheet: z.string().optional(),
   category: z.string().optional(),
   sourceLang: z.enum(["en-US", "ko-KR"]).optional().default("en-US"),
   targetLangs: z.array(z.string().min(1)).min(1).max(20),
@@ -116,7 +111,7 @@ export const GlossaryQaNextSchema = z.object({
 
 // ---------------- Mask (read / processing) ----------------
 export const MaskSchema = z.object({
-  sheet: z.string().optional(), // operating sheet (Trans5/Trans6 etc)
+  sheet: z.string().optional(), // operating sheet (TransX etc)
   glossarySheet: z.string().optional().default("Glossary"),
 
   category: z.string().optional(),
@@ -132,16 +127,24 @@ export const MaskSchema = z.object({
   wordBoundary: z.boolean().optional().default(true),
 
   forceReload: z.boolean().optional().default(false),
+
+  /**
+   * ✅ NEW: response minimization switches
+   * - includeMasks=false  → masks 배열 미포함 (메타에 matchedMaskIds만)
+   * - includeRestore=false → masks에 restore 문자열 미포함 (응답 축소)
+   * - includeAnchor=false  → masks에 anchor 문자열 미포함 (응답 축소)
+   *
+   * 기본값은 기존 동작 유지(파이프라인 안 깨짐).
+   */
+  includeMasks: z.boolean().optional().default(true),
+  includeRestore: z.boolean().optional().default(true),
+  includeAnchor: z.boolean().optional().default(true),
 });
 
 // ---------------- Mask Apply (WRITE) ----------------
-/**
- * POST /v1/translate/mask/apply
- * - 마스킹된 결과를 <targetLang>-Masking 컬럼에 업로드
- */
 export const MaskApplySchema = z.object({
-  sheet: z.string().min(1),          // Trans sheet
-  targetLang: z.string().min(1),     // ex) id-ID
+  sheet: z.string().min(1),
+  targetLang: z.string().min(1), // ex) id-ID
   entries: z
     .array(
       z.object({
