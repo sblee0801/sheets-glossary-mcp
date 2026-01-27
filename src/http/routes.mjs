@@ -30,29 +30,9 @@ import {
 // ---------------- In-memory sessions (lightweight) ----------------
 const _sessions = new Map(); // sessionId -> { sheet, category, sourceLangKey, targetLangKey, createdAt }
 
-// ---- Masking internal token (prevents token re-matching explosion) ----
-const _MSK_L = "\uE000";
-const _MSK_R = "\uE001";
-
-/**
- * ✅ 핵심: CustomGPT/Actions는 optional 필드를 null로 보내는 경우가 많다.
- * Zod 스키마에서 커버해도, 다른 레이어/검증이 먼저 터질 수 있으므로
- * 라우트 레벨에서 request body의 null을 "필드 제거"로 정규화한다.
- */
-function stripNullsDeep(v) {
-  if (v === null) return undefined;
-  if (Array.isArray(v)) return v.map(stripNullsDeep);
-  if (typeof v === "object" && v) {
-    const out = {};
-    for (const [k, val] of Object.entries(v)) {
-      const next = stripNullsDeep(val);
-      if (next === undefined) continue; // null -> drop key
-      out[k] = next;
-    }
-    return out;
-  }
-  return v;
-}
+// ✅ mask index cache (anchors + compiled regex)
+// key: `${glossarySheet}|${loadedAt}|${sourceLangKey}|${categoryKeyOrALL}|cs:${caseSensitive}|wb:${wordBoundary}`
+const _maskIndexCache = new Map(); // key -> { anchors, compiled, createdAt }
 
 function httpError(status, message, extra) {
   const err = new Error(message);
@@ -82,45 +62,87 @@ function escapeRegex(s) {
   return String(s).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
-// internal token during processing
-function makeInternalToken(id) {
-  return `${_MSK_L}${id}${_MSK_R}`;
-}
-
-function internalToExternalTokens(s) {
-  return String(s).replace(/\uE000(\d+)\uE001/g, "{mask:$1}");
-}
-
-function extractUsedIdsFromInternal(texts) {
-  const re = /\uE000(\d+)\uE001/g;
-  const usedIds = new Set();
-  for (const t of texts) {
-    let m;
-    const s = String(t ?? "");
-    while ((m = re.exec(s)) != null) usedIds.add(Number(m[1]));
-  }
-  return usedIds;
+function makeToken(style, id) {
+  if (style === "braces") return `{mask:${id}}`;
+  return `{mask:${id}}`;
 }
 
 /**
  * Build deterministic masks:
- * - 매칭되는 term에 대해서만 maskId 할당
- * - 토큰 문자열이 다시 glossary term에 매칭되는 폭주 방지: 내부 토큰(\uE000N\uE001) 사용
+ * ✅ FIX: 실제로 "매칭되는 term"에 대해서만 maskId를 할당한다.
+ * + ✅ NEW: maxMasksPerText/maxTotalMasks로 폭주 방지 (상한 초과 시 "새로운 id 할당/치환"을 중단)
  */
 function maskOneText({
   text,
-  terms,
+  compiledTerms, // [{ term, re }]
   termToMaskId,
   masksById,
+  maskStyle,
+  maxMasksPerText,
+  maxTotalMasks,
+}) {
+  let out = String(text ?? "");
+  if (!out || !compiledTerms.length) return { out, usedNewIds: 0 };
+
+  let usedNewIds = 0;
+
+  for (const ct of compiledTerms) {
+    const t = ct?.term;
+    const re = ct?.re;
+    if (!t || !re) continue;
+
+    // ✅ 핵심: 실제로 매칭되는 경우에만 진행
+    if (!re.test(out)) continue;
+    re.lastIndex = 0;
+
+    const existingId = termToMaskId.get(t);
+    const nextId = masksById.size + 1;
+
+    // 상한 체크: "새로운 id"가 필요한 상황에서만 제한
+    const needsNewId = !existingId;
+    if (needsNewId) {
+      if (usedNewIds >= maxMasksPerText) continue;
+      if (nextId > maxTotalMasks) continue;
+    }
+
+    const id = existingId ?? nextId;
+
+    if (!existingId) {
+      termToMaskId.set(t, id);
+      if (!masksById.has(id)) masksById.set(id, null);
+      usedNewIds += 1;
+    }
+
+    const token = makeToken(maskStyle, id);
+    out = out.replace(re, token);
+  }
+
+  return { out, usedNewIds };
+}
+
+function buildMaskIndexCacheKey({
+  glossarySheet,
+  loadedAt,
+  sourceLangKey,
+  categoryKey,
   caseSensitive,
   wordBoundary,
 }) {
-  let out = String(text ?? "");
-  if (!out || !terms.length) return out;
+  const cat = categoryKey || "ALL";
+  return `${glossarySheet}|${loadedAt}|${sourceLangKey}|${cat}|cs:${caseSensitive ? 1 : 0}|wb:${
+    wordBoundary ? 1 : 0
+  }`;
+}
 
-  for (const t of terms) {
+function buildCompiledTerms({ anchors, caseSensitive, wordBoundary }) {
+  // anchors: string[]
+  // compiled: [{term, re}]
+  const compiled = [];
+
+  for (const t of anchors) {
     if (!t) continue;
 
+    // word boundary handling (best-effort)
     const startsWord = /^[A-Za-z0-9_]/.test(t);
     const endsWord = /[A-Za-z0-9_]$/.test(t);
 
@@ -130,26 +152,15 @@ function maskOneText({
     }
 
     const re = new RegExp(pattern, caseSensitive ? "g" : "gi");
-
-    if (!re.test(out)) continue;
-    re.lastIndex = 0;
-
-    const existingId = termToMaskId.get(t);
-    const id = existingId ?? (masksById.size + 1);
-
-    if (!existingId) {
-      termToMaskId.set(t, id);
-      if (!masksById.has(id)) masksById.set(id, null);
-    }
-
-    out = out.replace(re, makeInternalToken(id));
+    compiled.push({ term: t, re });
   }
 
-  return out;
+  return compiled;
 }
 
 // ---------------- Endpoint registration ----------------
 export function registerRoutes(app) {
+  // basic routes
   app.get("/health", (_req, res) => res.status(200).json({ ok: true }));
   app.get("/healthz", (_req, res) => res.status(200).json({ ok: true }));
   app.get("/", (_req, res) => res.status(200).send("ok"));
@@ -160,7 +171,7 @@ export function registerRoutes(app) {
    */
   app.post("/v1/session/init", async (req, res) => {
     try {
-      const body = stripNullsDeep(getParsedBody(req));
+      const body = getParsedBody(req);
       const v = InitSchema.parse(body);
 
       const sheet = pickSheet(v);
@@ -210,7 +221,7 @@ export function registerRoutes(app) {
    */
   app.post("/v1/translate/replace", async (req, res) => {
     try {
-      const body = stripNullsDeep(getParsedBody(req));
+      const body = getParsedBody(req);
       const v = ReplaceSchema.parse(body);
 
       const sheet = pickSheet(v);
@@ -255,7 +266,9 @@ export function registerRoutes(app) {
       if (!sourceTextMap || sourceTextMap.size === 0) {
         throw httpError(
           400,
-          `No source texts found for sheet='${sheet}', sourceLang='${sourceLangKey}', category='${category || "ALL"}'.`
+          `No source texts found for sheet='${sheet}', sourceLang='${sourceLangKey}', category='${
+            category || "ALL"
+          }'.`
         );
       }
 
@@ -326,15 +339,15 @@ export function registerRoutes(app) {
   });
 
   /**
-   * maskGlossaryTermsForTranslation
+   * maskGlossaryTermsForTranslation (read-only/processing)
    * POST /v1/translate/mask
    */
   app.post("/v1/translate/mask", async (req, res) => {
     try {
-      const body = stripNullsDeep(getParsedBody(req));
+      const body = getParsedBody(req);
       const v = MaskSchema.parse(body);
 
-      const operatingSheet = pickSheet(v);
+      const operatingSheet = pickSheet(v); // 보고용
       const glossarySheet = String(v.glossarySheet ?? "Glossary").trim() || "Glossary";
 
       const sourceLangKey = normalizeLang(v.sourceLang);
@@ -366,33 +379,71 @@ export function registerRoutes(app) {
         );
       }
 
+      // categories
       let categories = [];
+      let categoryKeyForCache = null;
+
       if (v.category && String(v.category).trim()) {
         const catKey = String(v.category).trim().toLowerCase();
         if (!cache.byCategoryBySource.has(catKey)) {
           throw httpError(400, `Category not found: ${v.category}`, { sheet: glossarySheet });
         }
         categories = [catKey];
+        categoryKeyForCache = catKey;
       } else {
         categories = Array.from(cache.byCategoryBySource.keys());
+        categoryKeyForCache = null; // ALL
       }
 
       const sourceTextMap = mergeSourceTextMapsFromCache(cache, sourceLangKey, categories);
       if (!sourceTextMap || sourceTextMap.size === 0) {
         throw httpError(
           400,
-          `No source texts found for glossarySheet='${glossarySheet}', sourceLang='${sourceLangKey}', category='${v.category || "ALL"}'.`
+          `No source texts found for glossarySheet='${glossarySheet}', sourceLang='${sourceLangKey}', category='${
+            v.category || "ALL"
+          }'.`
         );
       }
 
-      const anchors = Array.from(sourceTextMap.keys())
-        .map((s) => String(s ?? "").trim())
-        .filter(Boolean);
+      // ✅ build or reuse compiled anchor regex list
+      const cacheKey = buildMaskIndexCacheKey({
+        glossarySheet,
+        loadedAt: cache.loadedAt,
+        sourceLangKey,
+        categoryKey: categoryKeyForCache,
+        caseSensitive: Boolean(v.caseSensitive),
+        wordBoundary: Boolean(v.wordBoundary),
+      });
 
-      anchors.sort((a, b) => b.length - a.length);
+      let compiledTerms = _maskIndexCache.get(cacheKey)?.compiled || null;
+      let anchors = _maskIndexCache.get(cacheKey)?.anchors || null;
+
+      if (!compiledTerms || !anchors) {
+        anchors = Array.from(sourceTextMap.keys())
+          .map((s) => String(s ?? "").trim())
+          .filter(Boolean);
+
+        // Sort by length desc to prefer longer phrases
+        anchors.sort((a, b) => b.length - a.length);
+
+        compiledTerms = buildCompiledTerms({
+          anchors,
+          caseSensitive: Boolean(v.caseSensitive),
+          wordBoundary: Boolean(v.wordBoundary),
+        });
+
+        _maskIndexCache.set(cacheKey, { anchors, compiled: compiledTerms, createdAt: nowIso() });
+
+        // 너무 커지면 cache가 메모리를 잡아먹을 수 있으니 단순 상한(키 수)만 둠
+        if (_maskIndexCache.size > 50) {
+          // 오래된 것부터 정리(간단)
+          const keys = Array.from(_maskIndexCache.keys());
+          for (let i = 0; i < Math.max(0, keys.length - 30); i++) _maskIndexCache.delete(keys[i]);
+        }
+      }
 
       const termToMaskId = new Map(); // anchor -> id
-      const masksById = new Map(); // id -> mask obj
+      const masksById = new Map(); // id -> {id, anchor, restore, rowIndex?}
 
       function computeRestore(anchor) {
         const hits = sourceTextMap.get(anchor) || [];
@@ -413,43 +464,50 @@ export function registerRoutes(app) {
         return { restore: anchor, rowIndex };
       }
 
-      const textsMaskedInternal = [];
+      // Mask each text
+      const textsMasked = [];
+      const maxMasksPerText = Number(v.maxMasksPerText ?? 500);
+      const maxTotalMasks = Number(v.maxTotalMasks ?? 2000);
+
       for (const original of v.texts) {
-        const maskedInternal = maskOneText({
+        const { out } = maskOneText({
           text: String(original ?? ""),
-          terms: anchors,
+          compiledTerms,
           termToMaskId,
           masksById,
-          caseSensitive: Boolean(v.caseSensitive),
-          wordBoundary: Boolean(v.wordBoundary),
+          maskStyle: v.maskStyle,
+          maxMasksPerText,
+          maxTotalMasks,
         });
-        textsMaskedInternal.push(maskedInternal);
+        textsMasked.push(out);
       }
 
+      // Count used ids from masked texts
+      const tokenRe = /\{mask:(\d+)\}/g;
+      const usedIds = new Set();
+
+      for (const t of textsMasked) {
+        let m;
+        while ((m = tokenRe.exec(String(t))) != null) usedIds.add(Number(m[1]));
+      }
+
+      // Fill masksById only for *used ids*
       for (const [anchor, id] of termToMaskId.entries()) {
+        if (!usedIds.has(Number(id))) continue;
         if (masksById.get(id)) continue;
+
         const { restore, rowIndex } = computeRestore(anchor);
         masksById.set(id, { id, anchor, restore, glossaryRowIndex: rowIndex || undefined });
       }
 
-      const usedIds = extractUsedIdsFromInternal(textsMaskedInternal);
-      const textsMasked = textsMaskedInternal.map(internalToExternalTokens);
+      const masks = Array.from(masksById.values())
+        .filter(Boolean)
+        .filter((x) => usedIds.has(Number(x.id)))
+        .sort((a, b) => a.id - b.id);
 
-      const matchedMaskIds = Array.from(usedIds).sort((a, b) => a - b);
-
-      let masks = undefined;
-      if (v.includeMasks) {
-        masks = Array.from(masksById.values())
-          .filter(Boolean)
-          .filter((x) => usedIds.has(Number(x.id)))
-          .sort((a, b) => a.id - b.id)
-          .map((m) => {
-            const out = { id: m.id, glossaryRowIndex: m.glossaryRowIndex };
-            if (v.includeAnchor) out.anchor = m.anchor;
-            if (v.includeRestore) out.restore = m.restore;
-            return out;
-          });
-      }
+      // ✅ 응답 폭주 방지: includeMasks=false 또는 returnMode=summary면 masks를 축소/제거
+      const includeMasks = Boolean(v.includeMasks);
+      const returnMode = v.returnMode || "full";
 
       toJson(res, 200, {
         ok: true,
@@ -464,17 +522,17 @@ export function registerRoutes(app) {
         maskStyle: v.maskStyle,
         restoreStrategy: v.restoreStrategy,
         textsMasked,
-        masks,
+        masks: includeMasks && returnMode === "full" ? masks : [],
         meta: {
           glossaryLoadedAt: cache.loadedAt,
           rawRowCount: cache.rawRowCount,
           categoriesUsedCount: categories.length,
           uniqueTermsInIndex: anchors.length,
-          matchedMaskIdsCount: matchedMaskIds.length,
-          matchedMaskIds,
-          includeMasks: Boolean(v.includeMasks),
-          includeRestore: Boolean(v.includeRestore),
-          includeAnchor: Boolean(v.includeAnchor),
+          matchedMaskIds: usedIds.size,
+          maxMasksPerText,
+          maxTotalMasks,
+          includeMasks,
+          returnMode,
         },
       });
     } catch (e) {
@@ -483,12 +541,15 @@ export function registerRoutes(app) {
   });
 
   /**
-   * maskApply (WRITE)
+   * ✅ maskApply (WRITE)
    * POST /v1/translate/mask/apply
+   *
+   * - <targetLang>-Masking 컬럼에 rowIndex 기반 업로드
+   * - responseMode=summary 기본(응답 폭주 방지)
    */
   app.post("/v1/translate/mask/apply", async (req, res) => {
     try {
-      const body = stripNullsDeep(getParsedBody(req));
+      const body = getParsedBody(req);
       const v = MaskApplySchema.parse(body);
 
       const sheet = String(v.sheet).trim();
@@ -511,6 +572,7 @@ export function registerRoutes(app) {
         const rowIndex = Number(it.rowIndex);
         const maskedText = String(it.maskedText ?? "").trim();
         if (!maskedText) continue;
+
         updates.push({
           range: `${sheet}!${colIndexToA1(colIdx)}${rowIndex}`,
           values: [[maskedText]],
@@ -524,19 +586,30 @@ export function registerRoutes(app) {
           maskingHeader,
           plannedUpdates: 0,
           updatedCells: 0,
-          updatedRanges: [],
+          ...(v.responseMode === "full" ? { updatedRanges: [] } : {}),
         });
       }
 
       const writeRes = await batchUpdateValuesA1(updates);
 
-      toJson(res, 200, {
+      if (v.responseMode === "full") {
+        return toJson(res, 200, {
+          ok: true,
+          sheet,
+          maskingHeader,
+          plannedUpdates: updates.length,
+          updatedCells: writeRes.updatedCells,
+          updatedRanges: writeRes.updatedRanges,
+        });
+      }
+
+      // ✅ summary (default)
+      return toJson(res, 200, {
         ok: true,
         sheet,
         maskingHeader,
         plannedUpdates: updates.length,
         updatedCells: writeRes.updatedCells,
-        updatedRanges: writeRes.updatedRanges,
       });
     } catch (e) {
       handleErr(res, e);
@@ -549,7 +622,7 @@ export function registerRoutes(app) {
    */
   app.post("/v1/glossary/update", async (req, res) => {
     try {
-      const body = stripNullsDeep(getParsedBody(req));
+      const body = getParsedBody(req);
       const v = UpdateSchema.parse(body);
 
       const sheet = pickSheet(v);
@@ -573,7 +646,7 @@ export function registerRoutes(app) {
    */
   app.post("/v1/glossary/pending/next", async (req, res) => {
     try {
-      const body = stripNullsDeep(getParsedBody(req));
+      const body = getParsedBody(req);
       const v = PendingNextSchema.parse(body);
 
       const sheet = pickSheet(v);
@@ -659,12 +732,12 @@ export function registerRoutes(app) {
   });
 
   /**
-   * glossaryQaNext
+   * glossaryQaNext (read-only)
    * POST /v1/glossary/qa/next
    */
   app.post("/v1/glossary/qa/next", async (req, res) => {
     try {
-      const body = stripNullsDeep(getParsedBody(req));
+      const body = getParsedBody(req);
       const v = GlossaryQaNextSchema.parse(body);
 
       const sheet = pickSheet(v);
@@ -767,10 +840,15 @@ export function registerRoutes(app) {
   /**
    * glossaryApply
    * POST /v1/glossary/apply
+   *
+   * ✅ 개선:
+   * - requireRowIndex(default true): rowIndex 없는 apply 차단 → 셀 misalign 방지
+   * - maxCellChars: 너무 긴 텍스트 업로드 제외
+   * - responseMode(default summary): 응답 폭주 방지
    */
   app.post("/v1/glossary/apply", async (req, res) => {
     try {
-      const body = stripNullsDeep(getParsedBody(req));
+      const body = getParsedBody(req);
       const v = ApplySchema.parse(body);
 
       const sheet = pickSheet(v);
@@ -789,6 +867,22 @@ export function registerRoutes(app) {
         );
       }
 
+      // ✅ requireRowIndex enforcement
+      const requireRowIndex = Boolean(v.requireRowIndex);
+      if (requireRowIndex) {
+        const missing = [];
+        for (let i = 0; i < v.entries.length; i++) {
+          const e = v.entries[i];
+          const has = e?.rowIndex != null && Number.isFinite(Number(e.rowIndex));
+          if (!has) missing.push(i);
+        }
+        if (missing.length) {
+          throw httpError(400, "requireRowIndex=true: every entry must include rowIndex.", {
+            missingEntryIndexes: missing,
+          });
+        }
+      }
+
       let categories = null;
       let categoryKey = null;
       if (v.category && String(v.category).trim()) {
@@ -805,6 +899,8 @@ export function registerRoutes(app) {
 
       const fillOnlyEmpty = Boolean(v.fillOnlyEmpty);
       const allowAnchorUpdate = Boolean(v.allowAnchorUpdate);
+      const responseMode = v.responseMode || "summary";
+      const maxCellChars = Number(v.maxCellChars ?? 45000);
 
       const updates = [];
       const results = [];
@@ -859,6 +955,7 @@ export function registerRoutes(app) {
 
           chosen = { _rowIndex: rowIndex, key: chosenEntry?.key };
         } else {
+          // requireRowIndex=false일 때만 여기로 내려옴
           const hits = sourceTextMap.get(sourceText) || [];
           if (!hits.length) {
             results.push({ sourceText, status: "skipped", reason: "not_found" });
@@ -882,6 +979,16 @@ export function registerRoutes(app) {
           const langKey = normalizeLang(rawLang);
           const val = String(rawVal ?? "").trim();
           if (!langKey || !val) continue;
+
+          // ✅ max cell length protection
+          if (val.length > maxCellChars) {
+            skipped += 1;
+            conflicts.push({
+              lang: langKey,
+              reason: `length_overflow(${val.length} > ${maxCellChars})`,
+            });
+            continue;
+          }
 
           if (langKey === "en-us" && !allowAnchorUpdate) {
             skipped += 1;
@@ -920,17 +1027,66 @@ export function registerRoutes(app) {
         });
       }
 
+      // plannedUpdates=0이면 write를 아예 안 함
+      if (updates.length === 0) {
+        if (responseMode === "full") {
+          return toJson(res, 200, {
+            ok: true,
+            sheet,
+            fillOnlyEmpty,
+            allowAnchorUpdate,
+            requireRowIndex,
+            responseMode,
+            maxCellChars,
+            plannedUpdates: 0,
+            updatedCells: 0,
+            updatedRanges: [],
+            results,
+          });
+        }
+
+        return toJson(res, 200, {
+          ok: true,
+          sheet,
+          fillOnlyEmpty,
+          allowAnchorUpdate,
+          requireRowIndex,
+          responseMode,
+          maxCellChars,
+          plannedUpdates: 0,
+          updatedCells: 0,
+        });
+      }
+
       const writeRes = await batchUpdateValuesA1(updates);
 
-      toJson(res, 200, {
+      if (responseMode === "full") {
+        return toJson(res, 200, {
+          ok: true,
+          sheet,
+          fillOnlyEmpty,
+          allowAnchorUpdate,
+          requireRowIndex,
+          responseMode,
+          maxCellChars,
+          plannedUpdates: updates.length,
+          updatedCells: writeRes.updatedCells,
+          updatedRanges: writeRes.updatedRanges,
+          results,
+        });
+      }
+
+      // ✅ summary (default): 응답 폭주 최소화
+      return toJson(res, 200, {
         ok: true,
         sheet,
         fillOnlyEmpty,
         allowAnchorUpdate,
+        requireRowIndex,
+        responseMode,
+        maxCellChars,
         plannedUpdates: updates.length,
         updatedCells: writeRes.updatedCells,
-        updatedRanges: writeRes.updatedRanges,
-        results,
       });
     } catch (e) {
       handleErr(res, e);

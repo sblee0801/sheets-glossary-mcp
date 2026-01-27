@@ -62,7 +62,6 @@ app.use((req, res, next) => {
 
   function logSize(bytes, note = "") {
     const ms = Date.now() - startedAt;
-    // 너무 noisy 하면 필요시 env로 on/off 가능하게 해도 됨
     console.log(
       `[RESP] ${req.method} ${req.originalUrl} -> ${bytes} bytes (${Math.round(bytes / 1024)}KB) in ${ms}ms${
         note ? ` ${note}` : ""
@@ -75,9 +74,6 @@ app.use((req, res, next) => {
 
     if (bytes > RESPONSE_LIMIT_BYTES) {
       logSize(bytes, "[CUTOFF: json too large]");
-      // 커넥터가 죽기 전에 "작은 에러"로 반환
-      // 상태코드는 200으로 둬도 되지만(액션이 4xx를 싫어하는 경우),
-      // 여기서는 의미상 413을 사용. 필요하면 200으로 바꿔도 됨.
       res.status(413);
       return originalJson({
         ok: false,
@@ -104,7 +100,6 @@ app.use((req, res, next) => {
     if (bytes > RESPONSE_LIMIT_BYTES) {
       logSize(bytes, "[CUTOFF: send too large]");
       res.status(413);
-      // send()인 경우에도 JSON으로 돌려서 Actions가 삼키기 쉽게
       return originalSend(
         JSON.stringify({
           ok: false,
