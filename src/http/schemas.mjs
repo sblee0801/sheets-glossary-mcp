@@ -5,9 +5,60 @@
 
 import { z } from "zod";
 
+/**
+ * CustomGPT/Actions에서 optional 필드가 null로 오는 케이스가 흔함.
+ * 서버에서 null을 undefined로 정규화해서 1차부터 실패하지 않게 한다.
+ */
+const nullToUndefined = (schema) =>
+  z.preprocess((v) => (v === null ? undefined : v), schema);
+
+const optString = () => nullToUndefined(z.string()).optional();
+const optStringDefault = (def) => nullToUndefined(z.string()).optional().default(def);
+
+/**
+ * ApplyEntry 정규화:
+ * - translations가 없으면: (rowIndex/sourceText/translations 제외한) 나머지 키들을 translations 레코드로 승격
+ * - translations가 배열이면: [{lang,text}] -> { [lang]: text }
+ * - translations가 null이면: undefined로 처리 후 위 규칙 적용
+ */
+function normalizeApplyEntry(raw) {
+  if (!raw || typeof raw !== "object") return raw;
+
+  // shallow copy
+  const obj = { ...raw };
+
+  // normalize null -> undefined
+  if (obj.translations === null) obj.translations = undefined;
+
+  // case 1) translations as array -> record
+  if (Array.isArray(obj.translations)) {
+    const rec = {};
+    for (const it of obj.translations) {
+      if (!it || typeof it !== "object") continue;
+      const lang = String(it.lang ?? it.language ?? "").trim();
+      const text = String(it.text ?? it.value ?? "").trim();
+      if (lang && text) rec[lang] = text;
+    }
+    obj.translations = rec;
+    return obj;
+  }
+
+  // case 2) translations missing -> promote extra keys
+  if (obj.translations === undefined) {
+    const rec = {};
+    for (const [k, v] of Object.entries(obj)) {
+      if (k === "rowIndex" || k === "sourceText" || k === "translations") continue;
+      if (typeof v === "string" && v.trim()) rec[k] = v.trim();
+    }
+    if (Object.keys(rec).length > 0) obj.translations = rec;
+  }
+
+  return obj;
+}
+
 // ---------------- REST Schemas ----------------
 export const InitSchema = z.object({
-  sheet: z.string().optional(),
+  sheet: optString(),
   category: z.string().min(1),
   sourceLang: z.string().min(1),
   targetLang: z.string().min(1),
@@ -15,11 +66,11 @@ export const InitSchema = z.object({
 
 export const ReplaceSchema = z
   .object({
-    sheet: z.string().optional(),
-    sessionId: z.string().min(1).optional(),
-    category: z.string().optional(),
-    sourceLang: z.string().min(1).optional(),
-    targetLang: z.string().min(1).optional(),
+    sheet: optString(),
+    sessionId: optString(),
+    category: optString(),
+    sourceLang: optString(),
+    targetLang: optString(),
     texts: z.array(z.string()).min(1),
     includeLogs: z.boolean().optional(),
     limit: z.number().int().min(1).max(200).optional(),
@@ -34,15 +85,15 @@ export const ReplaceSchema = z
   );
 
 export const UpdateSchema = z.object({
-  sheet: z.string().optional(),
-  sessionId: z.string().min(1).optional(),
+  sheet: optString(),
+  sessionId: optString(),
 });
 
 export const SuggestSchema = z.object({
-  sheet: z.string().optional(),
+  sheet: optString(),
   category: z.string().min(1),
   terms: z.array(z.string()).min(1).max(200),
-  anchorLang: z.string().optional().default("en-US"),
+  anchorLang: optStringDefault("en-US"),
   targetLangs: z.array(z.string()).min(1).max(20),
   sources: z.array(z.enum(["iroWikiDb", "rateMyServer", "divinePride"])).optional(),
   includeEvidence: z.boolean().optional().default(true),
@@ -51,17 +102,17 @@ export const SuggestSchema = z.object({
 });
 
 export const CandidatesSchema = z.object({
-  sheet: z.string().optional(),
+  sheet: optString(),
   category: z.string().min(1),
   sourceText: z.string().min(1),
-  sourceLang: z.string().optional().default("en-US"),
+  sourceLang: optStringDefault("en-US"),
   targetLangs: z.array(z.string()).min(1).max(20),
   sources: z.array(z.enum(["iroWikiDb", "rateMyServer", "divinePride"])).optional(),
 });
 
 export const CandidatesBatchSchema = z.object({
-  sheet: z.string().optional(),
-  category: z.string().optional(),
+  sheet: optString(),
+  category: optString(),
   sourceLang: z.enum(["en-US", "ko-KR"]).optional().default("en-US"),
   sourceTexts: z.array(z.string().min(1)).min(1).max(500),
   targetLangs: z.array(z.string().min(1)).min(1).max(20),
@@ -70,28 +121,41 @@ export const CandidatesBatchSchema = z.object({
   includeEvidence: z.boolean().optional().default(true),
 });
 
+// ✅ ApplyEntry with normalization
+const ApplyEntrySchema = z
+  .preprocess(
+    normalizeApplyEntry,
+    z.object({
+      rowIndex: z.number().int().min(2).optional(),
+      sourceText: z.string().min(1),
+      translations: z.record(z.string(), z.string().trim().min(1)).optional(),
+    })
+  )
+  .superRefine((v, ctx) => {
+    const t = v.translations ?? {};
+    if (typeof t !== "object" || Array.isArray(t) || Object.keys(t).length === 0) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message:
+          "translations is required and must contain at least 1 non-empty item (record). Example: translations: { \"id-ID\": \"...\" }",
+        path: ["translations"],
+      });
+    }
+  });
+
 export const ApplySchema = z.object({
-  sheet: z.string().optional(),
-  category: z.string().optional(),
+  sheet: optString(),
+  category: optString(),
   sourceLang: z.enum(["en-US", "ko-KR"]).optional().default("en-US"),
-  entries: z
-    .array(
-      z.object({
-        rowIndex: z.number().int().min(2).optional(),
-        sourceText: z.string().min(1),
-        translations: z.record(z.string(), z.string().trim().min(1)),
-      })
-    )
-    .min(1)
-    .max(500),
+  entries: z.array(ApplyEntrySchema).min(1).max(500),
   fillOnlyEmpty: z.boolean().optional().default(true),
   targetLangs: z.array(z.string().min(1)).optional(),
   allowAnchorUpdate: z.boolean().optional().default(false),
 });
 
 export const PendingNextSchema = z.object({
-  sheet: z.string().optional(),
-  category: z.string().optional(),
+  sheet: optString(),
+  category: optString(),
   sourceLang: z.enum(["en-US", "ko-KR"]).optional().default("en-US"),
   targetLangs: z.array(z.string().min(1)).min(1).max(20),
   limit: z.number().int().min(1).max(500).optional().default(100),
@@ -100,21 +164,21 @@ export const PendingNextSchema = z.object({
 
 // ---------------- QA ----------------
 export const GlossaryQaNextSchema = z.object({
-  sheet: z.string().optional(),
-  category: z.string().optional(),
+  sheet: optString(),
+  category: optString(),
   sourceLang: z.enum(["en-US", "ko-KR"]).optional().default("en-US"),
   targetLang: z.string().min(1),
   limit: z.number().int().min(1).max(500).optional().default(100),
-  cursor: z.string().optional(),
+  cursor: optString(),
   forceReload: z.boolean().optional().default(false),
 });
 
 // ---------------- Mask (read / processing) ----------------
 export const MaskSchema = z.object({
-  sheet: z.string().optional(), // operating sheet (TransX etc)
-  glossarySheet: z.string().optional().default("Glossary"),
+  sheet: optString(),
+  glossarySheet: optStringDefault("Glossary"),
 
-  category: z.string().optional(),
+  category: optString(), // category:null 허용 → undefined 정규화
   sourceLang: z.enum(["en-US", "ko-KR"]).optional().default("en-US"),
   targetLang: z.string().min(1),
 
@@ -128,14 +192,6 @@ export const MaskSchema = z.object({
 
   forceReload: z.boolean().optional().default(false),
 
-  /**
-   * ✅ NEW: response minimization switches
-   * - includeMasks=false  → masks 배열 미포함 (메타에 matchedMaskIds만)
-   * - includeRestore=false → masks에 restore 문자열 미포함 (응답 축소)
-   * - includeAnchor=false  → masks에 anchor 문자열 미포함 (응답 축소)
-   *
-   * 기본값은 기존 동작 유지(파이프라인 안 깨짐).
-   */
   includeMasks: z.boolean().optional().default(true),
   includeRestore: z.boolean().optional().default(true),
   includeAnchor: z.boolean().optional().default(true),
@@ -144,7 +200,7 @@ export const MaskSchema = z.object({
 // ---------------- Mask Apply (WRITE) ----------------
 export const MaskApplySchema = z.object({
   sheet: z.string().min(1),
-  targetLang: z.string().min(1), // ex) id-ID
+  targetLang: z.string().min(1),
   entries: z
     .array(
       z.object({
