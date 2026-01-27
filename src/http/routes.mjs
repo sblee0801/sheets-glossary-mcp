@@ -1,20 +1,15 @@
 /**
  * src/http/routes.mjs
- * - REST endpoints (sheet-aware)
+ * - REST endpoints
+ *
+ * ✅ 2026-01 changes
+ * - Add masking workflow:
+ *   1) /v1/translate/mask            (texts -> masked texts, compact)
+ *   2) /v1/translate/mask/fromSheet  (read sheet -> masked preview)
+ *   3) /v1/translate/mask/apply      (write maskedText -> <targetLang>-Masking)
+ *
+ * - Ensure mask endpoints return small payloads by default.
  */
-
-import {
-  normalizeLang,
-  assertAllowedSourceLang,
-  newSessionId,
-  nowIso,
-  getParsedBody,
-} from "../utils/common.mjs";
-
-import { ensureGlossaryLoaded, ensureRulesLoaded } from "../cache/global.mjs";
-import { mergeSourceTextMapsFromCache } from "../glossary/index.mjs";
-import { replaceByGlossaryWithLogs, buildRuleLogs } from "../replace/replace.mjs";
-import { colIndexToA1, batchUpdateValuesA1 } from "../google/sheets.mjs";
 
 import {
   InitSchema,
@@ -22,843 +17,675 @@ import {
   UpdateSchema,
   PendingNextSchema,
   ApplySchema,
-  GlossaryQaNextSchema,
-  MaskSchema, // ✅ NEW
+  CandidatesBatchSchema,
+  MaskSchema,
+  MaskFromSheetSchema,
+  MaskApplySchema,
 } from "./schemas.mjs";
 
-// ---------------- In-memory sessions (lightweight) ----------------
-const _sessions = new Map(); // sessionId -> { sheet, category, sourceLangKey, targetLangKey, createdAt }
+import { SHEET_NAME } from "../config/env.mjs";
 
-function httpError(status, message, extra) {
-  const err = new Error(message);
-  err.status = status;
-  err.extra = extra;
-  return err;
+import {
+  normalizeLang,
+  assertAllowedSourceLang,
+  newSessionId,
+  escapeRegExp,
+} from "../utils/common.mjs";
+
+import { ensureGlossaryLoaded, ensureRulesLoaded } from "../cache/global.mjs";
+import { mergeSourceTextMapsFromCache } from "../glossary/index.mjs";
+import { replaceByGlossaryWithLogs, buildRuleLogs } from "../replace/replace.mjs";
+import { runCandidatesBatch } from "../candidates/batch.mjs";
+
+import {
+  readSheetRange,
+  batchUpdateValuesA1,
+  colIndexToA1,
+} from "../google/sheets.mjs";
+
+// ---------------- Session Cache (legacy) ----------------
+const sessions = new Map();
+
+// ---------------- Mask helpers (compact, no huge payload) ----------------
+function pickRestoreText({ entry, targetLangKey, sourceLangKey, restoreStrategy }) {
+  // restoreStrategy = "glossaryTarget": targetLang이 있으면 그걸로 복원, 없으면 anchor fallback
+  if (restoreStrategy === "glossaryTarget") {
+    const v = String(entry?.translations?.[targetLangKey] ?? "").trim();
+    if (v) return v;
+    return String(entry?.translations?.[sourceLangKey] ?? "").trim();
+  }
+
+  const v = String(entry?.translations?.[targetLangKey] ?? "").trim();
+  if (v) return v;
+  return String(entry?.translations?.[sourceLangKey] ?? "").trim();
 }
 
-function toJson(res, status, payload) {
-  res.status(status).json(payload);
+function buildGlossaryTermList({ cache, sourceLangKey, categoryKey }) {
+  const categories = categoryKey
+    ? [String(categoryKey).trim().toLowerCase()]
+    : Array.from(cache.byCategoryBySource.keys());
+
+  const sourceTextMap = mergeSourceTextMapsFromCache(cache, sourceLangKey, categories);
+
+  const terms = Array.from(sourceTextMap.keys())
+    .map((t) => String(t ?? "").trim())
+    .filter(Boolean)
+    .sort((a, b) => b.length - a.length);
+
+  return { categories, sourceTextMap, terms };
 }
 
-function handleErr(res, e) {
-  const status = Number(e?.status) || 500;
-  toJson(res, status, {
-    ok: false,
-    error: String(e?.message ?? e),
-    extra: e?.extra,
-  });
-}
-
-function pickSheet(v) {
-  return String(v?.sheet ?? "Glossary").trim() || "Glossary";
-}
-
-function escapeRegex(s) {
-  return String(s).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-}
-
-function makeToken(style, id) {
-  if (style === "braces") return `{mask:${id}}`;
-  return `{mask:${id}}`;
-}
-
-/**
- * Build deterministic, non-overlapping masks:
- * - Prefer longer terms first
- * - Avoid overlaps
- * - Optionally enforce word boundaries
- */
 function maskOneText({
   text,
   terms,
-  termToMaskId,
-  masksById,
+  sourceTextMap,
+  sourceLangKey,
+  targetLangKey,
+  restoreStrategy,
   maskStyle,
-  caseSensitive,
-  wordBoundary,
 }) {
-  let out = String(text ?? "");
-  if (!out || !terms.length) return out;
+  const input = String(text ?? "");
+  if (!input) return { masked: "", masks: [] };
 
-  // track protected spans after replacement is tricky; we do iterative regex replace
-  // by processing terms in length-desc order and replacing globally.
-  for (const t of terms) {
-    if (!t) continue;
+  // token per term (NOT per occurrence) -> mapping is compact
+  const masks = [];
+  const termToToken = new Map();
 
-    const existingId = termToMaskId.get(t);
-    const id = existingId ?? (masksById.size + 1);
+  let masked = input;
+  let counter = 0;
 
-    if (!existingId) {
-      termToMaskId.set(t, id);
-      // masksById populated by caller (needs restore); here we just reserve id
-      if (!masksById.has(id)) masksById.set(id, null);
+  for (const term of terms) {
+    if (!term) continue;
+    if (!masked.includes(term)) continue;
+
+    const hits = sourceTextMap.get(term);
+    if (!hits || hits.length === 0) continue;
+
+    const chosen = hits[0];
+    if (!chosen) continue;
+
+    let token = termToToken.get(term);
+    if (!token) {
+      counter += 1;
+      token = maskStyle === "plain" ? `__MASK_${counter}__` : `{mask:${counter}}`;
+      termToToken.set(term, token);
+
+      const restore = pickRestoreText({
+        entry: chosen,
+        targetLangKey,
+        sourceLangKey,
+        restoreStrategy,
+      });
+
+      masks.push({
+        token,
+        source: term,
+        restore,
+        chosenRowIndex: chosen?._rowIndex ?? null,
+      });
     }
 
-    const token = makeToken(maskStyle, id);
-
-    // word boundary handling (best-effort):
-    // - if term begins/ends with alnum/underscore, wrap with \b
-    // - otherwise no boundary (symbols/space terms)
-    const startsWord = /^[A-Za-z0-9_]/.test(t);
-    const endsWord = /[A-Za-z0-9_]$/.test(t);
-
-    let pattern = escapeRegex(t);
-    if (wordBoundary && startsWord && endsWord) {
-      pattern = `\\b${pattern}\\b`;
-    }
-
-    const re = new RegExp(pattern, caseSensitive ? "g" : "gi");
-
-    out = out.replace(re, token);
+    const re = new RegExp(escapeRegExp(term), "g");
+    masked = masked.replace(re, token);
   }
 
-  return out;
+  return { masked, masks };
 }
 
-// ---------------- Endpoint registration ----------------
+function findColumnIndexByHeader(header, wantHeaderExact) {
+  const want = String(wantHeaderExact ?? "").trim();
+  if (!want) return -1;
+  for (let i = 0; i < header.length; i++) {
+    if (String(header[i] ?? "").trim() === want) return i;
+  }
+  return -1;
+}
+
+function buildMaskingHeader(targetLangRaw) {
+  // 규칙: "<targetLang>-Masking" (예: id-ID-Masking)
+  const t = String(targetLangRaw ?? "").trim();
+  return `${t}-Masking`;
+}
+
+// ---------------- Routes ----------------
 export function registerRoutes(app) {
-  // basic routes
+  // basic
   app.get("/health", (_req, res) => res.status(200).json({ ok: true }));
   app.get("/healthz", (_req, res) => res.status(200).json({ ok: true }));
   app.get("/", (_req, res) => res.status(200).send("ok"));
 
   /**
-   * Session init (optional)
-   * POST /v1/session/init
+   * POST /v1/session/init (legacy)
    */
   app.post("/v1/session/init", async (req, res) => {
     try {
-      const body = getParsedBody(req);
-      const v = InitSchema.parse(body);
+      const { category, sourceLang, targetLang } = InitSchema.parse(req.body);
 
-      const sheet = pickSheet(v);
-      const sourceLangKey = normalizeLang(v.sourceLang);
-      const targetLangKey = normalizeLang(v.targetLang);
-      const category = String(v.category ?? "").trim();
+      const categoryKey = String(category).trim().toLowerCase();
+      const sourceLangKey = normalizeLang(sourceLang);
+      const targetLangKey = normalizeLang(targetLang);
 
       assertAllowedSourceLang(sourceLangKey);
 
-      const cache = await ensureGlossaryLoaded({
-        sheetName: sheet,
-        forceReload: false,
-      });
-
-      if (sourceLangKey === "en-us" && cache.langIndex["en-us"] == null) {
-        throw httpError(
-          400,
-          `Sheet '${sheet}' does not include en-US column; cannot init with sourceLang=en-US.`
-        );
-      }
+      const cache = await ensureGlossaryLoaded({ forceReload: false });
 
       const sessionId = newSessionId();
-      _sessions.set(sessionId, {
-        sheet,
-        category,
-        sourceLangKey,
-        targetLangKey,
-        createdAt: nowIso(),
-      });
+      sessions.set(sessionId, { sessionId, categoryKey, sourceLangKey, targetLangKey });
 
-      toJson(res, 200, {
+      return res.status(200).json({
         ok: true,
         sessionId,
-        sheet,
-        category,
+        category: categoryKey,
         sourceLang: sourceLangKey,
         targetLang: targetLangKey,
+        glossaryLoadedAt: cache.loadedAt ?? null,
       });
     } catch (e) {
-      handleErr(res, e);
+      return res.status(e?.status ?? 500).json({ ok: false, error: e?.message });
     }
   });
 
   /**
-   * replaceGlossaryTerms
    * POST /v1/translate/replace
+   * - Phase 1 glossary replacement + Phase 1.5 ruleLogs
    */
   app.post("/v1/translate/replace", async (req, res) => {
     try {
-      const body = getParsedBody(req);
-      const v = ReplaceSchema.parse(body);
+      const body = ReplaceSchema.parse(req.body ?? {});
+      const wantLogs = body.includeLogs ?? true;
 
-      const sheet = pickSheet(v);
-
-      let cfg = null;
-      if (v.sessionId) {
-        cfg = _sessions.get(v.sessionId) || null;
-        if (!cfg) throw httpError(400, `Unknown sessionId: ${v.sessionId}`);
-      }
-
-      const category = String(v.category ?? cfg?.category ?? "").trim();
-      const sourceLangKey = normalizeLang(v.sourceLang ?? cfg?.sourceLangKey ?? "");
-      const targetLangKey = normalizeLang(v.targetLang ?? cfg?.targetLangKey ?? "");
-
-      if (!sourceLangKey || !targetLangKey) {
-        throw httpError(400, "sourceLang and targetLang are required (or provide sessionId).");
-      }
+      const sourceLangKey = normalizeLang(body.sourceLang);
+      const targetLangKey = normalizeLang(body.targetLang);
 
       assertAllowedSourceLang(sourceLangKey);
 
-      const cache = await ensureGlossaryLoaded({ sheetName: sheet, forceReload: false });
-
-      if (sourceLangKey === "en-us" && cache.langIndex["en-us"] == null) {
-        throw httpError(
-          400,
-          `Sheet '${sheet}' does not include en-US column; cannot use sourceLang=en-US.`
-        );
-      }
-
-      let categories = [];
-      if (category && String(category).trim()) {
-        const catKey = String(category).trim().toLowerCase();
-        if (!cache.byCategoryBySource.has(catKey)) {
-          throw httpError(400, `Category not found: ${category}`, { sheet });
-        }
-        categories = [catKey];
-      } else {
-        categories = Array.from(cache.byCategoryBySource.keys());
-      }
+      const cache = await ensureGlossaryLoaded({ forceReload: false });
+      const categories = body.category
+        ? [String(body.category).trim().toLowerCase()]
+        : Array.from(cache.byCategoryBySource.keys());
 
       const sourceTextMap = mergeSourceTextMapsFromCache(cache, sourceLangKey, categories);
-      if (!sourceTextMap || sourceTextMap.size === 0) {
-        throw httpError(
-          400,
-          `No source texts found for sheet='${sheet}', sourceLang='${sourceLangKey}', category='${category || "ALL"}'.`
-        );
-      }
-
-      const wantLogs = v.includeLogs ?? true;
-
       const rulesCache = await ensureRulesLoaded({ forceReload: false });
-      const categoryKey = category ? String(category).trim().toLowerCase() : categories[0] || "";
 
       const outTexts = [];
       const perLineLogs = [];
-      const perLineRuleLogs = [];
+      const ruleLogs = [];
 
-      let replacedTotalAll = 0;
-      let matchedTermsAll = 0;
-      let matchedRulesAll = 0;
-
-      for (let i = 0; i < v.texts.length; i++) {
-        const input = v.texts[i];
-
-        const { out, replacedTotal, logs } = replaceByGlossaryWithLogs({
-          text: input,
+      for (let i = 0; i < body.texts.length; i++) {
+        const { out, logs } = replaceByGlossaryWithLogs({
+          text: body.texts[i],
           sourceLangKey,
           targetLangKey,
           sourceTextMap,
         });
 
-        const ruleLogs = buildRuleLogs({
+        outTexts.push(out);
+        if (wantLogs) perLineLogs.push({ index: i, logs });
+
+        const rLogs = buildRuleLogs({
           text: out,
-          categoryKey: String(categoryKey || "").toLowerCase(),
+          categoryKey: body.category ?? "ALL",
           targetLangKey,
           rulesCache,
         });
-
-        outTexts.push(out);
-        replacedTotalAll += replacedTotal;
-        matchedTermsAll += logs.length;
-        matchedRulesAll += ruleLogs.length;
-
-        if (wantLogs) {
-          perLineLogs.push({ index: i, replacedTotal, logs });
-          perLineRuleLogs.push({ index: i, ruleLogs });
-        }
+        ruleLogs.push({ index: i, logs: rLogs });
       }
 
-      toJson(res, 200, {
+      return res.status(200).json({
         ok: true,
-        sheet: cache.sheetName,
-        category: category ? String(category).trim().toLowerCase() : "ALL",
+        mode: "stateless",
+        category: body.category ?? "ALL",
         sourceLang: sourceLangKey,
         targetLang: targetLangKey,
         texts: outTexts,
-        summary: {
-          lines: v.texts.length,
-          replacedTotal: replacedTotalAll,
-          matchedTerms: matchedTermsAll,
-          matchedRules: matchedRulesAll,
-          glossaryLoadedAt: cache.loadedAt,
-          rawRowCount: cache.rawRowCount,
-          categoriesUsedCount: categories.length,
-          uniqueTermsInIndex: sourceTextMap.size,
-        },
-        logs: wantLogs ? perLineLogs : undefined,
-        ruleLogs: wantLogs ? perLineRuleLogs : undefined,
+        logs: wantLogs ? perLineLogs : null,
+        ruleLogs,
       });
     } catch (e) {
-      handleErr(res, e);
+      return res.status(e?.status ?? 500).json({ ok: false, error: e?.message });
     }
   });
 
   /**
-   * ✅ NEW: maskGlossaryTermsForTranslation (read-only/processing)
-   * POST /v1/translate/mask
-   *
-   * - 목적: Glossary 용어를 {mask:N} 토큰으로 치환하여, GPT가 용어를 변형하지 못하게 함
-   * - restoreStrategy=glossaryTarget:
-   *   - Glossary에 targetLang 번역이 있으면 restore는 그 번역
-   *   - 없으면 anchor(원문 용어)를 restore로 사용
-   *
-   * 반환:
-   * - textsMasked: 마스킹된 텍스트들
-   * - masks: id->(anchor, restore) 매핑 (클라이언트가 번역 후 restore로 복원)
+   * ✅ POST /v1/translate/mask
+   * - texts 마스킹(검수용)
+   * - 기본 응답은 "maskedText 중심"으로 작게 유지
    */
   app.post("/v1/translate/mask", async (req, res) => {
     try {
-      const body = getParsedBody(req);
-      const v = MaskSchema.parse(body);
+      const body = MaskSchema.parse(req.body ?? {});
 
-      const operatingSheet = pickSheet(v); // 사용자가 작업 중인 시트(Trans5 등) - 로직에는 직접 영향 없음
-      const glossarySheet = String(v.glossarySheet ?? "Glossary").trim() || "Glossary";
+      const categoryKey = body.category ? String(body.category).trim().toLowerCase() : null;
+      const sourceLangKey = normalizeLang(body.sourceLang);
+      const targetLangKey = normalizeLang(body.targetLang);
 
-      const sourceLangKey = normalizeLang(v.sourceLang);
-      if (sourceLangKey !== "en-us" && sourceLangKey !== "ko-kr") {
-        throw httpError(400, "mask sourceLang must be en-US or ko-KR.");
-      }
+      assertAllowedSourceLang(sourceLangKey);
 
-      const targetLangKey = normalizeLang(v.targetLang);
-      if (!targetLangKey) throw httpError(400, "mask targetLang is required.");
-
-      // Glossary cache 로드(용어 소스)
-      const cache = await ensureGlossaryLoaded({
-        sheetName: glossarySheet,
-        forceReload: Boolean(v.forceReload),
+      const cache = await ensureGlossaryLoaded({ forceReload: false });
+      const { sourceTextMap, terms } = buildGlossaryTermList({
+        cache,
+        sourceLangKey,
+        categoryKey,
       });
 
-      const srcCol = cache.langIndex[sourceLangKey];
-      if (srcCol == null) {
-        throw httpError(
-          400,
-          `Glossary sheet '${glossarySheet}' does not include source language column: ${sourceLangKey}`
-        );
-      }
-
-      const tgtCol = cache.langIndex[targetLangKey];
-      // tgtCol이 없으면 restoreStrategy=glossaryTarget이라도 restore는 anchor fallback
-      // 다만 "컬럼 자체 없음"은 운영 실수 가능성이 커서 400으로 막는 게 더 안전함
-      if (tgtCol == null) {
-        throw httpError(
-          400,
-          `Glossary sheet '${glossarySheet}' does not include target language column: ${targetLangKey}`
-        );
-      }
-
-      // categories
-      let categories = [];
-      if (v.category && String(v.category).trim()) {
-        const catKey = String(v.category).trim().toLowerCase();
-        if (!cache.byCategoryBySource.has(catKey)) {
-          throw httpError(400, `Category not found: ${v.category}`, { sheet: glossarySheet });
-        }
-        categories = [catKey];
-      } else {
-        categories = Array.from(cache.byCategoryBySource.keys());
-      }
-
-      const sourceTextMap = mergeSourceTextMapsFromCache(cache, sourceLangKey, categories);
-      if (!sourceTextMap || sourceTextMap.size === 0) {
-        throw httpError(
-          400,
-          `No source texts found for glossarySheet='${glossarySheet}', sourceLang='${sourceLangKey}', category='${v.category || "ALL"}'.`
-        );
-      }
-
-      // Build unique term list (anchors)
-      const anchors = Array.from(sourceTextMap.keys())
-        .map((s) => String(s ?? "").trim())
-        .filter(Boolean);
-
-      // Sort by length desc to prefer longer phrases
-      anchors.sort((a, b) => b.length - a.length);
-
-      const termToMaskId = new Map(); // anchor -> id
-      const masksById = new Map(); // id -> {id, anchor, restore, rowIndex?}
-
-      // Precompute restore strings using earliest rowIndex hit for each anchor
-      // Note: sourceTextMap.get(anchor) returns list of entries with _rowIndex
-      function computeRestore(anchor) {
-        const hits = sourceTextMap.get(anchor) || [];
-        if (!hits.length) return { restore: anchor, rowIndex: null };
-
-        // choose earliest rowIndex
-        let chosen = hits[0];
-        for (const h of hits) {
-          if (Number(h?._rowIndex) < Number(chosen?._rowIndex)) chosen = h;
-        }
-        const rowIndex = Number(chosen?._rowIndex);
-
-        const rawRow = cache.rawRows[rowIndex - 2] || [];
-        const targetVal = String(rawRow[tgtCol] ?? "").trim();
-
-        if (v.restoreStrategy === "glossaryTarget") {
-          return { restore: targetVal || anchor, rowIndex };
-        }
-        return { restore: anchor, rowIndex };
-      }
-
-      // Mask each text
       const textsMasked = [];
-      let matchedTermsTotal = 0;
+      const mapByIndex = [];
 
-      for (const original of v.texts) {
-        const before = String(original ?? "");
-        const termToMaskIdLocal = termToMaskId; // shared across all lines (stable ids)
-        const masked = maskOneText({
-          text: before,
-          terms: anchors,
-          termToMaskId: termToMaskIdLocal,
-          masksById,
-          maskStyle: v.maskStyle,
-          caseSensitive: Boolean(v.caseSensitive),
-          wordBoundary: Boolean(v.wordBoundary),
+      for (let i = 0; i < body.texts.length; i++) {
+        const { masked, masks } = maskOneText({
+          text: body.texts[i],
+          terms,
+          sourceTextMap,
+          sourceLangKey,
+          targetLangKey,
+          restoreStrategy: body.restoreStrategy,
+          maskStyle: body.maskStyle,
         });
 
         textsMasked.push(masked);
-      }
 
-      // Fill masksById with anchor/restore after ids are allocated
-      for (const [anchor, id] of termToMaskId.entries()) {
-        if (masksById.get(id)) continue;
-        const { restore, rowIndex } = computeRestore(anchor);
-        masksById.set(id, { id, anchor, restore, glossaryRowIndex: rowIndex || undefined });
-      }
-
-      // Count matched terms approximately: masks used in output lines
-      const tokenRe = /\{mask:(\d+)\}/g;
-      const usedIds = new Set();
-      for (const t of textsMasked) {
-        let m;
-        while ((m = tokenRe.exec(String(t))) != null) {
-          usedIds.add(Number(m[1]));
+        // includeMap=false 기본 (대용량 안전)
+        if (body.includeMap) {
+          mapByIndex.push({
+            index: i,
+            masks: masks.map(({ token, source, restore }) => ({ token, source, restore })),
+          });
         }
       }
-      matchedTermsTotal = usedIds.size;
 
-      const masks = Array.from(masksById.values())
-        .filter(Boolean)
-        .sort((a, b) => a.id - b.id);
-
-      toJson(res, 200, {
+      return res.status(200).json({
         ok: true,
-        sheet: operatingSheet,
-        glossarySheet,
-        category:
-          v.category && String(v.category).trim()
-            ? String(v.category).trim().toLowerCase()
-            : "ALL",
-        sourceLang: sourceLangKey === "en-us" ? "en-US" : "ko-KR",
-        targetLang: v.targetLang,
-        maskStyle: v.maskStyle,
-        restoreStrategy: v.restoreStrategy,
+        sourceLang: body.sourceLang,
+        targetLang: body.targetLang,
         textsMasked,
-        masks,
-        meta: {
-          glossaryLoadedAt: cache.loadedAt,
-          rawRowCount: cache.rawRowCount,
-          categoriesUsedCount: categories.length,
-          uniqueTermsInIndex: anchors.length,
-          matchedMaskIds: matchedTermsTotal,
-        },
+        maps: body.includeMap ? mapByIndex : undefined,
+        meta: { lines: body.texts.length },
       });
     } catch (e) {
-      handleErr(res, e);
+      return res.status(e?.status ?? 500).json({ ok: false, error: e?.message });
     }
   });
 
   /**
-   * updateGlossary
+   * ✅ POST /v1/translate/mask/fromSheet
+   * - 1) Trans 시트에서 sourceLang 컬럼 텍스트를 읽고
+   * - 2) glossary 기반 마스킹 수행
+   * - 3) 결과만 반환 (WRITE 없음)
+   */
+  app.post("/v1/translate/mask/fromSheet", async (req, res) => {
+    try {
+      const body = MaskFromSheetSchema.parse(req.body ?? {});
+
+      const sheet = body.sheet;
+      const sourceLangRaw = body.sourceHeader ?? body.sourceLang;
+      const targetLangRaw = body.targetLang;
+      const maskingHeader = body.maskingHeader ?? buildMaskingHeader(targetLangRaw);
+
+      const sourceLangKey = normalizeLang(body.sourceLang);
+      const targetLangKey = normalizeLang(body.targetLang);
+      assertAllowedSourceLang(sourceLangKey);
+
+      const categoryKey = body.category ? String(body.category).trim().toLowerCase() : null;
+
+      // Trans sheet read A:Z
+      const { header, rows } = await readSheetRange(`${sheet}!A:Z`);
+      if (!header.length) return res.status(400).json({ ok: false, error: "sheet header is empty." });
+
+      const idxSource = findColumnIndexByHeader(header, sourceLangRaw);
+      if (idxSource < 0) {
+        return res.status(400).json({
+          ok: false,
+          error: `source column not found in header: '${sourceLangRaw}'`,
+        });
+      }
+
+      const idxMasking = findColumnIndexByHeader(header, maskingHeader);
+      if (body.onlyIfMaskingEmpty && idxMasking < 0) {
+        return res.status(400).json({
+          ok: false,
+          error: `masking column not found in header: '${maskingHeader}'`,
+        });
+      }
+
+      // glossary index once
+      const cache = await ensureGlossaryLoaded({ forceReload: false });
+      const { sourceTextMap, terms } = buildGlossaryTermList({
+        cache,
+        sourceLangKey,
+        categoryKey,
+      });
+
+      const items = [];
+      let nextCursor = body.cursor;
+
+      for (let r = 0; r < rows.length; r++) {
+        const rowIndex = r + 2; // header=1, data starts at 2
+        if (rowIndex <= body.cursor) continue;
+
+        const row = rows[r] || [];
+        const src = String(row[idxSource] ?? "").trim();
+        if (!src) continue;
+
+        if (body.onlyIfMaskingEmpty) {
+          const existingMask = String((row[idxMasking] ?? "")).trim();
+          if (existingMask) continue;
+        }
+
+        const { masked } = maskOneText({
+          text: src,
+          terms,
+          sourceTextMap,
+          sourceLangKey,
+          targetLangKey,
+          restoreStrategy: "glossaryTarget",
+          maskStyle: "braces",
+        });
+
+        items.push({ rowIndex, sourceText: src, maskedText: masked });
+        nextCursor = rowIndex;
+
+        if (items.length >= body.limit) break;
+      }
+
+      return res.status(200).json({
+        ok: true,
+        sheet,
+        sourceLang: body.sourceLang,
+        targetLang: body.targetLang,
+        sourceHeader: sourceLangRaw,
+        maskingHeader,
+        items,
+        nextCursor,
+        meta: { returned: items.length },
+      });
+    } catch (e) {
+      return res.status(e?.status ?? 500).json({ ok: false, error: e?.message });
+    }
+  });
+
+  /**
+   * ✅ POST /v1/translate/mask/apply
+   * - 검수한 maskedText를 <targetLang>-Masking 컬럼에 업로드
+   */
+  app.post("/v1/translate/mask/apply", async (req, res) => {
+    try {
+      const body = MaskApplySchema.parse(req.body ?? {});
+
+      const sheet = body.sheet;
+      const targetLangRaw = body.targetLang;
+      const maskingHeader = body.maskingHeader ?? buildMaskingHeader(targetLangRaw);
+
+      // read header to resolve masking col
+      const { header, rows } = await readSheetRange(`${sheet}!A:Z`);
+      if (!header.length) return res.status(400).json({ ok: false, error: "sheet header is empty." });
+
+      const idxMasking = findColumnIndexByHeader(header, maskingHeader);
+      if (idxMasking < 0) {
+        return res.status(400).json({
+          ok: false,
+          error: `masking column not found in header: '${maskingHeader}'`,
+        });
+      }
+
+      const updates = [];
+      let intended = 0;
+      let skippedFilled = 0;
+      let skippedInvalid = 0;
+
+      for (const it of body.entries) {
+        const rowIndex = it.rowIndex;
+        const maskedText = String(it.maskedText ?? "").trim();
+        if (!maskedText) {
+          skippedInvalid += 1;
+          continue;
+        }
+
+        if (body.fillOnlyEmpty) {
+          const dataRowIdx = rowIndex - 2;
+          const existing = String((rows[dataRowIdx] || [])[idxMasking] ?? "").trim();
+          if (existing) {
+            skippedFilled += 1;
+            continue;
+          }
+        }
+
+        const a1 = `${sheet}!${colIndexToA1(idxMasking)}${rowIndex}`;
+        updates.push({ range: a1, values: [[maskedText]] });
+        intended += 1;
+      }
+
+      const { updatedCells, updatedRanges } = await batchUpdateValuesA1(updates);
+
+      return res.status(200).json({
+        ok: true,
+        sheet,
+        targetLang: targetLangRaw,
+        maskingHeader,
+        writePlan: {
+          intendedUpdates: intended,
+          skippedBecauseFilled: skippedFilled,
+          skippedInvalid,
+        },
+        result: {
+          updatedCells,
+          updatedRangesCount: updatedRanges.length,
+        },
+      });
+    } catch (e) {
+      return res.status(e?.status ?? 500).json({ ok: false, error: e?.message });
+    }
+  });
+
+  /**
    * POST /v1/glossary/update
    */
   app.post("/v1/glossary/update", async (req, res) => {
     try {
-      const body = getParsedBody(req);
-      const v = UpdateSchema.parse(body);
+      UpdateSchema.parse(req.body ?? {});
+      const cache = await ensureGlossaryLoaded({ forceReload: true });
 
-      const sheet = pickSheet(v);
-      const cache = await ensureGlossaryLoaded({ sheetName: sheet, forceReload: true });
-
-      toJson(res, 200, {
+      return res.status(200).json({
         ok: true,
-        sheet: cache.sheetName,
-        glossaryLoadedAt: cache.loadedAt,
-        rawRowCount: cache.rawRowCount,
-        categoriesCount: cache.byCategoryBySource.size,
+        glossaryLoadedAt: cache.loadedAt ?? null,
+        rawRowCount: cache.rawRowCount ?? null,
       });
     } catch (e) {
-      handleErr(res, e);
+      return res.status(e?.status ?? 500).json({ ok: false, error: e?.message });
     }
   });
 
   /**
-   * glossaryPendingNext
+   * POST /v1/rules/update
+   */
+  app.post("/v1/rules/update", async (_req, res) => {
+    try {
+      const rules = await ensureRulesLoaded({ forceReload: true });
+      return res.status(200).json({
+        ok: true,
+        rulesLoadedAt: rules.loadedAt ?? null,
+        rawRowCount: rules.rawRowCount ?? null,
+        itemRulesCount: rules.itemEntries?.length ?? null,
+      });
+    } catch (e) {
+      return res.status(e?.status ?? 500).json({ ok: false, error: e?.message });
+    }
+  });
+
+  /**
+   * POST /v1/glossary/candidates/batch
+   */
+  app.post("/v1/glossary/candidates/batch", async (req, res) => {
+    try {
+      const body = CandidatesBatchSchema.parse(req.body ?? {});
+      const out = await runCandidatesBatch(body);
+      return res.status(200).json(out);
+    } catch (e) {
+      return res.status(e?.status ?? 500).json({ ok: false, error: e?.message });
+    }
+  });
+
+  /**
    * POST /v1/glossary/pending/next
+   * - (주의) 현재 구현은 glossary cache 기반이며 sheet별 cache까지 완전 멀티시트 SSOT는 다음 단계에서 맞추는 게 안전함
    */
   app.post("/v1/glossary/pending/next", async (req, res) => {
     try {
-      const body = getParsedBody(req);
-      const v = PendingNextSchema.parse(body);
+      const body = PendingNextSchema.parse(req.body ?? {});
+      const sourceLangKey = normalizeLang(body.sourceLang);
 
-      const sheet = pickSheet(v);
-      const cache = await ensureGlossaryLoaded({
-        sheetName: sheet,
-        forceReload: Boolean(v.forceReload),
-      });
-
-      const sourceLangKey = normalizeLang(v.sourceLang);
-      if (sourceLangKey !== "en-us" && sourceLangKey !== "ko-kr") {
-        throw httpError(400, "pending/next sourceLang must be en-US or ko-KR.");
-      }
-
-      const targetLangKeys = (v.targetLangs || []).map(normalizeLang).filter(Boolean);
-      if (!targetLangKeys.length)
-        throw httpError(400, "targetLangs must have at least 1 language.");
-
-      for (const lk of targetLangKeys) {
-        if (cache.langIndex[lk] == null) {
-          throw httpError(400, `Sheet '${sheet}' does not include target language column: ${lk}`);
-        }
-      }
-
-      const srcCol = cache.langIndex[sourceLangKey];
-      if (srcCol == null) {
-        throw httpError(
-          400,
-          `Sheet '${sheet}' does not include source language column: ${sourceLangKey}`
-        );
-      }
-
-      const limit = Number(v.limit || 100);
-      const out = [];
-
-      for (let i = 0; i < cache.rawRows.length; i++) {
-        const row = cache.rawRows[i];
-        const rowIndex = i + 2;
-
-        const srcText = String(row[srcCol] ?? "").trim();
-        if (!srcText) continue;
-
-        if (v.category && String(v.category).trim()) {
-          const catKey = String(v.category).trim().toLowerCase();
-          const e = cache.entries[i];
-          const eCat = String(e?.category ?? "").trim().toLowerCase();
-          if (eCat !== catKey) continue;
-        }
-
-        let isPending = false;
-        const missing = [];
-
-        for (const lk of targetLangKeys) {
-          const col = cache.langIndex[lk];
-          const cur = String(row[col] ?? "").trim();
-          if (!cur) {
-            isPending = true;
-            missing.push(lk);
-          }
-        }
-
-        if (!isPending) continue;
-
-        out.push({ rowIndex, sourceText: srcText, missingLangs: missing });
-        if (out.length >= limit) break;
-      }
-
-      toJson(res, 200, {
-        ok: true,
-        sheet: cache.sheetName,
-        sourceLang: sourceLangKey === "en-us" ? "en-US" : "ko-KR",
-        targetLangs: v.targetLangs,
-        limit,
-        count: out.length,
-        items: out,
-        meta: {
-          glossaryLoadedAt: cache.loadedAt,
-          rawRowCount: cache.rawRowCount,
-        },
-      });
-    } catch (e) {
-      handleErr(res, e);
-    }
-  });
-
-  /**
-   * glossaryQaNext (read-only)
-   * POST /v1/glossary/qa/next
-   */
-  app.post("/v1/glossary/qa/next", async (req, res) => {
-    try {
-      const body = getParsedBody(req);
-      const v = GlossaryQaNextSchema.parse(body);
-
-      const sheet = pickSheet(v);
-
-      const cache = await ensureGlossaryLoaded({
-        sheetName: sheet,
-        forceReload: Boolean(v.forceReload),
-      });
-
-      const sourceLangKey = normalizeLang(v.sourceLang);
-      if (sourceLangKey !== "en-us" && sourceLangKey !== "ko-kr") {
-        throw httpError(400, "qa/next sourceLang must be en-US or ko-KR.");
-      }
-
-      const targetLangKey = normalizeLang(v.targetLang);
-      if (!targetLangKey) throw httpError(400, "qa/next targetLang is required.");
-
-      const srcCol = cache.langIndex[sourceLangKey];
-      if (srcCol == null) {
-        throw httpError(
-          400,
-          `Sheet '${sheet}' does not include source language column: ${sourceLangKey}`
-        );
-      }
-
-      const tgtCol = cache.langIndex[targetLangKey];
-      if (tgtCol == null) {
-        throw httpError(
-          400,
-          `Sheet '${sheet}' does not include target language column: ${targetLangKey}`
-        );
-      }
+      const cache = await ensureGlossaryLoaded({ forceReload: Boolean(body.forceReload) });
 
       const categoryKey =
-        v.category && String(v.category).trim()
-          ? String(v.category).trim().toLowerCase()
+        body.category && String(body.category).trim()
+          ? String(body.category).trim().toLowerCase()
           : null;
 
-      const limit = Number(v.limit || 100);
+      const targetLangKeys = Array.from(new Set((body.targetLangs || []).map(normalizeLang).filter(Boolean)));
 
-      let start = 0;
-      if (v.cursor && String(v.cursor).trim()) {
-        const n = Number(String(v.cursor).trim());
-        if (!Number.isFinite(n) || n < 0) {
-          throw httpError(400, "cursor must be a non-negative integer string.");
-        }
-        start = Math.floor(n);
+      if (targetLangKeys.length === 0) {
+        return res.status(400).json({ ok: false, error: "targetLangs is required." });
+      }
+
+      const validTargetLangKeys = targetLangKeys.filter((k) => cache.langIndex?.[k] != null);
+      if (validTargetLangKeys.length === 0) {
+        return res.status(400).json({
+          ok: false,
+          error: "None of targetLangs exist in sheet header (langIndex).",
+        });
       }
 
       const items = [];
-      let i = start;
+      let scanned = 0;
 
-      for (; i < cache.entries.length; i++) {
-        const entry = cache.entries[i];
-        const row = cache.rawRows[i] || [];
-        const rowIndex = i + 2;
+      for (const entry of cache.entries || []) {
+        scanned++;
 
         if (categoryKey) {
-          const eCat = String(entry?.category ?? "").trim().toLowerCase();
+          const eCat = String(entry.category ?? "").trim().toLowerCase();
           if (eCat !== categoryKey) continue;
         }
 
-        const sourceText = String(row[srcCol] ?? "").trim();
-        if (!sourceText) continue;
+        const src = String(entry.translations?.[sourceLangKey] ?? "").trim();
+        if (!src) continue;
 
-        const targetText = String(row[tgtCol] ?? "").trim();
-        if (!targetText) continue;
-
-        items.push({ rowIndex, sourceText, targetText });
-
-        if (items.length >= limit) {
-          i += 1;
-          break;
+        let needs = false;
+        for (const tKey of validTargetLangKeys) {
+          const tv = String(entry.translations?.[tKey] ?? "").trim();
+          if (!tv) {
+            needs = true;
+            break;
+          }
         }
+        if (!needs) continue;
+
+        items.push({
+          sourceText: src,
+          category: entry.category ?? null,
+          rowIndex: entry._rowIndex ?? null,
+        });
+
+        if (items.length >= body.limit) break;
       }
 
-      const cursorNext = i < cache.entries.length ? String(i) : null;
-
-      toJson(res, 200, {
+      return res.status(200).json({
         ok: true,
-        sheet: cache.sheetName,
-        category: categoryKey || "ALL",
-        sourceLang: sourceLangKey === "en-us" ? "en-US" : "ko-KR",
-        targetLang: v.targetLang,
-        limit,
-        count: items.length,
-        cursor: String(start),
-        cursorNext,
+        sheet: body.sheet ?? "Glossary",
+        category: categoryKey ?? "ALL",
+        sourceLang: body.sourceLang,
+        targetLangs: validTargetLangKeys,
         items,
-        meta: {
-          glossaryLoadedAt: cache.loadedAt,
-          rawRowCount: cache.rawRowCount,
-        },
+        meta: { returned: items.length, scanned },
       });
     } catch (e) {
-      handleErr(res, e);
+      return res.status(e?.status ?? 500).json({ ok: false, error: e?.message });
     }
   });
 
   /**
-   * glossaryApply
    * POST /v1/glossary/apply
    */
   app.post("/v1/glossary/apply", async (req, res) => {
     try {
-      const body = getParsedBody(req);
-      const v = ApplySchema.parse(body);
+      const body = ApplySchema.parse(req.body ?? {});
+      const sourceLangKey = normalizeLang(body.sourceLang);
 
-      const sheet = pickSheet(v);
-      const cache = await ensureGlossaryLoaded({ sheetName: sheet, forceReload: false });
+      const cache = await ensureGlossaryLoaded({ forceReload: true });
 
-      const sourceLangKey = normalizeLang(v.sourceLang);
-      if (sourceLangKey !== "en-us" && sourceLangKey !== "ko-kr") {
-        throw httpError(400, "apply sourceLang must be en-US or ko-KR.");
-      }
+      const categoryKey =
+        body.category && String(body.category).trim()
+          ? String(body.category).trim().toLowerCase()
+          : null;
 
-      const srcCol = cache.langIndex[sourceLangKey];
-      if (srcCol == null) {
-        throw httpError(
-          400,
-          `Sheet '${sheet}' does not include source language column: ${sourceLangKey}`
-        );
-      }
-
-      let categories = null;
-      let categoryKey = null;
-      if (v.category && String(v.category).trim()) {
-        categoryKey = String(v.category).trim().toLowerCase();
-        if (!cache.byCategoryBySource.has(categoryKey)) {
-          throw httpError(400, `Category not found: ${v.category}`, { sheet });
-        }
-        categories = [categoryKey];
-      } else {
-        categories = Array.from(cache.byCategoryBySource.keys());
-      }
-
+      const categories = categoryKey ? [categoryKey] : Array.from(cache.byCategoryBySource.keys());
       const sourceTextMap = mergeSourceTextMapsFromCache(cache, sourceLangKey, categories);
 
-      const fillOnlyEmpty = Boolean(v.fillOnlyEmpty);
-      const allowAnchorUpdate = Boolean(v.allowAnchorUpdate);
-
       const updates = [];
-      const results = [];
+      let updatedPlanned = 0;
+      const skipped = [];
+      const notFound = [];
 
-      for (const entry of v.entries) {
-        const sourceText = String(entry?.sourceText ?? "").trim();
-        if (!sourceText) {
-          results.push({ sourceText: "", status: "skipped", reason: "empty sourceText" });
+      for (const item of body.entries) {
+        const sourceText = String(item.sourceText ?? "").trim();
+        const matches = sourceTextMap.get(sourceText);
+
+        if (!matches || matches.length === 0) {
+          notFound.push({ sourceText });
           continue;
         }
 
-        const hasRowIndex = entry?.rowIndex != null && Number.isFinite(Number(entry.rowIndex));
-        let chosen = null;
+        // 동일 sourceText 중 가장 위 row를 사용
+        const entry = matches.reduce((min, e) => (!min || e._rowIndex < min._rowIndex ? e : min), null);
 
-        if (hasRowIndex) {
-          const rowIndex = Number(entry.rowIndex);
+        for (const [langRaw, valRaw] of Object.entries(item.translations || {})) {
+          const langKey = normalizeLang(langRaw);
+          if (!langKey) continue;
 
-          if (rowIndex < 2 || rowIndex > cache.rawRows.length + 1) {
-            results.push({
-              sourceText,
-              status: "skipped",
-              reason: `rowIndex_out_of_range(${rowIndex})`,
-            });
+          if (langKey === "en-us" && !body.allowAnchorUpdate) {
+            skipped.push({ sourceText, lang: langKey, reason: "anchor_update_blocked" });
             continue;
           }
 
-          const rowArrIdx = rowIndex - 2;
-          const chosenEntry = cache.entries[rowArrIdx];
-          const rawRow = cache.rawRows[rowArrIdx] || [];
-
-          if (categoryKey) {
-            const eCat = String(chosenEntry?.category ?? "").trim().toLowerCase();
-            if (eCat !== categoryKey) {
-              results.push({
-                sourceText,
-                status: "skipped",
-                reason: `row_category_mismatch(${rowIndex})`,
-              });
-              continue;
-            }
-          }
-
-          const actualSrc = String(rawRow[srcCol] ?? "").trim();
-          if (actualSrc !== sourceText) {
-            results.push({
-              sourceText,
-              status: "skipped",
-              reason: `row_source_mismatch(rowIndex=${rowIndex})`,
-            });
-            continue;
-          }
-
-          chosen = { _rowIndex: rowIndex, key: chosenEntry?.key };
-        } else {
-          const hits = sourceTextMap.get(sourceText) || [];
-          if (!hits.length) {
-            results.push({ sourceText, status: "skipped", reason: "not_found" });
-            continue;
-          }
-
-          chosen = hits[0];
-          for (const h of hits) {
-            if (Number(h?._rowIndex) < Number(chosen?._rowIndex)) chosen = h;
-          }
-        }
-
-        const rowIndex = Number(chosen._rowIndex);
-        const rawRow = cache.rawRows[rowIndex - 2] || [];
-
-        let updated = 0;
-        let skipped = 0;
-        const conflicts = [];
-
-        for (const [rawLang, rawVal] of Object.entries(entry.translations || {})) {
-          const langKey = normalizeLang(rawLang);
-          const val = String(rawVal ?? "").trim();
-          if (!langKey || !val) continue;
-
-          if (langKey === "en-us" && !allowAnchorUpdate) {
-            skipped += 1;
-            continue;
-          }
-
-          const colIdx = cache.langIndex[langKey];
+          const colIdx = cache.langIndex?.[langKey];
           if (colIdx == null) {
-            skipped += 1;
-            conflicts.push({ lang: langKey, reason: "missing_column" });
+            skipped.push({ sourceText, lang: langKey, reason: "lang_column_not_found" });
             continue;
           }
 
-          const cur = String(rawRow[colIdx] ?? "").trim();
-          if (fillOnlyEmpty && cur) {
-            skipped += 1;
+          const existing = String(entry.translations?.[langKey] ?? "").trim();
+          if (body.fillOnlyEmpty && existing) {
+            skipped.push({ sourceText, lang: langKey, reason: "cell_already_has_value" });
             continue;
           }
 
-          const cellA1 = `${sheet}!${colIndexToA1(colIdx)}${rowIndex}`;
-          updates.push({ range: cellA1, values: [[val]] });
-          updated += 1;
+          const val = String(valRaw ?? "").trim();
+          if (!val) {
+            skipped.push({ sourceText, lang: langKey, reason: "empty_translation_value" });
+            continue;
+          }
+
+          const a1 = `${SHEET_NAME}!${colIndexToA1(colIdx)}${entry._rowIndex}`;
+          updates.push({ range: a1, values: [[val]] });
+          updatedPlanned += 1;
         }
-
-        let status = "no_op";
-        if (updated > 0 && skipped > 0) status = "partial_success";
-        else if (updated > 0) status = "success";
-
-        results.push({
-          sourceText,
-          chosen: { rowIndex, key: chosen.key || undefined },
-          updatedCellsPlanned: updated,
-          skippedCells: skipped,
-          conflicts,
-          status,
-        });
       }
 
-      const writeRes = await batchUpdateValuesA1(updates);
+      const { updatedCells } = await batchUpdateValuesA1(updates);
 
-      toJson(res, 200, {
+      return res.status(200).json({
         ok: true,
-        sheet,
-        fillOnlyEmpty,
-        allowAnchorUpdate,
-        plannedUpdates: updates.length,
-        updatedCells: writeRes.updatedCells,
-        updatedRanges: writeRes.updatedRanges,
-        results,
+        status: updatedCells > 0 ? "success" : "no_op",
+        sheet: body.sheet ?? "Glossary",
+        category: categoryKey ?? "ALL",
+        sourceLang: body.sourceLang,
+        fillOnlyEmpty: Boolean(body.fillOnlyEmpty),
+        allowAnchorUpdate: Boolean(body.allowAnchorUpdate),
+        writePlan: { intendedUpdates: updatedPlanned },
+        result: { updatedCells },
+        notFound,
+        skipped,
       });
     } catch (e) {
-      handleErr(res, e);
+      return res.status(e?.status ?? 500).json({ ok: false, error: e?.message });
     }
   });
 }
