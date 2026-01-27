@@ -5,8 +5,14 @@
 
 import { z } from "zod";
 
+/**
+ * 공통: 멀티 시트 지원을 위해 모든 endpoint schema에 sheet를 optional로 받는다.
+ * (Zod 기본 동작상 정의되지 않은 키는 strip되므로, sheet를 스키마에 넣지 않으면 서버에서 항상 Glossary로 fallback됨)
+ */
+
 // ---------------- REST Schemas ----------------
 export const InitSchema = z.object({
+  sheet: z.string().optional(), // ✅ FIX: allow sheet
   category: z.string().min(1),
   sourceLang: z.string().min(1),
   targetLang: z.string().min(1),
@@ -14,6 +20,7 @@ export const InitSchema = z.object({
 
 export const ReplaceSchema = z
   .object({
+    sheet: z.string().optional(), // ✅ FIX: allow sheet
     sessionId: z.string().min(1).optional(),
     category: z.string().optional(),
     sourceLang: z.string().min(1).optional(),
@@ -32,10 +39,12 @@ export const ReplaceSchema = z
   );
 
 export const UpdateSchema = z.object({
+  sheet: z.string().optional(), // ✅ FIX: allow sheet
   sessionId: z.string().min(1).optional(),
 });
 
 export const SuggestSchema = z.object({
+  sheet: z.string().optional(), // (향후 확장 대비, 사용 안 해도 무방)
   category: z.string().min(1),
   terms: z.array(z.string()).min(1).max(200),
   anchorLang: z.string().optional().default("en-US"),
@@ -47,6 +56,7 @@ export const SuggestSchema = z.object({
 });
 
 export const CandidatesSchema = z.object({
+  sheet: z.string().optional(), // (향후 확장 대비)
   category: z.string().min(1),
   sourceText: z.string().min(1),
   sourceLang: z.string().optional().default("en-US"),
@@ -55,6 +65,7 @@ export const CandidatesSchema = z.object({
 });
 
 export const CandidatesBatchSchema = z.object({
+  sheet: z.string().optional(), // (향후 확장 대비)
   category: z.string().optional(),
   sourceLang: z.enum(["en-US", "ko-KR"]).optional().default("en-US"),
   sourceTexts: z.array(z.string().min(1)).min(1).max(500),
@@ -65,6 +76,7 @@ export const CandidatesBatchSchema = z.object({
 });
 
 export const ApplySchema = z.object({
+  sheet: z.string().optional(), // ✅ FIX: allow sheet (Trans sheets에도 apply 가능)
   category: z.string().optional(),
   sourceLang: z.enum(["en-US", "ko-KR"]).optional().default("en-US"),
   entries: z
@@ -83,6 +95,7 @@ export const ApplySchema = z.object({
 });
 
 export const PendingNextSchema = z.object({
+  sheet: z.string().optional(), // ✅ FIX: 핵심 (Trans6 조회 문제 해결)
   category: z.string().optional(),
   sourceLang: z.enum(["en-US", "ko-KR"]).optional().default("en-US"),
   targetLangs: z.array(z.string().min(1)).min(1).max(20),
@@ -101,24 +114,20 @@ export const GlossaryQaNextSchema = z.object({
   forceReload: z.boolean().optional().default(false),
 });
 
-// ✅ NEW: mask endpoint schema (read-only/processing)
+// ✅ mask endpoint schema (read-only/processing)
 export const MaskSchema = z.object({
-  sheet: z.string().optional(), // where caller is operating (Trans5 etc); used only for reporting
+  sheet: z.string().optional(), // operating sheet (Trans5/Trans6 etc)
   glossarySheet: z.string().optional().default("Glossary"),
 
-  category: z.string().optional(), // optional filter; omit => ALL
+  category: z.string().optional(),
   sourceLang: z.enum(["en-US", "ko-KR"]).optional().default("en-US"),
-  targetLang: z.string().min(1), // e.g. "id-ID"
+  targetLang: z.string().min(1),
 
   texts: z.array(z.string()).min(1).max(500),
 
-  // token style
-  maskStyle: z.enum(["braces"]).optional().default("braces"), // {mask:N}
-
-  // restoreStrategy A (recommended): glossaryTarget
+  maskStyle: z.enum(["braces"]).optional().default("braces"),
   restoreStrategy: z.enum(["glossaryTarget", "anchor"]).optional().default("glossaryTarget"),
 
-  // matching policy
   caseSensitive: z.boolean().optional().default(true),
   wordBoundary: z.boolean().optional().default(true),
 
