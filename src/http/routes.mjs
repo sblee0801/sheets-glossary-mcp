@@ -8,6 +8,12 @@
  *    - Force reload cache after WRITE
  * 2) Support client-provided pending skip list:
  *    - PendingNextSchema.excludeRowIndexes
+ *
+ * 3) ✅ FIX (this change):
+ *    - Defensive body normalization for connector/custom GPT calls:
+ *      category may be omitted (undefined) even if client UI shows "".
+ *      If schema expects string, Zod throws "expected string, received undefined".
+ *      => Normalize category to "" BEFORE schema.parse for relevant endpoints.
  */
 
 import {
@@ -129,6 +135,31 @@ function makeToken(style, id) {
 }
 
 /**
+ * ✅ connector/custom GPT 방어용 body 정규화
+ * - category 누락(undefined) => "" 로 강제
+ * - sheet/glossarySheet 도 종종 누락되므로 기본값 보정
+ * - texts가 단일 문자열로 오는 경우 방어 (스키마가 array를 기대한다면 여기서 배열로 보정)
+ */
+function normalizeBodyForConnector(body, { ensureTextsArray = false } = {}) {
+  const b = body && typeof body === "object" ? body : {};
+
+  // 가장 많이 터지는 지점: category
+  if (b.category === undefined || b.category === null) b.category = "";
+
+  // sheet/glossarySheet 기본값
+  if (b.sheet === undefined || b.sheet === null) b.sheet = "Glossary";
+  if (b.glossarySheet === undefined || b.glossarySheet === null) b.glossarySheet = "Glossary";
+
+  // 일부 커넥터가 texts 단일 string을 보내는 경우 방어
+  if (ensureTextsArray) {
+    if (typeof b.texts === "string") b.texts = [b.texts];
+    if (b.texts == null) b.texts = [];
+  }
+
+  return b;
+}
+
+/**
  * Build deterministic masks:
  * ✅ FIX: 실제로 "매칭되는 term"에 대해서만 maskId를 할당한다.
  */
@@ -190,7 +221,8 @@ export function registerRoutes(app) {
    */
   app.post("/v1/session/init", async (req, res) => {
     try {
-      const body = getParsedBody(req);
+      const raw = getParsedBody(req);
+      const body = normalizeBodyForConnector(raw);
       const v = InitSchema.parse(body);
 
       const sheet = pickSheet(v);
@@ -240,7 +272,8 @@ export function registerRoutes(app) {
    */
   app.post("/v1/translate/replace", async (req, res) => {
     try {
-      const body = getParsedBody(req);
+      const raw = getParsedBody(req);
+      const body = normalizeBodyForConnector(raw, { ensureTextsArray: true });
       const v = ReplaceSchema.parse(body);
 
       const sheet = pickSheet(v);
@@ -361,7 +394,11 @@ export function registerRoutes(app) {
    */
   app.post("/v1/translate/mask", async (req, res) => {
     try {
-      const body = getParsedBody(req);
+      const raw = getParsedBody(req);
+
+      // ✅ 여기서 category 누락(undefined) 방어가 가장 중요 (현재 커넥터 이슈의 직접 원인)
+      const body = normalizeBodyForConnector(raw, { ensureTextsArray: true });
+
       const v = MaskSchema.parse(body);
 
       const operatingSheet = pickSheet(v); // 보고용
@@ -516,7 +553,8 @@ export function registerRoutes(app) {
    */
   app.post("/v1/translate/mask/apply", async (req, res) => {
     try {
-      const body = getParsedBody(req);
+      const raw = getParsedBody(req);
+      const body = normalizeBodyForConnector(raw);
       const v = MaskApplySchema.parse(body);
 
       const sheet = String(v.sheet).trim();
@@ -583,7 +621,8 @@ export function registerRoutes(app) {
    */
   app.post("/v1/glossary/update", async (req, res) => {
     try {
-      const body = getParsedBody(req);
+      const raw = getParsedBody(req);
+      const body = normalizeBodyForConnector(raw);
       const v = UpdateSchema.parse(body);
 
       const sheet = pickSheet(v);
@@ -607,7 +646,8 @@ export function registerRoutes(app) {
    */
   app.post("/v1/glossary/pending/next", async (req, res) => {
     try {
-      const body = getParsedBody(req);
+      const raw = getParsedBody(req);
+      const body = normalizeBodyForConnector(raw);
       const v = PendingNextSchema.parse(body);
 
       const sheet = pickSheet(v);
@@ -715,7 +755,8 @@ export function registerRoutes(app) {
    */
   app.post("/v1/glossary/qa/next", async (req, res) => {
     try {
-      const body = getParsedBody(req);
+      const raw = getParsedBody(req);
+      const body = normalizeBodyForConnector(raw);
       const v = GlossaryQaNextSchema.parse(body);
 
       const sheet = pickSheet(v);
@@ -821,7 +862,8 @@ export function registerRoutes(app) {
    */
   app.post("/v1/glossary/apply", async (req, res) => {
     try {
-      const body = getParsedBody(req);
+      const raw = getParsedBody(req);
+      const body = normalizeBodyForConnector(raw);
       const v = ApplySchema.parse(body);
 
       const sheet = pickSheet(v);
