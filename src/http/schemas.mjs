@@ -1,18 +1,34 @@
 /**
  * src/http/schemas.mjs
- * - REST 공용 Zod Schemas 모음
+ * - REST Zod Schemas
+ * - FIX:
+ *   1) Allow category=null coming from CustomGPT (normalize to undefined)
+ *   2) Add excludeRowIndexes to pending/next to support client-side skip + dedupe
  */
 
 import { z } from "zod";
 
 /**
- * 공통: 멀티 시트 지원을 위해 모든 endpoint schema에 sheet를 optional로 받는다.
- * (Zod 기본 동작상 정의되지 않은 키는 strip되므로, sheet를 스키마에 넣지 않으면 서버에서 항상 Glossary로 fallback됨)
+ * Helpers
+ * - CustomGPT Actions sometimes send null for optional strings.
+ * - Normalize: null/undefined/"" -> undefined, and trim strings.
  */
+const OptTrimmedStr = z
+  .preprocess((v) => {
+    if (v == null) return undefined;
+    if (typeof v === "string") {
+      const s = v.trim();
+      return s ? s : undefined;
+    }
+    return v;
+  }, z.string().min(1))
+  .optional();
+
+const SheetOpt = OptTrimmedStr; // defaulting happens in routes via pickSheet()
 
 // ---------------- REST Schemas ----------------
 export const InitSchema = z.object({
-  sheet: z.string().optional(),
+  sheet: SheetOpt, // ✅ allow sheet
   category: z.string().min(1),
   sourceLang: z.string().min(1),
   targetLang: z.string().min(1),
@@ -20,11 +36,11 @@ export const InitSchema = z.object({
 
 export const ReplaceSchema = z
   .object({
-    sheet: z.string().optional(),
-    sessionId: z.string().min(1).optional(),
-    category: z.string().optional(),
-    sourceLang: z.string().min(1).optional(),
-    targetLang: z.string().min(1).optional(),
+    sheet: SheetOpt, // ✅ allow sheet
+    sessionId: OptTrimmedStr,
+    category: OptTrimmedStr, // ✅ allow null/"" safely
+    sourceLang: OptTrimmedStr,
+    targetLang: OptTrimmedStr,
     texts: z.array(z.string()).min(1),
     includeLogs: z.boolean().optional(),
     limit: z.number().int().min(1).max(200).optional(),
@@ -39,15 +55,15 @@ export const ReplaceSchema = z
   );
 
 export const UpdateSchema = z.object({
-  sheet: z.string().optional(),
-  sessionId: z.string().min(1).optional(),
+  sheet: SheetOpt, // ✅ allow sheet
+  sessionId: OptTrimmedStr,
 });
 
 export const SuggestSchema = z.object({
-  sheet: z.string().optional(),
+  sheet: SheetOpt,
   category: z.string().min(1),
   terms: z.array(z.string()).min(1).max(200),
-  anchorLang: z.string().optional().default("en-US"),
+  anchorLang: OptTrimmedStr.default("en-US"),
   targetLangs: z.array(z.string()).min(1).max(20),
   sources: z.array(z.enum(["iroWikiDb", "rateMyServer", "divinePride"])).optional(),
   includeEvidence: z.boolean().optional().default(true),
@@ -56,17 +72,17 @@ export const SuggestSchema = z.object({
 });
 
 export const CandidatesSchema = z.object({
-  sheet: z.string().optional(),
+  sheet: SheetOpt,
   category: z.string().min(1),
   sourceText: z.string().min(1),
-  sourceLang: z.string().optional().default("en-US"),
+  sourceLang: OptTrimmedStr.default("en-US"),
   targetLangs: z.array(z.string()).min(1).max(20),
   sources: z.array(z.enum(["iroWikiDb", "rateMyServer", "divinePride"])).optional(),
 });
 
 export const CandidatesBatchSchema = z.object({
-  sheet: z.string().optional(),
-  category: z.string().optional(),
+  sheet: SheetOpt,
+  category: OptTrimmedStr, // ✅ allow null/"" safely
   sourceLang: z.enum(["en-US", "ko-KR"]).optional().default("en-US"),
   sourceTexts: z.array(z.string().min(1)).min(1).max(500),
   targetLangs: z.array(z.string().min(1)).min(1).max(20),
@@ -75,17 +91,10 @@ export const CandidatesBatchSchema = z.object({
   includeEvidence: z.boolean().optional().default(true),
 });
 
-/**
- * ✅ ApplySchema 개선
- * - requireRowIndex: rowIndex 없는 업로드를 원천 차단(기본 true)
- * - responseMode: summary 기본(응답 폭주 방지)
- * - maxCellChars: 너무 긴 텍스트 업로드 방지(셀 깨짐/폭주 방지)
- */
 export const ApplySchema = z.object({
-  sheet: z.string().optional(),
-  category: z.string().optional(),
+  sheet: SheetOpt, // ✅ Trans sheet apply 가능
+  category: OptTrimmedStr, // ✅ allow null/"" safely
   sourceLang: z.enum(["en-US", "ko-KR"]).optional().default("en-US"),
-
   entries: z
     .array(
       z.object({
@@ -96,49 +105,46 @@ export const ApplySchema = z.object({
     )
     .min(1)
     .max(500),
-
   fillOnlyEmpty: z.boolean().optional().default(true),
   targetLangs: z.array(z.string().min(1)).optional(),
   allowAnchorUpdate: z.boolean().optional().default(false),
-
-  // ✅ NEW
-  requireRowIndex: z.boolean().optional().default(true),
-  responseMode: z.enum(["summary", "full"]).optional().default("summary"),
-  maxCellChars: z.number().int().min(1000).max(50000).optional().default(45000),
 });
 
 export const PendingNextSchema = z.object({
-  sheet: z.string().optional(),
-  category: z.string().optional(),
+  sheet: SheetOpt, // ✅ 핵심 (Trans6 조회 문제 해결)
+  category: OptTrimmedStr, // ✅ allow null/"" safely
+
   sourceLang: z.enum(["en-US", "ko-KR"]).optional().default("en-US"),
   targetLangs: z.array(z.string().min(1)).min(1).max(20),
+
   limit: z.number().int().min(1).max(500).optional().default(100),
   forceReload: z.boolean().optional().default(false),
+
+  /**
+   * ✅ NEW: excludeRowIndexes
+   * - client can pass rows to skip (e.g., already processed in the current run)
+   * - server may also use its internal recent-applied gate separately
+   */
+  excludeRowIndexes: z.array(z.number().int().min(2)).max(5000).optional(),
 });
 
 // ---------------- QA ----------------
 export const GlossaryQaNextSchema = z.object({
-  sheet: z.string().optional(),
-  category: z.string().optional(),
+  sheet: SheetOpt,
+  category: OptTrimmedStr, // ✅ allow null/"" safely
   sourceLang: z.enum(["en-US", "ko-KR"]).optional().default("en-US"),
   targetLang: z.string().min(1),
   limit: z.number().int().min(1).max(500).optional().default(100),
-  cursor: z.string().optional(),
+  cursor: OptTrimmedStr,
   forceReload: z.boolean().optional().default(false),
 });
 
 // ---------------- Mask (read / processing) ----------------
-/**
- * ✅ MaskSchema 개선
- * - includeMasks: 매핑이 필요 없을 때 응답 절감 가능
- * - maxMasksPerText / maxTotalMasks: 폭주 방지 (기본값은 “충분히 큼”)
- * - returnMode: full/summary (meta 위주로도 가능)
- */
 export const MaskSchema = z.object({
-  sheet: z.string().optional(),
-  glossarySheet: z.string().optional().default("Glossary"),
+  sheet: SheetOpt, // operating sheet (Trans5/Trans6 etc)
+  glossarySheet: OptTrimmedStr.default("Glossary"),
 
-  category: z.string().optional(),
+  category: OptTrimmedStr, // ✅ allow null/"" safely
   sourceLang: z.enum(["en-US", "ko-KR"]).optional().default("en-US"),
   targetLang: z.string().min(1),
 
@@ -151,23 +157,16 @@ export const MaskSchema = z.object({
   wordBoundary: z.boolean().optional().default(true),
 
   forceReload: z.boolean().optional().default(false),
-
-  // ✅ NEW
-  includeMasks: z.boolean().optional().default(true),
-  maxMasksPerText: z.number().int().min(1).max(2000).optional().default(500),
-  maxTotalMasks: z.number().int().min(1).max(5000).optional().default(2000),
-  returnMode: z.enum(["full", "summary"]).optional().default("full"),
 });
 
 // ---------------- Mask Apply (WRITE) ----------------
 /**
  * POST /v1/translate/mask/apply
  * - 마스킹된 결과를 <targetLang>-Masking 컬럼에 업로드
- * - responseMode: summary 기본(응답 폭주 방지)
  */
 export const MaskApplySchema = z.object({
-  sheet: z.string().min(1),
-  targetLang: z.string().min(1),
+  sheet: z.string().min(1), // Trans sheet
+  targetLang: z.string().min(1), // ex) id-ID
   entries: z
     .array(
       z.object({
@@ -177,7 +176,4 @@ export const MaskApplySchema = z.object({
     )
     .min(1)
     .max(2000),
-
-  // ✅ NEW
-  responseMode: z.enum(["summary", "full"]).optional().default("summary"),
 });

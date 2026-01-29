@@ -1,6 +1,13 @@
 /**
  * src/http/routes.mjs
  * - REST endpoints (sheet-aware)
+ *
+ * FIX package:
+ * 1) Prevent duplicate pending rows after WRITE:
+ *    - Server-side recent-applied rowIndex TTL gate (dedupe)
+ *    - Force reload cache after WRITE
+ * 2) Support client-provided pending skip list:
+ *    - PendingNextSchema.excludeRowIndexes
  */
 
 import {
@@ -24,16 +31,70 @@ import {
   ApplySchema,
   GlossaryQaNextSchema,
   MaskSchema,
-  MaskApplySchema,
+  MaskApplySchema, // WRITE
 } from "./schemas.mjs";
 
 // ---------------- In-memory sessions (lightweight) ----------------
 const _sessions = new Map(); // sessionId -> { sheet, category, sourceLangKey, targetLangKey, createdAt }
 
-// ✅ mask index cache (anchors + compiled regex)
-// key: `${glossarySheet}|${loadedAt}|${sourceLangKey}|${categoryKeyOrALL}|cs:${caseSensitive}|wb:${wordBoundary}`
-const _maskIndexCache = new Map(); // key -> { anchors, compiled, createdAt }
+// ---------------- Recent-applied rowIndex gate (NEW) ----------------
+// 목적: WRITE 직후 캐시/시트 반영 지연으로 동일 rowIndex가 pendingNext에 재등장하는 현상 차단
+// 동작: glossaryApply 성공 rowIndex를 sheet별로 TTL 동안 기억하고 pendingNext에서 제외
+const _recentAppliedBySheet = new Map(); // sheet -> Map<rowIndex:number, expiresAtMs:number>
+const RECENT_APPLIED_TTL_MS = Number(process.env.RECENT_APPLIED_TTL_MS ?? 10 * 60 * 1000); // default 10m
 
+function _nowMs() {
+  return Date.now();
+}
+
+function _getSheetKey(sheet) {
+  return String(sheet ?? "Glossary").trim() || "Glossary";
+}
+
+function _pruneRecent(sheetKey) {
+  const m = _recentAppliedBySheet.get(sheetKey);
+  if (!m) return;
+  const now = _nowMs();
+  for (const [rowIndex, exp] of m.entries()) {
+    if (!exp || exp <= now) m.delete(rowIndex);
+  }
+  if (m.size === 0) _recentAppliedBySheet.delete(sheetKey);
+}
+
+function _markRecentApplied(sheetKey, rowIndexes) {
+  if (!RECENT_APPLIED_TTL_MS || RECENT_APPLIED_TTL_MS <= 0) return;
+  const key = _getSheetKey(sheetKey);
+  _pruneRecent(key);
+
+  let m = _recentAppliedBySheet.get(key);
+  if (!m) {
+    m = new Map();
+    _recentAppliedBySheet.set(key, m);
+  }
+
+  const exp = _nowMs() + RECENT_APPLIED_TTL_MS;
+  for (const ri of rowIndexes) {
+    const n = Number(ri);
+    if (!Number.isFinite(n) || n < 2) continue;
+    m.set(n, exp);
+  }
+}
+
+function _isRecentApplied(sheetKey, rowIndex) {
+  const key = _getSheetKey(sheetKey);
+  _pruneRecent(key);
+
+  const m = _recentAppliedBySheet.get(key);
+  if (!m) return false;
+
+  const n = Number(rowIndex);
+  if (!Number.isFinite(n)) return false;
+
+  const exp = m.get(n);
+  return Boolean(exp && exp > _nowMs());
+}
+
+// ---------------- Common helpers ----------------
 function httpError(status, message, extra) {
   const err = new Error(message);
   err.status = status;
@@ -55,7 +116,7 @@ function handleErr(res, e) {
 }
 
 function pickSheet(v) {
-  return String(v?.sheet ?? "Glossary").trim() || "Glossary";
+  return _getSheetKey(v?.sheet ?? "Glossary");
 }
 
 function escapeRegex(s) {
@@ -70,76 +131,20 @@ function makeToken(style, id) {
 /**
  * Build deterministic masks:
  * ✅ FIX: 실제로 "매칭되는 term"에 대해서만 maskId를 할당한다.
- * + ✅ NEW: maxMasksPerText/maxTotalMasks로 폭주 방지 (상한 초과 시 "새로운 id 할당/치환"을 중단)
  */
 function maskOneText({
   text,
-  compiledTerms, // [{ term, re }]
+  terms,
   termToMaskId,
   masksById,
   maskStyle,
-  maxMasksPerText,
-  maxTotalMasks,
-}) {
-  let out = String(text ?? "");
-  if (!out || !compiledTerms.length) return { out, usedNewIds: 0 };
-
-  let usedNewIds = 0;
-
-  for (const ct of compiledTerms) {
-    const t = ct?.term;
-    const re = ct?.re;
-    if (!t || !re) continue;
-
-    // ✅ 핵심: 실제로 매칭되는 경우에만 진행
-    if (!re.test(out)) continue;
-    re.lastIndex = 0;
-
-    const existingId = termToMaskId.get(t);
-    const nextId = masksById.size + 1;
-
-    // 상한 체크: "새로운 id"가 필요한 상황에서만 제한
-    const needsNewId = !existingId;
-    if (needsNewId) {
-      if (usedNewIds >= maxMasksPerText) continue;
-      if (nextId > maxTotalMasks) continue;
-    }
-
-    const id = existingId ?? nextId;
-
-    if (!existingId) {
-      termToMaskId.set(t, id);
-      if (!masksById.has(id)) masksById.set(id, null);
-      usedNewIds += 1;
-    }
-
-    const token = makeToken(maskStyle, id);
-    out = out.replace(re, token);
-  }
-
-  return { out, usedNewIds };
-}
-
-function buildMaskIndexCacheKey({
-  glossarySheet,
-  loadedAt,
-  sourceLangKey,
-  categoryKey,
   caseSensitive,
   wordBoundary,
 }) {
-  const cat = categoryKey || "ALL";
-  return `${glossarySheet}|${loadedAt}|${sourceLangKey}|${cat}|cs:${caseSensitive ? 1 : 0}|wb:${
-    wordBoundary ? 1 : 0
-  }`;
-}
+  let out = String(text ?? "");
+  if (!out || !terms.length) return out;
 
-function buildCompiledTerms({ anchors, caseSensitive, wordBoundary }) {
-  // anchors: string[]
-  // compiled: [{term, re}]
-  const compiled = [];
-
-  for (const t of anchors) {
+  for (const t of terms) {
     if (!t) continue;
 
     // word boundary handling (best-effort)
@@ -152,10 +157,24 @@ function buildCompiledTerms({ anchors, caseSensitive, wordBoundary }) {
     }
 
     const re = new RegExp(pattern, caseSensitive ? "g" : "gi");
-    compiled.push({ term: t, re });
+
+    // ✅ 핵심: 실제로 매칭되는 경우에만 id 할당/치환
+    if (!re.test(out)) continue;
+    re.lastIndex = 0;
+
+    const existingId = termToMaskId.get(t);
+    const id = existingId ?? (masksById.size + 1);
+
+    if (!existingId) {
+      termToMaskId.set(t, id);
+      if (!masksById.has(id)) masksById.set(id, null);
+    }
+
+    const token = makeToken(maskStyle, id);
+    out = out.replace(re, token);
   }
 
-  return compiled;
+  return out;
 }
 
 // ---------------- Endpoint registration ----------------
@@ -266,9 +285,7 @@ export function registerRoutes(app) {
       if (!sourceTextMap || sourceTextMap.size === 0) {
         throw httpError(
           400,
-          `No source texts found for sheet='${sheet}', sourceLang='${sourceLangKey}', category='${
-            category || "ALL"
-          }'.`
+          `No source texts found for sheet='${sheet}', sourceLang='${sourceLangKey}', category='${category || "ALL"}'.`
         );
       }
 
@@ -381,66 +398,31 @@ export function registerRoutes(app) {
 
       // categories
       let categories = [];
-      let categoryKeyForCache = null;
-
       if (v.category && String(v.category).trim()) {
         const catKey = String(v.category).trim().toLowerCase();
         if (!cache.byCategoryBySource.has(catKey)) {
           throw httpError(400, `Category not found: ${v.category}`, { sheet: glossarySheet });
         }
         categories = [catKey];
-        categoryKeyForCache = catKey;
       } else {
         categories = Array.from(cache.byCategoryBySource.keys());
-        categoryKeyForCache = null; // ALL
       }
 
       const sourceTextMap = mergeSourceTextMapsFromCache(cache, sourceLangKey, categories);
       if (!sourceTextMap || sourceTextMap.size === 0) {
         throw httpError(
           400,
-          `No source texts found for glossarySheet='${glossarySheet}', sourceLang='${sourceLangKey}', category='${
-            v.category || "ALL"
-          }'.`
+          `No source texts found for glossarySheet='${glossarySheet}', sourceLang='${sourceLangKey}', category='${v.category || "ALL"}'.`
         );
       }
 
-      // ✅ build or reuse compiled anchor regex list
-      const cacheKey = buildMaskIndexCacheKey({
-        glossarySheet,
-        loadedAt: cache.loadedAt,
-        sourceLangKey,
-        categoryKey: categoryKeyForCache,
-        caseSensitive: Boolean(v.caseSensitive),
-        wordBoundary: Boolean(v.wordBoundary),
-      });
+      // Build unique term list (anchors)
+      const anchors = Array.from(sourceTextMap.keys())
+        .map((s) => String(s ?? "").trim())
+        .filter(Boolean);
 
-      let compiledTerms = _maskIndexCache.get(cacheKey)?.compiled || null;
-      let anchors = _maskIndexCache.get(cacheKey)?.anchors || null;
-
-      if (!compiledTerms || !anchors) {
-        anchors = Array.from(sourceTextMap.keys())
-          .map((s) => String(s ?? "").trim())
-          .filter(Boolean);
-
-        // Sort by length desc to prefer longer phrases
-        anchors.sort((a, b) => b.length - a.length);
-
-        compiledTerms = buildCompiledTerms({
-          anchors,
-          caseSensitive: Boolean(v.caseSensitive),
-          wordBoundary: Boolean(v.wordBoundary),
-        });
-
-        _maskIndexCache.set(cacheKey, { anchors, compiled: compiledTerms, createdAt: nowIso() });
-
-        // 너무 커지면 cache가 메모리를 잡아먹을 수 있으니 단순 상한(키 수)만 둠
-        if (_maskIndexCache.size > 50) {
-          // 오래된 것부터 정리(간단)
-          const keys = Array.from(_maskIndexCache.keys());
-          for (let i = 0; i < Math.max(0, keys.length - 30); i++) _maskIndexCache.delete(keys[i]);
-        }
-      }
+      // Sort by length desc to prefer longer phrases
+      anchors.sort((a, b) => b.length - a.length);
 
       const termToMaskId = new Map(); // anchor -> id
       const masksById = new Map(); // id -> {id, anchor, restore, rowIndex?}
@@ -466,48 +448,38 @@ export function registerRoutes(app) {
 
       // Mask each text
       const textsMasked = [];
-      const maxMasksPerText = Number(v.maxMasksPerText ?? 500);
-      const maxTotalMasks = Number(v.maxTotalMasks ?? 2000);
-
       for (const original of v.texts) {
-        const { out } = maskOneText({
+        const masked = maskOneText({
           text: String(original ?? ""),
-          compiledTerms,
+          terms: anchors,
           termToMaskId,
           masksById,
           maskStyle: v.maskStyle,
-          maxMasksPerText,
-          maxTotalMasks,
+          caseSensitive: Boolean(v.caseSensitive),
+          wordBoundary: Boolean(v.wordBoundary),
         });
-        textsMasked.push(out);
+        textsMasked.push(masked);
       }
 
-      // Count used ids from masked texts
+      // Fill masksById only for allocated ids
+      for (const [anchor, id] of termToMaskId.entries()) {
+        if (masksById.get(id)) continue;
+        const { restore, rowIndex } = computeRestore(anchor);
+        masksById.set(id, { id, anchor, restore, glossaryRowIndex: rowIndex || undefined });
+      }
+
+      // Count used ids
       const tokenRe = /\{mask:(\d+)\}/g;
       const usedIds = new Set();
-
       for (const t of textsMasked) {
         let m;
         while ((m = tokenRe.exec(String(t))) != null) usedIds.add(Number(m[1]));
-      }
-
-      // Fill masksById only for *used ids*
-      for (const [anchor, id] of termToMaskId.entries()) {
-        if (!usedIds.has(Number(id))) continue;
-        if (masksById.get(id)) continue;
-
-        const { restore, rowIndex } = computeRestore(anchor);
-        masksById.set(id, { id, anchor, restore, glossaryRowIndex: rowIndex || undefined });
       }
 
       const masks = Array.from(masksById.values())
         .filter(Boolean)
         .filter((x) => usedIds.has(Number(x.id)))
         .sort((a, b) => a.id - b.id);
-
-      // ✅ 응답 폭주 방지: includeMasks=false 또는 returnMode=summary면 masks를 축소/제거
-      const includeMasks = Boolean(v.includeMasks);
-      const returnMode = v.returnMode || "full";
 
       toJson(res, 200, {
         ok: true,
@@ -522,17 +494,13 @@ export function registerRoutes(app) {
         maskStyle: v.maskStyle,
         restoreStrategy: v.restoreStrategy,
         textsMasked,
-        masks: includeMasks && returnMode === "full" ? masks : [],
+        masks,
         meta: {
           glossaryLoadedAt: cache.loadedAt,
           rawRowCount: cache.rawRowCount,
           categoriesUsedCount: categories.length,
           uniqueTermsInIndex: anchors.length,
           matchedMaskIds: usedIds.size,
-          maxMasksPerText,
-          maxTotalMasks,
-          includeMasks,
-          returnMode,
         },
       });
     } catch (e) {
@@ -541,11 +509,10 @@ export function registerRoutes(app) {
   });
 
   /**
-   * ✅ maskApply (WRITE)
+   * maskApply (WRITE)
    * POST /v1/translate/mask/apply
    *
    * - <targetLang>-Masking 컬럼에 rowIndex 기반 업로드
-   * - responseMode=summary 기본(응답 폭주 방지)
    */
   app.post("/v1/translate/mask/apply", async (req, res) => {
     try {
@@ -568,6 +535,7 @@ export function registerRoutes(app) {
       }
 
       const updates = [];
+      const touchedRowIndexes = [];
       for (const it of v.entries) {
         const rowIndex = Number(it.rowIndex);
         const maskedText = String(it.maskedText ?? "").trim();
@@ -577,6 +545,7 @@ export function registerRoutes(app) {
           range: `${sheet}!${colIndexToA1(colIdx)}${rowIndex}`,
           values: [[maskedText]],
         });
+        touchedRowIndexes.push(rowIndex);
       }
 
       if (updates.length === 0) {
@@ -586,30 +555,22 @@ export function registerRoutes(app) {
           maskingHeader,
           plannedUpdates: 0,
           updatedCells: 0,
-          ...(v.responseMode === "full" ? { updatedRanges: [] } : {}),
+          updatedRanges: [],
         });
       }
 
       const writeRes = await batchUpdateValuesA1(updates);
 
-      if (v.responseMode === "full") {
-        return toJson(res, 200, {
-          ok: true,
-          sheet,
-          maskingHeader,
-          plannedUpdates: updates.length,
-          updatedCells: writeRes.updatedCells,
-          updatedRanges: writeRes.updatedRanges,
-        });
-      }
+      // ✅ after WRITE, force reload cache (helps reduce stale reads)
+      await ensureGlossaryLoaded({ sheetName: sheet, forceReload: true });
 
-      // ✅ summary (default)
-      return toJson(res, 200, {
+      toJson(res, 200, {
         ok: true,
         sheet,
         maskingHeader,
         plannedUpdates: updates.length,
         updatedCells: writeRes.updatedCells,
+        updatedRanges: writeRes.updatedRanges,
       });
     } catch (e) {
       handleErr(res, e);
@@ -681,6 +642,14 @@ export function registerRoutes(app) {
       const limit = Number(v.limit || 100);
       const out = [];
 
+      // ✅ NEW: client-provided excludeRowIndexes
+      const exclude = new Set(
+        Array.isArray(v.excludeRowIndexes) ? v.excludeRowIndexes.map((n) => Number(n)) : []
+      );
+
+      // ✅ prune server-side recent applied gate
+      _pruneRecent(sheet);
+
       for (let i = 0; i < cache.rawRows.length; i++) {
         const row = cache.rawRows[i];
         const rowIndex = i + 2;
@@ -688,12 +657,19 @@ export function registerRoutes(app) {
         const srcText = String(row[srcCol] ?? "").trim();
         if (!srcText) continue;
 
+        // category filter
         if (v.category && String(v.category).trim()) {
           const catKey = String(v.category).trim().toLowerCase();
           const e = cache.entries[i];
           const eCat = String(e?.category ?? "").trim().toLowerCase();
           if (eCat !== catKey) continue;
         }
+
+        // ✅ skip if client asked to exclude
+        if (exclude.has(rowIndex)) continue;
+
+        // ✅ skip if recently applied (server dedupe gate)
+        if (_isRecentApplied(sheet, rowIndex)) continue;
 
         let isPending = false;
         const missing = [];
@@ -724,6 +700,8 @@ export function registerRoutes(app) {
         meta: {
           glossaryLoadedAt: cache.loadedAt,
           rawRowCount: cache.rawRowCount,
+          recentAppliedTtlMs: RECENT_APPLIED_TTL_MS,
+          excludeRowIndexesCount: exclude.size,
         },
       });
     } catch (e) {
@@ -840,11 +818,6 @@ export function registerRoutes(app) {
   /**
    * glossaryApply
    * POST /v1/glossary/apply
-   *
-   * ✅ 개선:
-   * - requireRowIndex(default true): rowIndex 없는 apply 차단 → 셀 misalign 방지
-   * - maxCellChars: 너무 긴 텍스트 업로드 제외
-   * - responseMode(default summary): 응답 폭주 방지
    */
   app.post("/v1/glossary/apply", async (req, res) => {
     try {
@@ -867,22 +840,6 @@ export function registerRoutes(app) {
         );
       }
 
-      // ✅ requireRowIndex enforcement
-      const requireRowIndex = Boolean(v.requireRowIndex);
-      if (requireRowIndex) {
-        const missing = [];
-        for (let i = 0; i < v.entries.length; i++) {
-          const e = v.entries[i];
-          const has = e?.rowIndex != null && Number.isFinite(Number(e.rowIndex));
-          if (!has) missing.push(i);
-        }
-        if (missing.length) {
-          throw httpError(400, "requireRowIndex=true: every entry must include rowIndex.", {
-            missingEntryIndexes: missing,
-          });
-        }
-      }
-
       let categories = null;
       let categoryKey = null;
       if (v.category && String(v.category).trim()) {
@@ -899,11 +856,12 @@ export function registerRoutes(app) {
 
       const fillOnlyEmpty = Boolean(v.fillOnlyEmpty);
       const allowAnchorUpdate = Boolean(v.allowAnchorUpdate);
-      const responseMode = v.responseMode || "summary";
-      const maxCellChars = Number(v.maxCellChars ?? 45000);
 
       const updates = [];
       const results = [];
+
+      // We'll mark these as "recent applied" only if we actually plan to update some cells for that row
+      const plannedRowIndexes = new Set();
 
       for (const entry of v.entries) {
         const sourceText = String(entry?.sourceText ?? "").trim();
@@ -955,7 +913,6 @@ export function registerRoutes(app) {
 
           chosen = { _rowIndex: rowIndex, key: chosenEntry?.key };
         } else {
-          // requireRowIndex=false일 때만 여기로 내려옴
           const hits = sourceTextMap.get(sourceText) || [];
           if (!hits.length) {
             results.push({ sourceText, status: "skipped", reason: "not_found" });
@@ -980,16 +937,6 @@ export function registerRoutes(app) {
           const val = String(rawVal ?? "").trim();
           if (!langKey || !val) continue;
 
-          // ✅ max cell length protection
-          if (val.length > maxCellChars) {
-            skipped += 1;
-            conflicts.push({
-              lang: langKey,
-              reason: `length_overflow(${val.length} > ${maxCellChars})`,
-            });
-            continue;
-          }
-
           if (langKey === "en-us" && !allowAnchorUpdate) {
             skipped += 1;
             continue;
@@ -1013,6 +960,9 @@ export function registerRoutes(app) {
           updated += 1;
         }
 
+        // Mark for recent-applied skip only if we actually plan any update
+        if (updated > 0) plannedRowIndexes.add(rowIndex);
+
         let status = "no_op";
         if (updated > 0 && skipped > 0) status = "partial_success";
         else if (updated > 0) status = "success";
@@ -1027,66 +977,27 @@ export function registerRoutes(app) {
         });
       }
 
-      // plannedUpdates=0이면 write를 아예 안 함
-      if (updates.length === 0) {
-        if (responseMode === "full") {
-          return toJson(res, 200, {
-            ok: true,
-            sheet,
-            fillOnlyEmpty,
-            allowAnchorUpdate,
-            requireRowIndex,
-            responseMode,
-            maxCellChars,
-            plannedUpdates: 0,
-            updatedCells: 0,
-            updatedRanges: [],
-            results,
-          });
-        }
-
-        return toJson(res, 200, {
-          ok: true,
-          sheet,
-          fillOnlyEmpty,
-          allowAnchorUpdate,
-          requireRowIndex,
-          responseMode,
-          maxCellChars,
-          plannedUpdates: 0,
-          updatedCells: 0,
-        });
-      }
-
       const writeRes = await batchUpdateValuesA1(updates);
 
-      if (responseMode === "full") {
-        return toJson(res, 200, {
-          ok: true,
-          sheet,
-          fillOnlyEmpty,
-          allowAnchorUpdate,
-          requireRowIndex,
-          responseMode,
-          maxCellChars,
-          plannedUpdates: updates.length,
-          updatedCells: writeRes.updatedCells,
-          updatedRanges: writeRes.updatedRanges,
-          results,
-        });
-      }
+      // ✅ NEW: Mark recent applied rows to prevent immediate re-pending due to cache/sheet propagation delays
+      _markRecentApplied(sheet, Array.from(plannedRowIndexes));
 
-      // ✅ summary (default): 응답 폭주 최소화
-      return toJson(res, 200, {
+      // ✅ after WRITE, force reload cache (best-effort)
+      await ensureGlossaryLoaded({ sheetName: sheet, forceReload: true });
+
+      toJson(res, 200, {
         ok: true,
         sheet,
         fillOnlyEmpty,
         allowAnchorUpdate,
-        requireRowIndex,
-        responseMode,
-        maxCellChars,
         plannedUpdates: updates.length,
         updatedCells: writeRes.updatedCells,
+        updatedRanges: writeRes.updatedRanges,
+        results,
+        meta: {
+          recentAppliedCount: plannedRowIndexes.size,
+          recentAppliedTtlMs: RECENT_APPLIED_TTL_MS,
+        },
       });
     } catch (e) {
       handleErr(res, e);
