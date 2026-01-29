@@ -3,18 +3,22 @@
  * - REST Zod Schemas
  *
  * FIX:
- * 1) CustomGPT/Connector가 optional string에 null/undefined/""을 보낼 수 있음
- * 2) 특히 category는 누락(undefined)되면 "expected string, received undefined"가 자주 발생
- *    => category는 항상 string(빈문자 허용)으로 normalize하여 downstream이 안정적으로 처리하게 함
- * 3) pending/next에 excludeRowIndexes 유지
- * 4) (보너스) texts가 단일 string으로 올 때 array로 normalize
+ * 1) CustomGPT/Connector may omit category (undefined) or send null/"".
+ *    => Normalize category to "" (empty string). Server treats "" as ALL categories.
+ * 2) pending/next supports excludeRowIndexes
+ * 3) Some clients may send texts as a single string; normalize to string[]
+ *
+ * IMPORTANT:
+ * - z.preprocess returns ZodEffects, so do NOT chain .min/.max on it.
+ *   Apply min/max on the inner schema (2nd arg) or via .pipe(...)
  */
 
 import { z } from "zod";
 
 /**
- * Helpers
- * - Optional trimmed string: null/undefined/"" -> undefined
+ * Optional trimmed string:
+ * - null/undefined/"" -> undefined
+ * - string -> trimmed (if non-empty)
  */
 const OptTrimmedStr = z
   .preprocess((v) => {
@@ -28,8 +32,8 @@ const OptTrimmedStr = z
   .optional();
 
 /**
- * Helpers
- * - Required trimmed string: trims and requires min(1)
+ * Required trimmed string:
+ * - string -> trimmed and min(1)
  */
 const ReqTrimmedStr = z.preprocess((v) => {
   if (typeof v === "string") return v.trim();
@@ -37,44 +41,40 @@ const ReqTrimmedStr = z.preprocess((v) => {
 }, z.string().min(1));
 
 /**
- * ✅ Category normalization (most important)
- * - CustomGPT가 category를:
- *   - 아예 누락(undefined) / null / "" 로 보낼 수 있음
- * - 서버 로직은 보통:
- *   - "" (or falsy) => ALL 처리
- * - 따라서 schema 레벨에서 category는 "항상 string"으로 보장:
- *   - null/undefined -> ""
- *   - string -> trim (빈 문자열 유지)
+ * ✅ Category normalization (critical)
+ * - undefined/null -> ""
+ * - string -> trim (empty allowed)
  */
 const CategoryStr = z.preprocess((v) => {
   if (v == null) return "";
   if (typeof v === "string") return v.trim();
-  // 이상 타입이 오면 z.string()에서 에러
   return v;
 }, z.string());
 
 /**
- * Sheet optional
- * - defaulting happens in routes via pickSheet()
+ * Sheet optional (defaulting happens in routes via pickSheet)
  */
 const SheetOpt = OptTrimmedStr;
 
 /**
- * ✅ texts normalization (connector가 단일 문자열로 보낼 때 방어)
+ * ✅ Texts normalization
  * - string -> [string]
- * - null/undefined -> [] (이후 min(1)에서 잡힘)
+ * - null/undefined -> [] (min(1) will fail if required)
+ *
+ * NOTE: Because this is ZodEffects, min/max must be applied on the inner array schema.
  */
-const TextsArray = z.preprocess((v) => {
-  if (v == null) return [];
-  if (typeof v === "string") return [v];
-  return v;
-}, z.array(z.string()));
+const TextsParam = z.preprocess(
+  (v) => {
+    if (v == null) return [];
+    if (typeof v === "string") return [v];
+    return v;
+  },
+  z.array(z.string()).min(1).max(500)
+);
 
 // ---------------- REST Schemas ----------------
 export const InitSchema = z.object({
   sheet: SheetOpt,
-  // ✅ FIX: Init에서도 category 누락 허용 + 항상 string으로 normalize
-  // routes에서 "" => ALL/세션 기본 카테고리 없음 처리 가능
   category: CategoryStr.optional().default(""),
   sourceLang: ReqTrimmedStr,
   targetLang: ReqTrimmedStr,
@@ -85,14 +85,12 @@ export const ReplaceSchema = z
     sheet: SheetOpt,
     sessionId: OptTrimmedStr,
 
-    // ✅ FIX: category는 항상 string (빈 문자열 허용)
     category: CategoryStr.optional().default(""),
 
     sourceLang: OptTrimmedStr,
     targetLang: OptTrimmedStr,
 
-    // texts도 커넥터 방어: string -> [string]
-    texts: TextsArray.min(1),
+    texts: TextsParam, // ✅ already min(1)/max(500)
 
     includeLogs: z.boolean().optional(),
     limit: z.number().int().min(1).max(200).optional(),
@@ -113,9 +111,6 @@ export const UpdateSchema = z.object({
 
 export const SuggestSchema = z.object({
   sheet: SheetOpt,
-
-  // ✅ FIX: Suggest도 커넥터에서 category 누락될 수 있으니 string normalize
-  // (Suggest가 category 필수 정책이어도, 서버에서 ""을 받은 뒤 처리로 강제할 수 있음)
   category: CategoryStr.optional().default(""),
 
   terms: z.array(z.string()).min(1).max(200),
@@ -129,8 +124,6 @@ export const SuggestSchema = z.object({
 
 export const CandidatesSchema = z.object({
   sheet: SheetOpt,
-
-  // ✅ FIX
   category: CategoryStr.optional().default(""),
 
   sourceText: z.string().min(1),
@@ -141,8 +134,6 @@ export const CandidatesSchema = z.object({
 
 export const CandidatesBatchSchema = z.object({
   sheet: SheetOpt,
-
-  // ✅ FIX: batch도 category normalize
   category: CategoryStr.optional().default(""),
 
   sourceLang: z.enum(["en-US", "ko-KR"]).optional().default("en-US"),
@@ -155,8 +146,6 @@ export const CandidatesBatchSchema = z.object({
 
 export const ApplySchema = z.object({
   sheet: SheetOpt,
-
-  // ✅ FIX: apply도 category normalize
   category: CategoryStr.optional().default(""),
 
   sourceLang: z.enum(["en-US", "ko-KR"]).optional().default("en-US"),
@@ -177,8 +166,6 @@ export const ApplySchema = z.object({
 
 export const PendingNextSchema = z.object({
   sheet: SheetOpt,
-
-  // ✅ FIX
   category: CategoryStr.optional().default(""),
 
   sourceLang: z.enum(["en-US", "ko-KR"]).optional().default("en-US"),
@@ -187,18 +174,12 @@ export const PendingNextSchema = z.object({
   limit: z.number().int().min(1).max(500).optional().default(100),
   forceReload: z.boolean().optional().default(false),
 
-  /**
-   * ✅ excludeRowIndexes
-   * - client can pass rows to skip (already processed in the current run)
-   */
   excludeRowIndexes: z.array(z.number().int().min(2)).max(5000).optional(),
 });
 
 // ---------------- QA ----------------
 export const GlossaryQaNextSchema = z.object({
   sheet: SheetOpt,
-
-  // ✅ FIX
   category: CategoryStr.optional().default(""),
 
   sourceLang: z.enum(["en-US", "ko-KR"]).optional().default("en-US"),
@@ -210,17 +191,16 @@ export const GlossaryQaNextSchema = z.object({
 
 // ---------------- Mask (read / processing) ----------------
 export const MaskSchema = z.object({
-  sheet: SheetOpt, // operating sheet (Trans5/Trans6 etc)
+  sheet: SheetOpt,
   glossarySheet: OptTrimmedStr.default("Glossary"),
 
-  // ✅ FIX: 여기서 터졌던 케이스 방어 (undefined/null/"" -> "")
   category: CategoryStr.optional().default(""),
 
   sourceLang: z.enum(["en-US", "ko-KR"]).optional().default("en-US"),
   targetLang: z.string().min(1),
 
-  // ✅ texts도 커넥터 방어
-  texts: TextsArray.min(1).max(500),
+  // ✅ needs max(500) - already enforced in TextsParam
+  texts: TextsParam,
 
   maskStyle: z.enum(["braces"]).optional().default("braces"),
   restoreStrategy: z.enum(["glossaryTarget", "anchor"]).optional().default("glossaryTarget"),
@@ -232,13 +212,9 @@ export const MaskSchema = z.object({
 });
 
 // ---------------- Mask Apply (WRITE) ----------------
-/**
- * POST /v1/translate/mask/apply
- * - 마스킹된 결과를 <targetLang>-Masking 컬럼에 업로드
- */
 export const MaskApplySchema = z.object({
-  sheet: z.string().min(1), // Trans sheet
-  targetLang: z.string().min(1), // ex) id-ID
+  sheet: z.string().min(1),
+  targetLang: z.string().min(1),
   entries: z
     .array(
       z.object({
