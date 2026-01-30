@@ -3,8 +3,7 @@
  * - REST Zod Schemas
  *
  * FIX:
- * 1) CustomGPT/Connector may omit category (undefined) or send null/"".
- *    => Normalize category to "" (empty string). Server treats "" as ALL categories.
+ * 1) CustomGPT/Connector may omit category (undefined) or send null/"". => normalize to "".
  * 2) pending/next supports excludeRowIndexes
  * 3) Some clients may send texts as a single string; normalize to string[]
  *
@@ -60,8 +59,6 @@ const SheetOpt = OptTrimmedStr;
  * ✅ Texts normalization
  * - string -> [string]
  * - null/undefined -> [] (min(1) will fail if required)
- *
- * NOTE: Because this is ZodEffects, min/max must be applied on the inner array schema.
  */
 const TextsParam = z.preprocess(
   (v) => {
@@ -199,7 +196,6 @@ export const MaskSchema = z.object({
   sourceLang: z.enum(["en-US", "ko-KR"]).optional().default("en-US"),
   targetLang: z.string().min(1),
 
-  // ✅ needs max(500) - already enforced in TextsParam
   texts: TextsParam,
 
   maskStyle: z.enum(["braces"]).optional().default("braces"),
@@ -224,4 +220,33 @@ export const MaskApplySchema = z.object({
     )
     .min(1)
     .max(2000),
+});
+
+/**
+ * ✅ NEW: /v1/translate/auto (server-side translation) schema
+ * - mode="replace": server will apply glossary replacement then translate
+ * - mode="mask": client may provide textProcessed (e.g., textsMasked) for translation
+ */
+export const AutoTranslateSchema = z.object({
+  sheet: SheetOpt,
+  category: CategoryStr.optional().default(""),
+
+  mode: z.enum(["replace", "mask"]).optional().default("mask"),
+
+  sourceLang: z.enum(["en-US", "ko-KR"]).optional().default("en-US"),
+  targetLang: z.string().min(1),
+
+  chunkSize: z.number().int().min(1).max(100).optional(),
+  forceReload: z.boolean().optional().default(false),
+
+  items: z
+    .array(
+      z.object({
+        rowIndex: z.number().int().min(2),
+        sourceText: z.string().min(1),
+        textProcessed: z.string().optional(),
+      })
+    )
+    .min(1)
+    .max(500),
 });

@@ -2,18 +2,13 @@
  * src/http/routes.mjs
  * - REST endpoints (sheet-aware)
  *
- * FIX package:
- * 1) Prevent duplicate pending rows after WRITE:
- *    - Server-side recent-applied rowIndex TTL gate (dedupe)
- *    - Force reload cache after WRITE
- * 2) Support client-provided pending skip list:
- *    - PendingNextSchema.excludeRowIndexes
- *
- * 3) ✅ FIX (this change):
- *    - Defensive body normalization for connector/custom GPT calls:
- *      category may be omitted (undefined) even if client UI shows "".
- *      If schema expects string, Zod throws "expected string, received undefined".
- *      => Normalize category to "" BEFORE schema.parse for relevant endpoints.
+ * 최종 통합:
+ * - connector/custom GPT body 방어 정규화(category/sheet/texts)
+ * - replace 최적화: compiled replace plan cache 사용 + includeLogs=false면 ruleLogs 스킵
+ * - mask 최적화: precompiled mask regex plan cache 사용 (텍스트 처리 중 RegExp 생성 0)
+ * - pending dedupe: 최근 apply rowIndex TTL gate + excludeRowIndexes
+ * - /v1/translate/auto: 서버가 GPT-4.1로 Phase2 번역 수행
+ * - ✅ AutoTranslateSchema로 /auto 입력 검증 강화
  */
 
 import {
@@ -24,10 +19,19 @@ import {
   getParsedBody,
 } from "../utils/common.mjs";
 
-import { ensureGlossaryLoaded, ensureRulesLoaded } from "../cache/global.mjs";
+import {
+  ensureGlossaryLoaded,
+  ensureRulesLoaded,
+  getReplacePlanFromCache,
+  getMaskAnchorsFromCache,
+  getMaskRegexPlanFromCache,
+} from "../cache/global.mjs";
+
 import { mergeSourceTextMapsFromCache } from "../glossary/index.mjs";
 import { replaceByGlossaryWithLogs, buildRuleLogs } from "../replace/replace.mjs";
 import { colIndexToA1, batchUpdateValuesA1 } from "../google/sheets.mjs";
+
+import { translateItemsWithGpt41 } from "../translate/openaiTranslate.mjs";
 
 import {
   InitSchema,
@@ -37,15 +41,14 @@ import {
   ApplySchema,
   GlossaryQaNextSchema,
   MaskSchema,
-  MaskApplySchema, // WRITE
+  MaskApplySchema,
+  AutoTranslateSchema, // ✅ NEW
 } from "./schemas.mjs";
 
 // ---------------- In-memory sessions (lightweight) ----------------
 const _sessions = new Map(); // sessionId -> { sheet, category, sourceLangKey, targetLangKey, createdAt }
 
-// ---------------- Recent-applied rowIndex gate (NEW) ----------------
-// 목적: WRITE 직후 캐시/시트 반영 지연으로 동일 rowIndex가 pendingNext에 재등장하는 현상 차단
-// 동작: glossaryApply 성공 rowIndex를 sheet별로 TTL 동안 기억하고 pendingNext에서 제외
+// ---------------- Recent-applied rowIndex gate ----------------
 const _recentAppliedBySheet = new Map(); // sheet -> Map<rowIndex:number, expiresAtMs:number>
 const RECENT_APPLIED_TTL_MS = Number(process.env.RECENT_APPLIED_TTL_MS ?? 10 * 60 * 1000); // default 10m
 
@@ -58,13 +61,14 @@ function _getSheetKey(sheet) {
 }
 
 function _pruneRecent(sheetKey) {
-  const m = _recentAppliedBySheet.get(sheetKey);
+  const key = _getSheetKey(sheetKey);
+  const m = _recentAppliedBySheet.get(key);
   if (!m) return;
   const now = _nowMs();
   for (const [rowIndex, exp] of m.entries()) {
     if (!exp || exp <= now) m.delete(rowIndex);
   }
-  if (m.size === 0) _recentAppliedBySheet.delete(sheetKey);
+  if (m.size === 0) _recentAppliedBySheet.delete(key);
 }
 
 function _markRecentApplied(sheetKey, rowIndexes) {
@@ -125,10 +129,6 @@ function pickSheet(v) {
   return _getSheetKey(v?.sheet ?? "Glossary");
 }
 
-function escapeRegex(s) {
-  return String(s).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-}
-
 function makeToken(style, id) {
   if (style === "braces") return `{mask:${id}}`;
   return `{mask:${id}}`;
@@ -136,69 +136,43 @@ function makeToken(style, id) {
 
 /**
  * ✅ connector/custom GPT 방어용 body 정규화
- * - category 누락(undefined) => "" 로 강제
- * - sheet/glossarySheet 도 종종 누락되므로 기본값 보정
- * - texts가 단일 문자열로 오는 경우 방어 (스키마가 array를 기대한다면 여기서 배열로 보정)
+ * - category 누락(undefined)/null => "" 로 강제
+ * - sheet/glossarySheet 기본값
+ * - texts 단일 문자열 방어(필요 시 배열화)
  */
 function normalizeBodyForConnector(body, { ensureTextsArray = false } = {}) {
   const b = body && typeof body === "object" ? body : {};
 
-  // 가장 많이 터지는 지점: category
   if (b.category === undefined || b.category === null) b.category = "";
 
-  // sheet/glossarySheet 기본값
   if (b.sheet === undefined || b.sheet === null) b.sheet = "Glossary";
   if (b.glossarySheet === undefined || b.glossarySheet === null) b.glossarySheet = "Glossary";
 
-  // 일부 커넥터가 texts 단일 string을 보내는 경우 방어
   if (ensureTextsArray) {
     if (typeof b.texts === "string") b.texts = [b.texts];
     if (b.texts == null) b.texts = [];
   }
-
   return b;
 }
 
 /**
- * Build deterministic masks:
- * ✅ FIX: 실제로 "매칭되는 term"에 대해서만 maskId를 할당한다.
+ * ✅ Mask with precompiled regex plan
  */
-function maskOneText({
-  text,
-  terms,
-  termToMaskId,
-  masksById,
-  maskStyle,
-  caseSensitive,
-  wordBoundary,
-}) {
+function maskOneTextWithPlan({ text, regexPlan, termToMaskId, masksById, maskStyle }) {
   let out = String(text ?? "");
-  if (!out || !terms.length) return out;
+  if (!out || !regexPlan.length) return out;
 
-  for (const t of terms) {
-    if (!t) continue;
+  for (const { term, re } of regexPlan) {
+    if (!term || !(re instanceof RegExp)) continue;
 
-    // word boundary handling (best-effort)
-    const startsWord = /^[A-Za-z0-9_]/.test(t);
-    const endsWord = /[A-Za-z0-9_]$/.test(t);
-
-    let pattern = escapeRegex(t);
-    if (wordBoundary && startsWord && endsWord) {
-      pattern = `\\b${pattern}\\b`;
-    }
-
-    const re = new RegExp(pattern, caseSensitive ? "g" : "gi");
-
-    // ✅ 핵심: 실제로 매칭되는 경우에만 id 할당/치환
     if (!re.test(out)) continue;
     re.lastIndex = 0;
 
-    const existingId = termToMaskId.get(t);
-    const id = existingId ?? (masksById.size + 1);
-
-    if (!existingId) {
-      termToMaskId.set(t, id);
-      if (!masksById.has(id)) masksById.set(id, null);
+    let id = termToMaskId.get(term);
+    if (!id) {
+      id = masksById.size + 1;
+      termToMaskId.set(term, id);
+      masksById.set(id, null);
     }
 
     const token = makeToken(maskStyle, id);
@@ -291,7 +265,6 @@ export function registerRoutes(app) {
       if (!sourceLangKey || !targetLangKey) {
         throw httpError(400, "sourceLang and targetLang are required (or provide sessionId).");
       }
-
       assertAllowedSourceLang(sourceLangKey);
 
       const cache = await ensureGlossaryLoaded({ sheetName: sheet, forceReload: false });
@@ -324,7 +297,15 @@ export function registerRoutes(app) {
 
       const wantLogs = v.includeLogs ?? true;
 
-      const rulesCache = await ensureRulesLoaded({ forceReload: false });
+      const replacePlan = getReplacePlanFromCache({
+        cache,
+        sheetName: sheet,
+        sourceLangKey,
+        categories,
+        targetLangKey,
+      });
+
+      const rulesCache = wantLogs ? await ensureRulesLoaded({ forceReload: false }) : null;
       const categoryKey = category ? String(category).trim().toLowerCase() : categories[0] || "";
 
       const outTexts = [];
@@ -343,21 +324,23 @@ export function registerRoutes(app) {
           sourceLangKey,
           targetLangKey,
           sourceTextMap,
-        });
-
-        const ruleLogs = buildRuleLogs({
-          text: out,
-          categoryKey: String(categoryKey || "").toLowerCase(),
-          targetLangKey,
-          rulesCache,
+          replacePlan,
         });
 
         outTexts.push(out);
         replacedTotalAll += replacedTotal;
         matchedTermsAll += logs.length;
-        matchedRulesAll += ruleLogs.length;
 
         if (wantLogs) {
+          const ruleLogs = buildRuleLogs({
+            text: out,
+            categoryKey: String(categoryKey || "").toLowerCase(),
+            targetLangKey,
+            rulesCache,
+          });
+
+          matchedRulesAll += ruleLogs.length;
+
           perLineLogs.push({ index: i, replacedTotal, logs });
           perLineRuleLogs.push({ index: i, ruleLogs });
         }
@@ -389,19 +372,16 @@ export function registerRoutes(app) {
   });
 
   /**
-   * maskGlossaryTermsForTranslation (read-only/processing)
+   * maskGlossaryTermsForTranslation
    * POST /v1/translate/mask
    */
   app.post("/v1/translate/mask", async (req, res) => {
     try {
       const raw = getParsedBody(req);
-
-      // ✅ 여기서 category 누락(undefined) 방어가 가장 중요 (현재 커넥터 이슈의 직접 원인)
       const body = normalizeBodyForConnector(raw, { ensureTextsArray: true });
-
       const v = MaskSchema.parse(body);
 
-      const operatingSheet = pickSheet(v); // 보고용
+      const operatingSheet = pickSheet(v);
       const glossarySheet = String(v.glossarySheet ?? "Glossary").trim() || "Glossary";
 
       const sourceLangKey = normalizeLang(v.sourceLang);
@@ -433,7 +413,6 @@ export function registerRoutes(app) {
         );
       }
 
-      // categories
       let categories = [];
       if (v.category && String(v.category).trim()) {
         const catKey = String(v.category).trim().toLowerCase();
@@ -453,16 +432,17 @@ export function registerRoutes(app) {
         );
       }
 
-      // Build unique term list (anchors)
-      const anchors = Array.from(sourceTextMap.keys())
-        .map((s) => String(s ?? "").trim())
-        .filter(Boolean);
+      const regexPlan = getMaskRegexPlanFromCache({
+        cache,
+        sheetName: glossarySheet,
+        sourceLangKey,
+        categories,
+        caseSensitive: Boolean(v.caseSensitive),
+        wordBoundary: Boolean(v.wordBoundary),
+      });
 
-      // Sort by length desc to prefer longer phrases
-      anchors.sort((a, b) => b.length - a.length);
-
-      const termToMaskId = new Map(); // anchor -> id
-      const masksById = new Map(); // id -> {id, anchor, restore, rowIndex?}
+      const termToMaskId = new Map();
+      const masksById = new Map();
 
       function computeRestore(anchor) {
         const hits = sourceTextMap.get(anchor) || [];
@@ -483,29 +463,24 @@ export function registerRoutes(app) {
         return { restore: anchor, rowIndex };
       }
 
-      // Mask each text
       const textsMasked = [];
       for (const original of v.texts) {
-        const masked = maskOneText({
+        const masked = maskOneTextWithPlan({
           text: String(original ?? ""),
-          terms: anchors,
+          regexPlan,
           termToMaskId,
           masksById,
           maskStyle: v.maskStyle,
-          caseSensitive: Boolean(v.caseSensitive),
-          wordBoundary: Boolean(v.wordBoundary),
         });
         textsMasked.push(masked);
       }
 
-      // Fill masksById only for allocated ids
       for (const [anchor, id] of termToMaskId.entries()) {
         if (masksById.get(id)) continue;
         const { restore, rowIndex } = computeRestore(anchor);
         masksById.set(id, { id, anchor, restore, glossaryRowIndex: rowIndex || undefined });
       }
 
-      // Count used ids
       const tokenRe = /\{mask:(\d+)\}/g;
       const usedIds = new Set();
       for (const t of textsMasked) {
@@ -517,6 +492,13 @@ export function registerRoutes(app) {
         .filter(Boolean)
         .filter((x) => usedIds.has(Number(x.id)))
         .sort((a, b) => a.id - b.id);
+
+      const anchors = getMaskAnchorsFromCache({
+        cache,
+        sheetName: glossarySheet,
+        sourceLangKey,
+        categories,
+      });
 
       toJson(res, 200, {
         ok: true,
@@ -546,10 +528,141 @@ export function registerRoutes(app) {
   });
 
   /**
+   * ✅ /v1/translate/auto
+   * - AutoTranslateSchema로 입력 검증
+   */
+  app.post("/v1/translate/auto", async (req, res) => {
+    try {
+      const raw = getParsedBody(req);
+
+      // 스키마가 category 등을 normalize하지만, sheet 기본값 방어는 routes에서도 한번 더 보정
+      const normalized = normalizeBodyForConnector(raw);
+      const v = AutoTranslateSchema.parse(normalized);
+
+      const sheet = pickSheet(v);
+      const category = String(v.category ?? "").trim();
+      const mode = String(v.mode ?? "mask").trim().toLowerCase(); // replace | mask
+
+      const sourceLangKey = normalizeLang(v.sourceLang ?? "en-US");
+      const targetLangKey = normalizeLang(v.targetLang);
+
+      if (!targetLangKey) throw httpError(400, "targetLang is required.");
+      assertAllowedSourceLang(sourceLangKey);
+
+      const cache = await ensureGlossaryLoaded({
+        sheetName: sheet,
+        forceReload: Boolean(v.forceReload),
+      });
+
+      let categories = [];
+      if (category) {
+        const ck = category.toLowerCase();
+        if (!cache.byCategoryBySource.has(ck)) throw httpError(400, `Category not found: ${category}`);
+        categories = [ck];
+      } else {
+        categories = Array.from(cache.byCategoryBySource.keys());
+      }
+
+      const sourceTextMap = mergeSourceTextMapsFromCache(cache, sourceLangKey, categories);
+      if (!sourceTextMap || sourceTextMap.size === 0) {
+        throw httpError(
+          400,
+          `No source texts found for sheet='${sheet}', sourceLang='${sourceLangKey}', category='${category || "ALL"}'.`
+        );
+      }
+
+      const replacePlan =
+        mode === "replace"
+          ? getReplacePlanFromCache({
+              cache,
+              sheetName: sheet,
+              sourceLangKey,
+              categories,
+              targetLangKey,
+            })
+          : null;
+
+      const processed = [];
+      for (const it of v.items) {
+        const rowIndex = Number(it?.rowIndex);
+        const sourceText = String(it?.sourceText ?? "").trim();
+        if (!Number.isFinite(rowIndex) || rowIndex < 2) continue;
+        if (!sourceText) continue;
+
+        let processedText = sourceText;
+
+        if (mode === "replace") {
+          const r = replaceByGlossaryWithLogs({
+            text: sourceText,
+            sourceLangKey,
+            targetLangKey,
+            sourceTextMap,
+            replacePlan,
+          });
+          processedText = r.out;
+        } else {
+          // mask 모드: client가 /mask로 만든 textsMasked를 textProcessed로 넘기면 그대로 사용
+          if (it?.textProcessed != null) processedText = String(it.textProcessed);
+        }
+
+        processed.push({ rowIndex, sourceText, processedText });
+      }
+
+      if (!processed.length) throw httpError(400, "No valid items to process.");
+
+      const tRes = await translateItemsWithGpt41({
+        items: processed.map((x) => ({ rowIndex: x.rowIndex, text: x.processedText })),
+        sourceLang: sourceLangKey,
+        targetLang: targetLangKey,
+        mode,
+        chunkSize: v.chunkSize,
+      });
+
+      const byRow = new Map();
+      for (const r of tRes.results) byRow.set(Number(r.rowIndex), String(r.translatedText ?? ""));
+
+      const entries = [];
+      for (const p of processed) {
+        const translatedText = byRow.get(p.rowIndex) || "";
+        if (!translatedText.trim()) continue;
+
+        entries.push({
+          rowIndex: p.rowIndex,
+          sourceText: p.sourceText,
+          translations: { [targetLangKey]: translatedText },
+        });
+      }
+
+      toJson(res, 200, {
+        ok: true,
+        sheet,
+        category: category || "ALL",
+        sourceLang: sourceLangKey,
+        targetLang: targetLangKey,
+        mode,
+        results: entries.map((e) => ({
+          rowIndex: e.rowIndex,
+          sourceText: e.sourceText,
+          translatedText: e.translations[targetLangKey],
+        })),
+        applyDraft: {
+          sheet,
+          category,
+          sourceLang: sourceLangKey,
+          entries,
+          fillOnlyEmpty: true,
+          allowAnchorUpdate: false,
+        },
+        meta: tRes.meta,
+      });
+    } catch (e) {
+      handleErr(res, e);
+    }
+  });
+
+  /**
    * maskApply (WRITE)
    * POST /v1/translate/mask/apply
-   *
-   * - <targetLang>-Masking 컬럼에 rowIndex 기반 업로드
    */
   app.post("/v1/translate/mask/apply", async (req, res) => {
     try {
@@ -573,7 +686,6 @@ export function registerRoutes(app) {
       }
 
       const updates = [];
-      const touchedRowIndexes = [];
       for (const it of v.entries) {
         const rowIndex = Number(it.rowIndex);
         const maskedText = String(it.maskedText ?? "").trim();
@@ -583,7 +695,6 @@ export function registerRoutes(app) {
           range: `${sheet}!${colIndexToA1(colIdx)}${rowIndex}`,
           values: [[maskedText]],
         });
-        touchedRowIndexes.push(rowIndex);
       }
 
       if (updates.length === 0) {
@@ -599,7 +710,6 @@ export function registerRoutes(app) {
 
       const writeRes = await batchUpdateValuesA1(updates);
 
-      // ✅ after WRITE, force reload cache (helps reduce stale reads)
       await ensureGlossaryLoaded({ sheetName: sheet, forceReload: true });
 
       toJson(res, 200, {
@@ -682,12 +792,10 @@ export function registerRoutes(app) {
       const limit = Number(v.limit || 100);
       const out = [];
 
-      // ✅ NEW: client-provided excludeRowIndexes
       const exclude = new Set(
         Array.isArray(v.excludeRowIndexes) ? v.excludeRowIndexes.map((n) => Number(n)) : []
       );
 
-      // ✅ prune server-side recent applied gate
       _pruneRecent(sheet);
 
       for (let i = 0; i < cache.rawRows.length; i++) {
@@ -697,7 +805,6 @@ export function registerRoutes(app) {
         const srcText = String(row[srcCol] ?? "").trim();
         if (!srcText) continue;
 
-        // category filter
         if (v.category && String(v.category).trim()) {
           const catKey = String(v.category).trim().toLowerCase();
           const e = cache.entries[i];
@@ -705,10 +812,7 @@ export function registerRoutes(app) {
           if (eCat !== catKey) continue;
         }
 
-        // ✅ skip if client asked to exclude
         if (exclude.has(rowIndex)) continue;
-
-        // ✅ skip if recently applied (server dedupe gate)
         if (_isRecentApplied(sheet, rowIndex)) continue;
 
         let isPending = false;
@@ -857,7 +961,7 @@ export function registerRoutes(app) {
   });
 
   /**
-   * glossaryApply
+   * glossaryApply (WRITE)
    * POST /v1/glossary/apply
    */
   app.post("/v1/glossary/apply", async (req, res) => {
@@ -901,8 +1005,6 @@ export function registerRoutes(app) {
 
       const updates = [];
       const results = [];
-
-      // We'll mark these as "recent applied" only if we actually plan to update some cells for that row
       const plannedRowIndexes = new Set();
 
       for (const entry of v.entries) {
@@ -1002,7 +1104,6 @@ export function registerRoutes(app) {
           updated += 1;
         }
 
-        // Mark for recent-applied skip only if we actually plan any update
         if (updated > 0) plannedRowIndexes.add(rowIndex);
 
         let status = "no_op";
@@ -1021,10 +1122,7 @@ export function registerRoutes(app) {
 
       const writeRes = await batchUpdateValuesA1(updates);
 
-      // ✅ NEW: Mark recent applied rows to prevent immediate re-pending due to cache/sheet propagation delays
       _markRecentApplied(sheet, Array.from(plannedRowIndexes));
-
-      // ✅ after WRITE, force reload cache (best-effort)
       await ensureGlossaryLoaded({ sheetName: sheet, forceReload: true });
 
       toJson(res, 200, {

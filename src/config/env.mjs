@@ -1,65 +1,105 @@
 /**
  * src/config/env.mjs
  * - 환경변수 로딩/검증/기본값 정의
- * - 다른 모듈에서 import 해서 사용
  *
- * 주의:
- * - dotenv는 server.mjs에서 import "dotenv/config"로 1회만 로드하는 것을 권장
- * - 본 파일은 process.env 값을 읽기만 한다.
+ * ✅ 중요(호환성):
+ * - 기존 코드가 import 하는 export를 반드시 제공해야 함:
+ *   - DEFAULT_SHEET_NAME
+ *   - buildSheetRange
+ *
+ * ✅ 포함:
+ * - Google Sheets (spreadsheet / ranges)
+ * - OpenAI (Responses API) for server-side translation
+ * - optional feature gate: ENABLE_OPENAI_TRANSLATION
  */
 
 export const PORT = Number(process.env.PORT || 8080);
 
+// ---------------- Google Sheets ----------------
 export const SPREADSHEET_ID = process.env.SPREADSHEET_ID;
 
-// 기존 호환 유지: SHEET_NAME은 "기본 Glossary 시트명"으로만 사용
+// 기존 코드 호환용: DEFAULT_SHEET_NAME export 필요
 export const DEFAULT_SHEET_NAME = process.env.SHEET_NAME || "Glossary";
 
-/**
- * ✅ 기존 호환 유지용
- * - 예전 코드가 SHEET_RANGE를 직접 쓰는 경우를 위해 남겨둔다.
- * - 다중 시트 지원 이후에는, loadGlossaryAll({ sheetName })가 sheetName에 맞는 range를 생성한다.
- */
-export const SHEET_RANGE = process.env.SHEET_RANGE || `${DEFAULT_SHEET_NAME}!A:Z`;
-
-// Phase 1.5 Rules sheet (separate from Glossary)
-export const RULE_SHEET_NAME = process.env.RULE_SHEET_NAME || "Rules";
-export const RULE_SHEET_RANGE = process.env.RULE_SHEET_RANGE || `${RULE_SHEET_NAME}!A:Z`;
+// 기존 코드에서도 사용할 수 있게 동일 의미로 제공
+export const SHEET_NAME = DEFAULT_SHEET_NAME;
 
 /**
- * Google Service Account JSON
- * - Cloud Run에서는 보통 env로 주입
+ * ✅ buildSheetRange (호환성 필수)
+ * - buildSheetRange("Glossary") => "Glossary!A:U"
+ * - buildSheetRange("Trans5", "A:Z") => "Trans5!A:Z"
+ * - buildSheetRange("Trans5!A:Z") => 이미 ! 포함이면 그대로 보정
  */
-export const GOOGLE_SERVICE_ACCOUNT_JSON = process.env.GOOGLE_SERVICE_ACCOUNT_JSON;
+export function buildSheetRange(sheetName, a1Range = "A:U") {
+  const s = String(sheetName ?? DEFAULT_SHEET_NAME).trim() || DEFAULT_SHEET_NAME;
+  const r = String(a1Range ?? "A:U").trim() || "A:U";
 
-/**
- * ✅ 시트별 기본 Range 생성 (Glossary형 vs Trans형)
- * - Trans1~5: A:H 고정 (ID + 언어 컬럼)
- * - 그 외: A:U (기존 Glossary 규격 유지)
- *
- * 필요 시, DEFAULT_SHEET_NAME에 대해서는 env.SHEET_RANGE로 override 가능(기존 유지).
- */
-export function buildSheetRange(sheetName) {
-  const sn = String(sheetName ?? "").trim() || DEFAULT_SHEET_NAME;
+  // 이미 "Sheet!A:Z" 형태로 들어오면 그대로
+  if (s.includes("!")) return s;
 
-  // 기존 호환: 기본 시트는 SHEET_RANGE override 허용
-  if (sn === DEFAULT_SHEET_NAME && process.env.SHEET_RANGE) {
-    return process.env.SHEET_RANGE;
-  }
+  // range가 "!A:U" 같이 들어오면 보정
+  const rr = r.startsWith("!") ? r.slice(1) : r;
 
-  const isTrans = /^trans\d+$/i.test(sn);
-  return `${sn}!${isTrans ? "A:Z" : "A:Z"}`;
+  return `${s}!${rr}`;
 }
 
 /**
+ * ✅ TERM(V열) 무시 → A:U만 읽음 (기본)
+ * 필요 시 env로 변경 가능
+ */
+export const SHEET_RANGE = process.env.SHEET_RANGE || buildSheetRange(DEFAULT_SHEET_NAME, "A:U");
+
+// Rules sheet
+export const RULE_SHEET_NAME = process.env.RULE_SHEET_NAME || "Rules";
+export const RULE_SHEET_RANGE = process.env.RULE_SHEET_RANGE || buildSheetRange(RULE_SHEET_NAME, "A:U");
+
+/**
+ * Google Service Account JSON (stringified)
+ */
+export const GOOGLE_SERVICE_ACCOUNT_JSON = process.env.GOOGLE_SERVICE_ACCOUNT_JSON;
+
+// ---------------- OpenAI (Server-side translation) ----------------
+
+/**
+ * 기능 스위치
+ * - true일 때 /v1/translate/auto 사용을 전제로 필수 env 검증 강화
+ */
+export const ENABLE_OPENAI_TRANSLATION = String(process.env.ENABLE_OPENAI_TRANSLATION || "false")
+  .trim()
+  .toLowerCase() === "true";
+
+export const OPENAI_API_KEY = process.env.OPENAI_API_KEY || "";
+
+/**
+ * 모델 기본값 (네 의도: GPT-4.1)
+ */
+export const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-4.1";
+
+/**
+ * 타임아웃/재시도/청크
+ */
+export const OPENAI_TIMEOUT_MS = Number(process.env.OPENAI_TIMEOUT_MS ?? 60_000);
+export const OPENAI_MAX_RETRIES = Number(process.env.OPENAI_MAX_RETRIES ?? 3);
+export const OPENAI_CHUNK_SIZE = Number(process.env.OPENAI_CHUNK_SIZE ?? 25);
+
+/**
+ * 서버 request 가드(선택)
+ */
+export const MAX_TEXTS_PER_REQUEST = Number(process.env.MAX_TEXTS_PER_REQUEST ?? 500);
+
+// ---------------- Diagnostics / misc ----------------
+export const NODE_ENV = process.env.NODE_ENV || "production";
+
+/**
  * 앱 시작 시 필수 env 검증
- * - server.mjs에서 1회 호출
+ * - server.mjs에서 1회 호출 권장
  */
 export function assertRequiredEnv() {
-  if (!SPREADSHEET_ID) {
-    throw new Error("SPREADSHEET_ID is missing. Check env.");
-  }
-  if (!GOOGLE_SERVICE_ACCOUNT_JSON) {
+  if (!SPREADSHEET_ID) throw new Error("SPREADSHEET_ID is missing. Check env.");
+  if (!GOOGLE_SERVICE_ACCOUNT_JSON)
     throw new Error("GOOGLE_SERVICE_ACCOUNT_JSON is missing. Check env.");
+
+  if (ENABLE_OPENAI_TRANSLATION) {
+    if (!OPENAI_API_KEY) throw new Error("OPENAI_API_KEY is missing. Check env.");
   }
 }
