@@ -1,243 +1,254 @@
-/**
- * src/translate/openaiTranslate.mjs
- * - Server-side Phase 2 translation via OpenAI Responses API
- *
- * Provides:
- *   export async function translateItemsWithGpt41(...)
- */
+const DEFAULT_MODEL = process.env.OPENAI_MODEL || "gpt-4.1";
+const DEFAULT_TEMPERATURE = Number(process.env.OPENAI_TEMPERATURE ?? 0);
+const DEFAULT_MAX_OUTPUT_TOKENS = Number(process.env.OPENAI_MAX_OUTPUT_TOKENS ?? 4096);
+const DEFAULT_TIMEOUT_MS = Number(process.env.OPENAI_TIMEOUT_MS ?? 60_000);
 
-import {
-  OPENAI_API_KEY,
-  OPENAI_MODEL,
-  OPENAI_TIMEOUT_MS,
-  OPENAI_MAX_RETRIES,
-  OPENAI_CHUNK_SIZE,
-} from "../config/env.mjs";
+const OPENAI_BASE_URL = process.env.OPENAI_BASE_URL || "https://api.openai.com/v1";
 
-function sleep(ms) {
-  return new Promise((r) => setTimeout(r, ms));
+// Record separator & newline placeholder
+const RS = "\u241E"; // ␞ (SYMBOL FOR RECORD SEPARATOR)
+const NL = "\u241F"; // ␟ (SYMBOL FOR UNIT SEPARATOR) - newline placeholder
+
+function nowMs() {
+  return Date.now();
 }
 
-function httpError(status, message, extra) {
-  const err = new Error(message);
-  err.status = status;
-  err.extra = extra;
-  return err;
+function assertString(x, name) {
+  if (typeof x !== "string") throw new Error(`${name} must be a string`);
 }
 
-function ensureApiKey() {
-  if (!OPENAI_API_KEY) throw httpError(500, "OPENAI_API_KEY is missing in env.");
+function protectNewlines(s) {
+  // Preserve all line breaks exactly; keep empty lines.
+  return String(s ?? "").replace(/\r\n/g, "\n").replace(/\n/g, NL);
 }
 
-function normalizeLangKeyForPrompt(langKey) {
-  const k = String(langKey || "").toLowerCase();
-  if (k === "en-us") return "English (en-US)";
-  if (k === "ko-kr") return "Korean (ko-KR)";
-  return String(langKey || "Unknown");
+function restoreNewlines(s) {
+  // Ensure the correct restoration of line breaks after translation
+  return String(s ?? "").replace(new RegExp(NL, "g"), "\n");
 }
 
-/**
- * items: [{ rowIndex:number, text:string }]
- * returns: { results:[{rowIndex, translatedText}], meta:{...} }
- */
-export async function translateItemsWithGpt41({
-  items,
-  sourceLang,
-  targetLang,
-  mode = "replace", // replace | mask
-  chunkSize,
-}) {
-  ensureApiKey();
-
-  const safeItems = Array.isArray(items) ? items : [];
-  if (!safeItems.length) throw httpError(400, "translateItemsWithGpt41: items is empty.");
-
-  const cs = Number(chunkSize || OPENAI_CHUNK_SIZE || 20);
-  const chunks = [];
-  for (let i = 0; i < safeItems.length; i += cs) chunks.push(safeItems.slice(i, i + cs));
-
-  const startedAt = Date.now();
-  const results = [];
-
-  for (let ci = 0; ci < chunks.length; ci++) {
-    const chunk = chunks[ci];
-
-    const inputLines = chunk.map((it) => {
-      const rowIndex = Number(it?.rowIndex);
-      const text = String(it?.text ?? "");
-      return `${rowIndex}\t${text}`;
-    });
-
-    const sys = [
-      "You are a professional game localization translator.",
-      "Rules (HARD):",
-      "- Preserve all tokens exactly (e.g., {mask:123}, {0}, {1}, %s, <TAG>, [TAG]). Do NOT modify token text.",
-      "- Preserve punctuation, numbers, and line structure.",
-      "- Translate ONLY natural language parts into the target language.",
-      "- Output MUST be TSV lines: <rowIndex>\\t<translatedText>",
-      "- Output line count MUST equal input line count.",
-      mode === "mask"
-        ? "- If {mask:N} appears, keep it unchanged and in the same position."
-        : "- Do not invent glossary terms; already-replaced terms must remain unchanged.",
-    ].join("\n");
-
-    const user = [
-      `Source language: ${normalizeLangKeyForPrompt(sourceLang)}`,
-      `Target language: ${normalizeLangKeyForPrompt(targetLang)}`,
-      "",
-      "Translate the following TSV lines:",
-      ...inputLines,
-    ].join("\n");
-
-    const outText = await callOpenAIResponses({
-      model: OPENAI_MODEL,
-      instructions: sys,
-      input: user,
-      timeoutMs: OPENAI_TIMEOUT_MS,
-      maxRetries: OPENAI_MAX_RETRIES,
-    });
-
-    const parsed = parseTsvOutput(outText, chunk);
-    for (const p of parsed) results.push(p);
-  }
-
-  const endedAt = Date.now();
-
-  return {
-    results,
-    meta: {
-      model: OPENAI_MODEL,
-      chunks: chunks.length,
-      chunkSize: cs,
-      elapsedMs: endedAt - startedAt,
-      items: safeItems.length,
-    },
-  };
+function buildInputPayload(items) {
+  // items: [{rowIndex, textForTranslate}]
+  // Encode as RS-delimited records:
+  //   <rowIndex>\t<protectedText>
+  return items
+    .map((it) => {
+      const rowIndex = Number(it.rowIndex);
+      const t = protectNewlines(it.textForTranslate);
+      return `${rowIndex}\t${t}`;
+    })
+    .join(RS);
 }
 
-function parseTsvOutput(outputText, chunk) {
-  const raw = String(outputText ?? "").trim();
-  if (!raw) throw httpError(502, "OpenAI returned empty output.");
+function parseOutputPayload(raw, expectedRowIndexes) {
+  const parts = String(raw ?? "").split(RS);
 
-  const lines = raw.split(/\r?\n/).map((s) => s.trim()).filter(Boolean);
+  // Normalize: trim each record outer whitespace only
+  const records = parts
+    .map((p) => String(p ?? "").trim())
+    .filter((p) => p.length > 0);
 
-  // strip accidental code fences
-  const cleaned = [];
-  for (const ln of lines) {
-    if (ln.startsWith("```")) continue;
-    cleaned.push(ln);
-  }
-
-  if (cleaned.length !== chunk.length) {
-    throw httpError(502, `OpenAI output line count mismatch. expected=${chunk.length}, got=${cleaned.length}`, {
-      expected: chunk.length,
-      got: cleaned.length,
-      sample: cleaned.slice(0, 5),
-    });
+  const out = new Map();
+  for (const rec of records) {
+    const tab = rec.indexOf("\t");
+    if (tab <= 0) continue;
+    const k = Number(rec.slice(0, tab).trim());
+    if (!Number.isFinite(k)) continue;
+    const v = rec.slice(tab + 1);
+    out.set(k, restoreNewlines(v));
   }
 
   const results = [];
-  for (let i = 0; i < chunk.length; i++) {
-    const expectedRow = Number(chunk[i]?.rowIndex);
-    const ln = cleaned[i];
-
-    const tabPos = ln.indexOf("\t");
-    if (tabPos < 0) throw httpError(502, "OpenAI output must be TSV (<rowIndex>\\t<text>).", { line: ln });
-
-    const rowStr = ln.slice(0, tabPos).trim();
-    const text = ln.slice(tabPos + 1);
-
-    const rowIndex = Number(rowStr);
-    if (!Number.isFinite(rowIndex) || rowIndex !== expectedRow) {
-      throw httpError(502, "OpenAI output rowIndex mismatch.", { expectedRow, gotRow: rowStr, line: ln });
-    }
-
-    results.push({ rowIndex, translatedText: String(text ?? "") });
+  for (const ri of expectedRowIndexes) {
+    const t = out.get(ri);
+    results.push({ rowIndex: ri, translatedText: t ?? null });
   }
-
   return results;
 }
 
-/**
- * OpenAI Responses API (no SDK)
- */
-async function callOpenAIResponses({ model, instructions, input, timeoutMs, maxRetries }) {
-  const url = "https://api.openai.com/v1/responses";
+function buildSystemPrompt({ sourceLang, targetLang }) {
+  return [
+    `You are a professional game localization translator.`,
+    `Translate from ${sourceLang} to ${targetLang}.`,
+    `HARD RULES:`,
+    `- Output MUST keep the same record structure.`,
+    `- Records are separated by the character "${RS}". Do NOT remove it.`,
+    `- Each record format: <rowIndex>\\t<text>. Keep the same rowIndex.`,
+    `- Newlines are encoded as the character "${NL}". Do NOT change/remove it.`,
+    `- Keep any "{mask:N}" tokens EXACTLY unchanged.`,
+    `- Preserve punctuation, numbers, tags (<TIPBOX>, <INFO>, <NAV>), slashes/commands.`,
+    `- Do not add commentary; output ONLY the translated records.`,
+  ].join("\n");
+}
 
-  const payload = {
-    model,
-    instructions,
-    input,
+async function fetchWithTimeout(url, options, timeoutMs) {
+  const controller = new AbortController();
+  const id = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const resp = await fetch(url, { ...options, signal: controller.signal });
+    return resp;
+  } finally {
+    clearTimeout(id);
+  }
+}
+
+async function callOpenAIChatCompletions({
+  model,
+  temperature,
+  maxTokens,
+  messages,
+  timeoutMs,
+}) {
+  const apiKey = String(process.env.OPENAI_API_KEY || "").trim();
+  if (!apiKey) throw new Error("OPENAI_API_KEY is missing in environment.");
+
+  const url = `${OPENAI_BASE_URL}/chat/completions`;
+
+  const body = {
+    model: model || DEFAULT_MODEL,
+    temperature: typeof temperature === "number" ? temperature : DEFAULT_TEMPERATURE,
+    max_tokens: typeof maxTokens === "number" ? maxTokens : DEFAULT_MAX_OUTPUT_TOKENS,
+    messages,
   };
 
-  const retries = Number(maxRetries ?? 3);
-  const timeout = Number(timeoutMs ?? 60000);
+  const resp = await fetchWithTimeout(
+    url,
+    {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${apiKey}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(body),
+    },
+    Math.max(1_000, Number(timeoutMs ?? DEFAULT_TIMEOUT_MS))
+  );
 
-  for (let attempt = 0; attempt <= retries; attempt++) {
-    const ctrl = new AbortController();
-    const t = setTimeout(() => ctrl.abort(), timeout);
+  const text = await resp.text();
+  let data = null;
+  try {
+    data = JSON.parse(text);
+  } catch {
+    // keep as raw text
+  }
 
-    try {
-      const res = await fetch(url, {
-        method: "POST",
-        signal: ctrl.signal,
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${OPENAI_API_KEY}`,
-        },
-        body: JSON.stringify(payload),
+  if (!resp.ok) {
+    const msg =
+      (data && (data.error?.message || data.error?.type || JSON.stringify(data))) ||
+      text ||
+      `OpenAI error status=${resp.status}`;
+    const err = new Error(msg);
+    err.status = 502;
+    err.extra = { openaiStatus: resp.status };
+    throw err;
+  }
+
+  const out = data?.choices?.[0]?.message?.content ?? "";
+  return String(out);
+}
+
+/**
+ * Translate items in chunks with newline & record boundary guarantees.
+ * @param {object} args
+ * @param {string} args.sourceLang
+ * @param {string} args.targetLang
+ * @param {Array<{rowIndex:number, sourceText?:string, textForTranslate:string}>} args.items
+ * @param {number} args.chunkSize
+ * @param {string} [args.model]
+ * @returns {Promise<{results:Array<{rowIndex:number, sourceText?:string, translatedText:string, _fallbackUsed?:boolean}>, meta:object}>}
+ */
+export async function translateItemsWithGpt41(args) {
+  const started = nowMs();
+
+  const sourceLang = String(args.sourceLang ?? "").trim();
+  const targetLang = String(args.targetLang ?? "").trim();
+  const items = Array.isArray(args.items) ? args.items : [];
+  const chunkSize = Math.max(1, Math.min(Number(args.chunkSize ?? 25), 100));
+  const model = args.model || DEFAULT_MODEL;
+
+  assertString(sourceLang, "sourceLang");
+  assertString(targetLang, "targetLang");
+
+  if (!items.length) {
+    return {
+      results: [],
+      meta: { model, chunks: 0, chunkSize, elapsedMs: nowMs() - started, items: 0 },
+    };
+  }
+
+  const resultsAll = [];
+  let chunks = 0;
+
+  for (let i = 0; i < items.length; i += chunkSize) {
+    chunks += 1;
+    const chunk = items.slice(i, i + chunkSize);
+
+    const expectedRowIndexes = chunk.map((it) => Number(it.rowIndex));
+    const inputText = buildInputPayload(chunk);
+
+    const system = buildSystemPrompt({ sourceLang, targetLang });
+
+    // 1st pass
+    let outText = await callOpenAIChatCompletions({
+      model,
+      temperature: DEFAULT_TEMPERATURE,
+      maxTokens: DEFAULT_MAX_OUTPUT_TOKENS,
+      timeoutMs: DEFAULT_TIMEOUT_MS,
+      messages: [
+        { role: "system", content: system },
+        { role: "user", content: inputText },
+      ],
+    });
+
+    let parsed = parseOutputPayload(outText, expectedRowIndexes);
+
+    // Repair pass if any missing
+    const missing = parsed.filter((x) => !x.translatedText || String(x.translatedText).trim() === "");
+    if (missing.length > 0) {
+      const repairSystem = [
+        `You must REPAIR the output.`,
+        `Return ALL records for the input. Keep "${RS}" separators and "${NL}" newline tokens.`,
+        `Output ONLY records.`,
+      ].join("\n");
+
+      outText = await callOpenAIChatCompletions({
+        model,
+        temperature: 0,
+        maxTokens: DEFAULT_MAX_OUTPUT_TOKENS,
+        timeoutMs: DEFAULT_TIMEOUT_MS,
+        messages: [
+          { role: "system", content: system + "\n" + repairSystem },
+          { role: "user", content: inputText },
+          { role: "user", content: "The previous output missed some records. Return all records correctly." },
+        ],
       });
 
-      const data = await res.json().catch(() => null);
+      parsed = parseOutputPayload(outText, expectedRowIndexes);
+    }
 
-      if (!res.ok) {
-        const msg =
-          (data && (data.error?.message || data.message)) ||
-          `OpenAI API error: ${res.status}`;
+    // Finalize: if still missing, fallback to original textForTranslate
+    for (const it of chunk) {
+      const ri = Number(it.rowIndex);
+      const got = parsed.find((x) => Number(x.rowIndex) === ri);
+      const t = got?.translatedText;
 
-        if ((res.status === 429 || res.status >= 500) && attempt < retries) {
-          await sleep(250 * (attempt + 1) ** 2);
-          continue;
-        }
-        throw httpError(502, msg, { status: res.status, data });
-      }
-
-      return extractOutputText(data);
-    } catch (e) {
-      const isAbort = String(e?.name) === "AbortError";
-      if ((isAbort || isTransientFetchError(e)) && attempt < retries) {
-        await sleep(250 * (attempt + 1) ** 2);
-        continue;
-      }
-      throw e;
-    } finally {
-      clearTimeout(t);
+      resultsAll.push({
+        rowIndex: ri,
+        sourceText: String(it.sourceText ?? ""),
+        translatedText: t && String(t).trim() ? String(t) : String(it.textForTranslate ?? ""),
+        _fallbackUsed: !(t && String(t).trim()),
+      });
     }
   }
 
-  throw httpError(502, "OpenAI API: exceeded retry limit.");
-}
-
-function isTransientFetchError(e) {
-  const msg = String(e?.message ?? "");
-  return /ECONNRESET|ETIMEDOUT|EAI_AGAIN|fetch failed/i.test(msg);
-}
-
-function extractOutputText(data) {
-  if (!data || typeof data !== "object") return "";
-
-  if (typeof data.output_text === "string") return data.output_text;
-
-  const out = Array.isArray(data.output) ? data.output : [];
-  const parts = [];
-
-  for (const o of out) {
-    const content = Array.isArray(o?.content) ? o.content : [];
-    for (const c of content) {
-      if (c?.type === "output_text" && typeof c?.text === "string") parts.push(c.text);
-      if (c?.type === "text" && typeof c?.text === "string") parts.push(c.text);
-    }
-  }
-
-  return parts.join("\n").trim();
+  return {
+    results: resultsAll,
+    meta: {
+      model,
+      chunks,
+      chunkSize,
+      elapsedMs: nowMs() - started,
+      items: items.length,
+    },
+  };
 }
