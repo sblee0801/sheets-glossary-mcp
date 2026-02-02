@@ -31,8 +31,8 @@ export function registerMcp(app) {
         forceReload: Boolean(forceReload),
       });
 
-      const sourceLangKey = normalizeLang(sourceLang);
-      const targetLangKey = normalizeLang(targetLang);
+      const sourceLangKey = normalizeLang(sourceLang);  // normalizeLang 적용
+      const targetLangKey = normalizeLang(targetLang);  // normalizeLang 적용
 
       assertAllowedSourceLang(sourceLangKey);
 

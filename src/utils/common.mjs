@@ -1,9 +1,4 @@
-/**
- * src/utils/common.mjs
- * - 여러 모듈에서 공통으로 쓰는 유틸 함수 모음
- * - 상태(캐시) 없음: 순수 유틸 성격 유지
- */
-
+// src/utils/common.mjs
 import crypto from "crypto";
 
 // ---------------- Normalize ----------------
@@ -45,8 +40,8 @@ export function getParsedBody(req) {
 
 // ---------------- Validation helpers ----------------
 export function assertAllowedSourceLang(sourceLangKey) {
-  if (sourceLangKey !== "ko-kr" && sourceLangKey !== "en-us") {
-    const err = new Error("sourceLang must be ko-KR or en-US");
+  if (sourceLangKey !== "ko-kr" && sourceLangKey !== "en-us" && sourceLangKey !== "th-th") {
+    const err = new Error("sourceLang must be ko-KR, en-US, or th-TH");
     err.status = 400;
     throw err;
   }
@@ -59,3 +54,16 @@ export function isLikelyEnglish(s) {
   const ratio = ascii.length / Math.max(1, t.length);
   return ratio > 0.95;
 }
+
+// ---------------- Line break handling ----------------
+// 줄바꿈 문자를 <br> 태그로 변환하는 함수
+export function formatTextWithLineBreaks(text) {
+  if (typeof text === 'string') {
+    return text.replace(/\n/g, "<br>");
+  }
+  return text;
+}
+
+// 예시 사용
+const formattedText = formatTextWithLineBreaks("Hello, world!\nThis is a new line.");
+console.log(formattedText);  // 줄바꿈 처리된 텍스트 반환
