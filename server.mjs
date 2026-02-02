@@ -2,16 +2,14 @@
  * server.mjs (ENTRY)
  * - REST only (CustomGPT Actions/OpenAPI)
  * - ✅ Health/Healthz: no-store + ETag off + slash/alias/method 방어
- * - ✅ Adds revision info (K_REVISION) to detect traffic mixing
- * - ✅ Adds /debug/echo to inspect what CustomGPT actually sends
- * - ✅ Listens on process.env.PORT first (Cloud Run)
+ * - ✅ strict routing OFF (trailing slash 차이 제거)
  * - Response size guard 유지
  */
 
 import "dotenv/config";
 import express from "express";
 
-import { PORT as ENV_PORT, SHEET_RANGE, RULE_SHEET_RANGE, assertRequiredEnv } from "./src/config/env.mjs";
+import { PORT, SHEET_RANGE, RULE_SHEET_RANGE, assertRequiredEnv } from "./src/config/env.mjs";
 import { registerRoutes } from "./src/http/routes.mjs";
 
 // ---- boot-time env validation ----
@@ -26,13 +24,51 @@ const RESPONSE_LIMIT_BYTES = Math.max(50 * 1024, RESPONSE_LIMIT_KB * 1024);
 const app = express();
 app.disable("x-powered-by");
 
-// ✅ 304 방지
+// ✅ trailing slash 차이 제거 (중요)
+app.set("strict routing", false);
+app.set("case sensitive routing", false);
+
+// ✅ 304 방지 (CustomGPT가 304를 실패로 볼 수 있음)
 app.set("etag", false);
 
-// ---- request log (필수: CustomGPT가 실제 어떤 method/path로 오는지 확인) ----
+// (원하면 켜기) 요청이 실제 어떤 path/method로 오는지 로그
 app.use((req, _res, next) => {
   console.log(`[REQ] ${req.method} ${req.originalUrl}`);
   next();
+});
+
+// ✅ Health는 “가장 먼저” + “항상 200 + JSON 바디” + “캐시 금지”
+const noStore = (res) => {
+  res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate, proxy-revalidate");
+  res.setHeader("Pragma", "no-cache");
+  res.setHeader("Expires", "0");
+  if (typeof res.removeHeader === "function") res.removeHeader("ETag");
+};
+
+const healthJson = (req, res) => {
+  noStore(res);
+  return res.status(200).json({
+    ok: true,
+    revision: process.env.K_REVISION ?? null,
+    service: process.env.K_SERVICE ?? null,
+    path: req.originalUrl,
+  });
+};
+
+// ✅ 메서드/슬래시/프리픽스 변형 전부 허용
+app.all("/health", healthJson);
+app.all("/health/", healthJson);
+app.all("/healthz", healthJson);
+app.all("/healthz/", healthJson);
+app.all("/v1/health", healthJson);
+app.all("/v1/health/", healthJson);
+app.all("/v1/healthz", healthJson);
+app.all("/v1/healthz/", healthJson);
+
+// root도 항상 살아있게
+app.all("/", (_req, res) => {
+  noStore(res);
+  return res.status(200).send("ok");
 });
 
 // ---- body parsers ----
@@ -44,7 +80,9 @@ app.use(
 );
 app.use(express.text({ limit: BODY_LIMIT, type: ["text/*"] }));
 
-// ---- Response size guard + logging ----
+/**
+ * Response size guard + logging
+ */
 app.use((req, res, next) => {
   const startedAt = Date.now();
 
@@ -125,63 +163,10 @@ app.use((req, res, next) => {
   next();
 });
 
-// ---- cache control helper ----
-const noStore = (res) => {
-  res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate, proxy-revalidate");
-  res.setHeader("Pragma", "no-cache");
-  res.setHeader("Expires", "0");
-};
-
-// ✅ Health는 “무조건” 여기서 먼저 잡는다 (routes와 무관하게)
-const healthJson = (_req, res) => {
-  noStore(res);
-  return res.status(200).json({
-    ok: true,
-    // ✅ 이게 핵심: /healthz 와 /healthz/ 가 같은 revision인지 확인 가능
-    revision: process.env.K_REVISION || null,
-    service: process.env.K_SERVICE || null,
-  });
-};
-
-// 슬래시/프리픽스/메서드 변형 모두 허용
-app.all(
-  [
-    "/health",
-    "/health/",
-    "/healthz",
-    "/healthz/",
-    "/v1/health",
-    "/v1/health/",
-    "/v1/healthz",
-    "/v1/healthz/",
-  ],
-  healthJson
-);
-
-// root
-app.get("/", (_req, res) => {
-  noStore(res);
-  return res.status(200).send("ok");
-});
-
-// ✅ CustomGPT가 뭘 보내는지 확인하는 에코(원인 확정용)
-app.all("/debug/echo", (req, res) => {
-  noStore(res);
-  return res.status(200).json({
-    ok: true,
-    method: req.method,
-    path: req.originalUrl,
-    headers: req.headers,
-    // express.json/text 이후라 body가 여기서 보임
-    body: req.body,
-    revision: process.env.K_REVISION || null,
-  });
-});
-
-// ---- register endpoints ----
+// ---- register endpoints (REST only) ----
 registerRoutes(app);
 
-// 404 디버깅
+// ✅ 404 디버깅 핸들러 (항상 JSON)
 app.use((req, res) => {
   noStore(res);
   res.status(404).json({
@@ -189,17 +174,12 @@ app.use((req, res) => {
     error: "NotFound",
     method: req.method,
     path: req.originalUrl,
-    revision: process.env.K_REVISION || null,
   });
 });
 
 // ---- start ----
-// ✅ Cloud Run은 process.env.PORT 가 최우선
-const port = Number(process.env.PORT || ENV_PORT || 8080);
-
-app.listen(port, () => {
-  console.log(`Server listening on :${port}`);
-  console.log(`K_REVISION=${process.env.K_REVISION || ""}`);
+app.listen(PORT, () => {
+  console.log(`Server listening on :${PORT}`);
   console.log(`Sheet range: ${SHEET_RANGE} (TERM ignored)`);
   console.log(`Rule range: ${RULE_SHEET_RANGE}`);
   console.log(`BODY_LIMIT=${BODY_LIMIT}`);
