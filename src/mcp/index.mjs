@@ -28,8 +28,8 @@ export function registerMcp(app) {
       sheet: z.string().optional(),
       texts: z.array(z.string()).min(1).max(2000),
       category: z.string().optional(),
-      sourceLang: z.string().min(1),
-      targetLang: z.string().min(1),
+      sourceLang: z.enum(["en-US", "ko-KR"]).min(1),  // sourceLang은 "en-US", "ko-KR"만 허용
+      targetLang: z.array(z.string()).min(1),  // targetLang은 다국어 지원 (배열로 여러 언어 지원)
       includeLogs: z.boolean().optional(),
       forceReload: z.boolean().optional(),
     },
@@ -40,7 +40,7 @@ export function registerMcp(app) {
       });
 
       const sourceLangKey = normalizeLang(sourceLang);  // normalizeLang 적용
-      const targetLangKey = normalizeLang(targetLang);  // normalizeLang 적용
+      const wantLogs = includeLogs ?? true;
 
       assertAllowedSourceLang(sourceLangKey);
 
@@ -93,27 +93,28 @@ export function registerMcp(app) {
         };
       }
 
-      const wantLogs = includeLogs ?? true;
-
       const outTexts = [];
       const perLineLogs = [];
       let replacedTotalAll = 0;
       let matchedTermsAll = 0;
 
+      // 여러 targetLang을 지원하도록 처리
       for (let i = 0; i < texts.length; i++) {
         const input = texts[i];
-        const { out, replacedTotal, logs } = replaceByGlossaryWithLogs({
-          text: input,
-          sourceLangKey,
-          targetLangKey,
-          sourceTextMap,
-        });
+        for (const targetLangKey of targetLang) {
+          const { out, replacedTotal, logs } = replaceByGlossaryWithLogs({
+            text: input,
+            sourceLangKey,
+            targetLangKey: normalizeLang(targetLangKey),
+            sourceTextMap,
+          });
 
-        outTexts.push(formatTextWithLineBreaks(out)); // 줄바꿈 처리
-        replacedTotalAll += replacedTotal;
-        matchedTermsAll += logs.length;
+          outTexts.push(formatTextWithLineBreaks(out));  // 줄바꿈 처리
+          replacedTotalAll += replacedTotal;
+          matchedTermsAll += logs.length;
 
-        if (wantLogs) perLineLogs.push({ index: i, replacedTotal, logs });
+          if (wantLogs) perLineLogs.push({ index: i, replacedTotal, logs });
+        }
       }
 
       return {
@@ -126,7 +127,7 @@ export function registerMcp(app) {
                 sheet: cache.sheetName,
                 category: category ? String(category).trim().toLowerCase() : "ALL",
                 sourceLang: sourceLangKey,
-                targetLang: targetLangKey,
+                targetLangs: targetLang,  // 여러 targetLang을 함께 반환
                 texts: outTexts,
                 summary: {
                   lines: texts.length,

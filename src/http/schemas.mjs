@@ -120,7 +120,7 @@ export const CandidatesBatchSchema = z.object({
   sheet: SheetOpt,
   category: CategoryStr.optional().default(""),
 
-  sourceLang: z.enum(["en-US", "ko-KR", "th-TH"]).optional().default("en-US"), // "th-TH" 추가
+  sourceLang: z.enum(["en-US", "ko-KR", "th-TH"]).optional().default("en-US"),
   sourceTexts: z.array(z.string().min(1)).min(1).max(500),
   targetLangs: z.array(z.string().min(1)).min(1).max(20),
   sources: z.array(z.enum(["divinePride"])).optional(),
@@ -132,7 +132,7 @@ export const ApplySchema = z.object({
   sheet: SheetOpt,
   category: CategoryStr.optional().default(""),
 
-  sourceLang: z.enum(["en-US", "ko-KR", "th-TH"]).optional().default("en-US"), // "th-TH" 추가
+  sourceLang: z.enum(["en-US", "ko-KR", "th-TH"]).optional().default("en-US"),
   entries: z
     .array(
       z.object({
@@ -152,88 +152,11 @@ export const PendingNextSchema = z.object({
   sheet: SheetOpt,
   category: CategoryStr.optional().default(""),
 
-  sourceLang: z.enum(["en-US", "ko-KR", "th-TH"]).optional().default("en-US"), // "th-TH" 추가
+  sourceLang: z.enum(["en-US", "ko-KR", "th-TH"]).optional().default("en-US"),
   targetLangs: z.array(z.string().min(1)).min(1).max(20),
 
   limit: z.number().int().min(1).max(500).optional().default(100),
   forceReload: z.boolean().optional().default(false),
 
   excludeRowIndexes: z.array(z.number().int().min(2)).max(5000).optional(),
-});
-
-// ---------------- QA ----------------
-export const GlossaryQaNextSchema = z.object({
-  sheet: SheetOpt,
-  category: CategoryStr.optional().default(""),
-
-  sourceLang: z.enum(["en-US", "ko-KR", "th-TH"]).optional().default("en-US"), // "th-TH" 추가
-  targetLang: z.string().min(1),
-  limit: z.number().int().min(1).max(500).optional().default(100),
-  cursor: OptTrimmedStr,
-  forceReload: z.boolean().optional().default(false),
-});
-
-// ---------------- Mask (read / processing) ----------------
-export const MaskSchema = z.object({
-  sheet: SheetOpt,
-  glossarySheet: OptTrimmedStr.default("Glossary"),
-
-  category: CategoryStr.optional().default(""),
-
-  sourceLang: z.enum(["en-US", "ko-KR", "th-TH"]).optional().default("en-US"), // "th-TH" 추가
-  targetLang: z.string().min(1),
-
-  texts: TextsParam,
-
-  maskStyle: z.enum(["braces"]).optional().default("braces"),
-  restoreStrategy: z.enum(["glossaryTarget", "anchor"]).optional().default("glossaryTarget"),
-
-  caseSensitive: z.boolean().optional().default(true),
-  wordBoundary: z.boolean().optional().default(true),
-
-  forceReload: z.boolean().optional().default(false),
-});
-
-// ---------------- Mask Apply (WRITE) ----------------
-export const MaskApplySchema = z.object({
-  sheet: z.string().min(1),
-  targetLang: z.string().min(1),
-  entries: z
-    .array(
-      z.object({
-        rowIndex: z.number().int().min(2),
-        maskedText: z.string().min(1),
-      })
-    )
-    .min(1)
-    .max(2000),
-});
-
-/**
- * ✅ NEW: /v1/translate/auto (server-side translation) schema
- * - mode="replace": server will apply glossary replacement then translate
- * - mode="mask": client may provide textProcessed (e.g., textsMasked) for translation
- */
-export const AutoTranslateSchema = z.object({
-  sheet: SheetOpt,
-  category: CategoryStr.optional().default(""),
-
-  mode: z.enum(["replace", "mask"]).optional().default("mask"),
-
-  sourceLang: z.enum(["en-US", "ko-KR", "th-TH"]).optional().default("en-US"), // "th-TH" 추가
-  targetLang: z.string().min(1),
-
-  chunkSize: z.number().int().min(1).max(100).optional(),
-  forceReload: z.boolean().optional().default(false),
-
-  items: z
-    .array(
-      z.object({
-        rowIndex: z.number().int().min(2),
-        sourceText: z.string().min(1),
-        textProcessed: z.string().optional(),
-      })
-    )
-    .min(1)
-    .max(500),
 });

@@ -63,7 +63,3 @@ export function formatTextWithLineBreaks(text) {
   }
   return text;
 }
-
-// 예시 사용
-const formattedText = formatTextWithLineBreaks("Hello, world!\nThis is a new line.");
-console.log(formattedText);  // 줄바꿈 처리된 텍스트 반환
