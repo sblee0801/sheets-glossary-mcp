@@ -199,30 +199,29 @@ function maskOneTextWithPlan({ text, regexPlan, termToMaskId, masksById, maskSty
 export function registerRoutes(app) {
   /**
    * ✅ Health routes: CustomGPT/Connector 방어 (강화판)
-   * - GET/HEAD/OPTIONS 포함 어떤 메서드로 와도 200 + JSON 바디 반환
-   * - /healthz 와 /healthz/ (trailing slash) 둘 다 허용
-   * - /v1 prefix 붙는 케이스도 허용
-   * - ✅ 캐시/ETag로 인한 304 응답을 방지 (CustomGPT가 304를 실패로 보는 경우가 있음)
+   * - HEAD/OPTIONS/trailing slash(/healthz/) 방어
+   * - /v1 prefix 방어
+   * - ✅ 캐시/ETag로 인한 304 방지 (CustomGPT가 304를 실패로 볼 수 있음)
    */
-  const noStoreHeaders = (res) => {
+  const noStore = (res) => {
     res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate, proxy-revalidate");
     res.setHeader("Pragma", "no-cache");
     res.setHeader("Expires", "0");
-    // ETag/304 방지용. (express가 자동으로 붙이는 경우가 있어 명시적으로 제거)
-    res.removeHeader?.("ETag");
+    // express가 ETag를 붙이는 경우가 있어 제거(가능한 경우)
+    if (typeof res.removeHeader === "function") res.removeHeader("ETag");
   };
 
   const healthJson = (_req, res) => {
-    noStoreHeaders(res);
+    noStore(res);
     return res.status(200).json({ ok: true });
   };
 
   const rootOk = (_req, res) => {
-    noStoreHeaders(res);
+    noStore(res);
     return res.status(200).send("ok");
   };
 
-  // ✅ all()로 메서드 방어 + 슬래시 변형 모두 수용
+  // ✅ 메서드/슬래시 변형 전부 허용
   app.all(["/health", "/health/"], healthJson);
   app.all(["/healthz", "/healthz/"], healthJson);
 
@@ -230,8 +229,7 @@ export function registerRoutes(app) {
   app.all(["/v1/health", "/v1/health/"], healthJson);
   app.all(["/v1/healthz", "/v1/healthz/"], healthJson);
 
-  // root
-  app.all("/", rootOk);
+
 
   /**
    * Session init (optional)
