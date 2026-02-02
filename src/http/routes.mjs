@@ -116,7 +116,20 @@ function toJson(res, status, payload) {
   res.status(status).json(payload);
 }
 
+/**
+ * ✅ IMPORTANT:
+ * - Zod parse 에러(issues)가 status 없이 throw 되면 기존 로직에선 500이 됨
+ * - 이제 issues가 있으면 400 + details로 내려서 원인 추적 가능
+ */
 function handleErr(res, e) {
+  if (e && Array.isArray(e.issues)) {
+    return toJson(res, 400, {
+      ok: false,
+      error: "InvalidRequest",
+      details: e.issues,
+    });
+  }
+
   const status = Number(e?.status) || 500;
   toJson(res, status, {
     ok: false,
@@ -610,11 +623,19 @@ export function registerRoutes(app) {
 
       if (!processed.length) throw httpError(400, "No valid items to process.");
 
+      /**
+       * ✅ CRITICAL FIX:
+       * translateItemsWithGpt41 expects items[].textForTranslate
+       * (기존 코드의 { text: ... } 는 번역 입력이 깨질 수 있음)
+       */
       const tRes = await translateItemsWithGpt41({
-        items: processed.map((x) => ({ rowIndex: x.rowIndex, text: x.processedText })),
+        items: processed.map((x) => ({
+          rowIndex: x.rowIndex,
+          sourceText: x.sourceText,
+          textForTranslate: x.processedText,
+        })),
         sourceLang: sourceLangKey,
         targetLang: targetLangKey,
-        mode,
         chunkSize: v.chunkSize,
       });
 

@@ -1,20 +1,14 @@
-/**
- * src/replace/replace.mjs
- * - Phase 1: Glossary 치환 + 상세 로그
- * - Phase 1.5: Rules 매칭 로그(치환/생성 없음)
- *
- * ✅ Performance upgrades (backward compatible):
- * 1) Add "compiled replace plan" to avoid per-request:
- *    - sorting terms
- *    - creating RegExp objects
- *    - scanning sourceTextMap to pick targets
- * 2) Add fast replace helper (no logs) for bulk processing
- * 3) Rule logs: support precompiled rule regex/pattern if provided in rulesCache entries
- *
- * 원칙:
- * - 기존 API와 호환 유지 (replaceByGlossaryWithLogs 시그니처 유지)
- * - 호출자가 compileReplacePlan() 결과를 넘기면 성능 크게 개선
- */
+// src/replace/replace.mjs
+// - Phase 1: Glossary 치환 + 상세 로그
+// - Phase 1.5: Rules 매칭 로그(치환/생성 없음)
+//
+// ✅ Performance upgrades (backward compatible):
+// 1) Add "compiled replace plan" to avoid per-request:
+//    - sorting terms
+//    - creating RegExp objects
+//    - scanning sourceTextMap to pick targets
+// 2) Add fast replace helper (no logs) for bulk processing
+// 3) Rule logs: support precompiled rule regex/pattern if provided in rulesCache entries
 
 import { escapeRegExp } from "../utils/common.mjs";
 

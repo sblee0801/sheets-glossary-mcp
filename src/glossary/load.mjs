@@ -1,17 +1,6 @@
-/**
- * src/glossary/load.mjs
- * - Glossary-like 시트를 로드해서 entries 구조로 변환
- * - "언어 컬럼 인덱스(langIndex)"를 자동 구성
- *
- * 지원 형식:
- * 1) Glossary형: KEY + 분류 + 언어 컬럼들 (기존)
- * 2) Trans형: ID + 언어 컬럼들 (분류 없음)
- *
- * 정책:
- * - 언어 컬럼은 헤더 기반 자동 탐지
- * - ko-KR 컬럼은 필수
- * - category(분류)가 없으면 sheetName을 category로 강제 주입 (인덱스 생성 안정화)
- */
+// src/glossary/load.mjs
+// - Glossary-like 시트를 로드해서 entries 구조로 변환
+// - "언어 컬럼 인덱스(langIndex)"를 자동 구성
 
 import { DEFAULT_SHEET_NAME, buildSheetRange } from "../config/env.mjs";
 import { readSheetRange } from "../google/sheets.mjs";
