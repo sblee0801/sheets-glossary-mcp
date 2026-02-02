@@ -197,10 +197,25 @@ function maskOneTextWithPlan({ text, regexPlan, termToMaskId, masksById, maskSty
 
 // ---------------- Endpoint registration ----------------
 export function registerRoutes(app) {
-  // basic routes
-  app.get("/health", (_req, res) => res.status(200).json({ ok: true }));
-  app.get("/healthz", (_req, res) => res.status(200).json({ ok: true }));
-  app.get("/", (_req, res) => res.status(200).send("ok"));
+  /**
+   * ✅ Health routes: CustomGPT/Connector 방어
+   * - 일부 클라이언트가 HEAD/OPTIONS 또는 trailing slash(/healthz/)로 호출하는 케이스가 있어
+   *   GET만 열어두면 404처럼 보일 수 있음.
+   * - 또한 어떤 환경은 /v1 prefix를 붙여 호출하는 케이스도 있어 alias를 둠.
+   */
+  const healthJson = (_req, res) => res.status(200).json({ ok: true });
+  const rootOk = (_req, res) => res.status(200).send("ok");
+
+  app.all("/health", healthJson);
+  app.all("/health/", healthJson);
+  app.all("/healthz", healthJson);
+  app.all("/healthz/", healthJson);
+
+  // optional aliases (defensive)
+  app.all("/v1/health", healthJson);
+  app.all("/v1/healthz", healthJson);
+
+  app.all("/", rootOk);
 
   /**
    * Session init (optional)
@@ -626,7 +641,6 @@ export function registerRoutes(app) {
       /**
        * ✅ CRITICAL FIX:
        * translateItemsWithGpt41 expects items[].textForTranslate
-       * (기존 코드의 { text: ... } 는 번역 입력이 깨질 수 있음)
        */
       const tRes = await translateItemsWithGpt41({
         items: processed.map((x) => ({

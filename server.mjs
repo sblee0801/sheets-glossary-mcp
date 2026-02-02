@@ -1,33 +1,30 @@
 /**
- * server.mjs (ENTRY)
+ * src/server.mjs (ENTRY)
  * - Express 앱 생성 + 미들웨어 설정
  * - REST 라우트 등록
  * - (MCP 제거) CustomGPT Actions(OpenAPI) 기반 REST만 사용
  * - 응답 크기 가드(커넥터 ResponseTooLarge 사전 차단)
- * - 응답 바이트 로깅(어느 엔드포인트가 폭주하는지 즉시 확정)
+ * - 응답 바이트 로깅
  */
 
 import "dotenv/config";
 import express from "express";
 
-import { PORT, SHEET_RANGE, RULE_SHEET_RANGE, assertRequiredEnv } from "./src/config/env.mjs";
-import { registerRoutes } from "./src/http/routes.mjs";
+import { PORT, SHEET_RANGE, RULE_SHEET_RANGE, assertRequiredEnv } from "./config/env.mjs";
+import { registerRoutes } from "./http/routes.mjs";
 
 // ---- boot-time env validation ----
 assertRequiredEnv();
 
 // ---- env knobs ----
-// 요청 바디 제한(서버가 받는 입력 제한)
 const BODY_LIMIT = process.env.BODY_LIMIT ?? "8mb";
-
-// 커넥터/Actions 쪽은 "응답"이 너무 크면 죽는다.
-// 서버에서 미리 컷해서 작은 에러(JSON)로 돌려주기 위한 제한.
-const RESPONSE_LIMIT_KB = Number(process.env.RESPONSE_LIMIT_KB ?? "900"); // 기본 900KB
-const RESPONSE_LIMIT_BYTES = Math.max(50 * 1024, RESPONSE_LIMIT_KB * 1024); // 최소 50KB 안전장치
+const RESPONSE_LIMIT_KB = Number(process.env.RESPONSE_LIMIT_KB ?? "900");
+const RESPONSE_LIMIT_BYTES = Math.max(50 * 1024, RESPONSE_LIMIT_KB * 1024);
 
 // ---- app ----
 const app = express();
 
+// ---- parsers ----
 app.use(
   express.json({
     limit: BODY_LIMIT,
@@ -37,9 +34,20 @@ app.use(
 app.use(express.text({ limit: BODY_LIMIT, type: ["text/*"] }));
 
 /**
+ * CORS (CustomGPT/Connector 방어)
+ * - Connector는 서버-서버라 CORS 불필요한 경우도 많지만,
+ *   일부 환경에서 preflight(OPTIONS) 때문에 실패하는 케이스를 막음.
+ */
+app.use((req, res, next) => {
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Access-Control-Allow-Methods", "GET,POST,PUT,PATCH,DELETE,OPTIONS,HEAD");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Requested-With");
+  if (req.method === "OPTIONS") return res.status(204).send("");
+  next();
+});
+
+/**
  * Response size guard + logging
- * - res.json / res.send payload 바이트를 계산해 상한 초과 시 "작은 에러"로 대체
- * - 어떤 path가 얼마나 큰 응답을 만들었는지 로그로 고정
  */
 app.use((req, res, next) => {
   const startedAt = Date.now();
@@ -52,10 +60,8 @@ app.use((req, res, next) => {
       if (payload == null) return 0;
       if (Buffer.isBuffer(payload)) return payload.length;
       if (typeof payload === "string") return Buffer.byteLength(payload, "utf8");
-      // object / array
       return Buffer.byteLength(JSON.stringify(payload), "utf8");
     } catch {
-      // 최악의 경우를 대비
       return RESPONSE_LIMIT_BYTES + 1;
     }
   }
@@ -79,7 +85,7 @@ app.use((req, res, next) => {
         ok: false,
         error: "ResponseTooLarge",
         message:
-          "Server response exceeded safe limit for CustomGPT Actions. Reduce payload (e.g., return only matched mask ids, not full glossary/masks).",
+          "Server response exceeded safe limit for CustomGPT Actions. Reduce payload size.",
         meta: {
           responseBytes: bytes,
           limitBytes: RESPONSE_LIMIT_BYTES,
@@ -105,7 +111,7 @@ app.use((req, res, next) => {
           ok: false,
           error: "ResponseTooLarge",
           message:
-            "Server response exceeded safe limit for CustomGPT Actions. Reduce payload (e.g., return only matched mask ids, not full glossary/masks).",
+            "Server response exceeded safe limit for CustomGPT Actions. Reduce payload size.",
           meta: {
             responseBytes: bytes,
             limitBytes: RESPONSE_LIMIT_BYTES,
@@ -124,7 +130,7 @@ app.use((req, res, next) => {
   next();
 });
 
-// ---- register endpoints (REST only) ----
+// ---- register endpoints ----
 registerRoutes(app);
 
 // ---- start ----
@@ -134,7 +140,4 @@ app.listen(PORT, () => {
   console.log(`Rule range: ${RULE_SHEET_RANGE}`);
   console.log(`BODY_LIMIT=${BODY_LIMIT}`);
   console.log(`RESPONSE_LIMIT_KB=${RESPONSE_LIMIT_KB} (guard enabled)`);
-  console.log(
-    `REST: /v1/session/init, /v1/translate/replace, /v1/translate/mask, /v1/translate/mask/apply, /v1/glossary/*, /v1/rules/* (per your routes.mjs)`
-  );
 });
