@@ -8,6 +8,14 @@ import { mergeSourceTextMapsFromCache } from "../glossary/index.mjs";
 import { replaceByGlossaryWithLogs } from "../replace/replace.mjs";
 import { normalizeLang, assertAllowedSourceLang, getParsedBody } from "../utils/common.mjs";
 
+// 줄바꿈 처리 함수 추가
+function formatTextWithLineBreaks(text) {
+  if (typeof text === 'string') {
+    return text.replace(/\n/g, "<br>");
+  }
+  return text;
+}
+
 export function registerMcp(app) {
   const mcp = new McpServer({
     name: "sheets-glossary-mcp",
@@ -17,7 +25,7 @@ export function registerMcp(app) {
   mcp.tool(
     "replace_texts",
     {
-      sheet: z.string().optional(), // ✅ NEW
+      sheet: z.string().optional(),
       texts: z.array(z.string()).min(1).max(2000),
       category: z.string().optional(),
       sourceLang: z.string().min(1),
@@ -101,7 +109,7 @@ export function registerMcp(app) {
           sourceTextMap,
         });
 
-        outTexts.push(out);
+        outTexts.push(formatTextWithLineBreaks(out)); // 줄바꿈 처리
         replacedTotalAll += replacedTotal;
         matchedTermsAll += logs.length;
 
@@ -143,7 +151,7 @@ export function registerMcp(app) {
   mcp.tool(
     "glossary_update",
     {
-      sheet: z.string().optional(), // ✅ NEW
+      sheet: z.string().optional(),
       forceReload: z.boolean().optional(),
     },
     async ({ sheet, forceReload }) => {
