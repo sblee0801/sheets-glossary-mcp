@@ -2,7 +2,7 @@
  * server.mjs
  * - Cloud Run entrypoint
  * - Express bootstrap
- * - Correct env import: src/config/env.mjs
+ * - ✅ Always-on health endpoints defined BEFORE any other routes
  */
 
 import "dotenv/config";
@@ -14,7 +14,7 @@ import { registerRoutes } from "./src/http/routes.mjs";
 
 const app = express();
 
-// ---------------- Body parsers ----------------
+// ---- Body parsers ----
 app.use(
   express.json({
     limit: "8mb",
@@ -29,8 +29,7 @@ app.use(
   })
 );
 
-// ---------------- CORS / preflight safety ----------------
-// CustomGPT / Connector 방어용
+// ---- CORS / preflight safety ----
 app.use((req, res, next) => {
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader(
@@ -42,21 +41,25 @@ app.use((req, res, next) => {
     "Content-Type, Authorization, X-Requested-With"
   );
 
-  // OPTIONS / HEAD 는 바로 종료
-  if (req.method === "OPTIONS") {
-    return res.status(204).send("");
-  }
+  if (req.method === "OPTIONS") return res.status(204).send("");
   next();
 });
 
-// ---------------- Register routes ----------------
+/**
+ * ✅ ALWAYS-ON health (CustomGPT/Cloud Run/Proxy defensive)
+ * - Some clients call HEAD/OPTIONS or add trailing slash.
+ * - Some tools unexpectedly prefix /v1.
+ * - Put these BEFORE registerRoutes so they never disappear.
+ */
+const health = (_req, res) => res.status(200).json({ ok: true });
+app.all(["/health", "/health/", "/healthz", "/healthz/", "/v1/health", "/v1/healthz"], health);
+app.all("/", (_req, res) => res.status(200).send("ok"));
+
+// ---- Register the rest of routes ----
 registerRoutes(app);
 
-// ---------------- Start server ----------------
-// Cloud Run은 process.env.PORT 를 강제함
+// ---- Start server ----
 const port = Number(process.env.PORT || PORT || 8080);
-
 app.listen(port, () => {
   console.log(`✅ Server listening on port ${port}`);
-  console.log(`   ENV PORT=${process.env.PORT}, fallback PORT=${PORT}`);
 });
