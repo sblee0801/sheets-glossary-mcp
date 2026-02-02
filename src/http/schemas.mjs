@@ -120,8 +120,7 @@ export const CandidatesBatchSchema = z.object({
   sheet: SheetOpt,
   category: CategoryStr.optional().default(""),
 
-  // ✏️ 여기서는 sourceLang을 enum으로 제한 (기존 설계 유지 + th-TH 지원)
-  sourceLang: z.enum(["en-US", "ko-KR", "th-TH"]).optional().default("en-US"),
+  sourceLang: z.enum(["en-US", "ko-KR", "th-TH"]).optional().default("en-US"), // "th-TH" 추가
   sourceTexts: z.array(z.string().min(1)).min(1).max(500),
   targetLangs: z.array(z.string().min(1)).min(1).max(20),
   sources: z.array(z.enum(["divinePride"])).optional(),
@@ -133,7 +132,6 @@ export const ApplySchema = z.object({
   sheet: SheetOpt,
   category: CategoryStr.optional().default(""),
 
-  // sourceLang 기준 언어 (en/ko/th 허용)
   sourceLang: z.enum(["en-US", "ko-KR", "th-TH"]).optional().default("en-US"),
   entries: z
     .array(
