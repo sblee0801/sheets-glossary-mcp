@@ -1,49 +1,50 @@
 /**
  * server.mjs (ENTRY)
- * - Express 앱 생성 + 미들웨어 설정
- * - REST 라우트 등록
- * - 응답 크기 가드 + 응답 바이트 로깅
- * - ✅ Health/Healthz 강제 대응(프록시/CustomGPT 변형 호출 방어)
- * - ✅ 요청 method/path 로깅(문제 재현 즉시 원인 확정)
+ * - ✅ Health/Healthz: no-store + trailing slash + /v1 alias + HEAD/OPTIONS 모두 200
+ * - ✅ ETag 비활성화 (304 방지)
+ * - ✅ Cloud Run: process.env.PORT 우선 리슨
+ * - Response size guard 유지
  */
 
 import "dotenv/config";
 import express from "express";
 
-import { PORT as ENV_PORT, SHEET_RANGE, RULE_SHEET_RANGE, assertRequiredEnv } from "./src/config/env.mjs";
+import { PORT, SHEET_RANGE, RULE_SHEET_RANGE, assertRequiredEnv } from "./src/config/env.mjs";
 import { registerRoutes } from "./src/http/routes.mjs";
 
 // ---- boot-time env validation ----
 assertRequiredEnv();
 
-// ---- env knobs ----
 const BODY_LIMIT = process.env.BODY_LIMIT ?? "8mb";
 const RESPONSE_LIMIT_KB = Number(process.env.RESPONSE_LIMIT_KB ?? "900");
 const RESPONSE_LIMIT_BYTES = Math.max(50 * 1024, RESPONSE_LIMIT_KB * 1024);
 
-// ---- app ----
 const app = express();
 app.disable("x-powered-by");
 
-// ✅ (중요) CustomGPT/프록시가 이상한 method로 health 때리는지 바로 보이게
+// ✅ 304 방지: express 기본 ETag 때문에 브라우저/클라이언트가 If-None-Match 보내면 304가 나올 수 있음
+app.set("etag", false);
+
+// (선택) 요청이 어떻게 들어오는지 확인하고 싶으면 켜두기
 app.use((req, _res, next) => {
   console.log(`[REQ] ${req.method} ${req.originalUrl}`);
   next();
 });
 
-/**
- * ✅ ALWAYS-ON health endpoints (가장 먼저 등록)
- * - /healthz/ 같이 슬래시 붙이거나
- * - /v1/healthz 로 프리픽스 붙이거나
- * - HEAD/OPTIONS 로 호출해도 무조건 200
- */
-const healthHandler = (_req, res) => res.status(200).json({ ok: true });
+// ✅ Health는 제일 먼저, 무조건 200 + 바디 반환 (캐시 금지)
+const health = (_req, res) => {
+  res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate, proxy-revalidate");
+  res.setHeader("Pragma", "no-cache");
+  res.setHeader("Expires", "0");
+  return res.status(200).json({ ok: true });
+};
+
+// 슬래시/프리픽스/메서드 변형 전부 수용
 app.all(
   ["/health", "/health/", "/healthz", "/healthz/", "/v1/health", "/v1/healthz", "/v1/healthz/"],
-  healthHandler
+  health
 );
 
-// Root도 항상 살아있게
 app.get("/", (_req, res) => res.status(200).send("ok"));
 
 // ---- body parsers ----
@@ -60,7 +61,6 @@ app.use(express.text({ limit: BODY_LIMIT, type: ["text/*"] }));
  */
 app.use((req, res, next) => {
   const startedAt = Date.now();
-
   const originalJson = res.json.bind(res);
   const originalSend = res.send.bind(res);
 
@@ -86,7 +86,6 @@ app.use((req, res, next) => {
 
   res.json = (payload) => {
     const bytes = byteLen(payload);
-
     if (bytes > RESPONSE_LIMIT_BYTES) {
       logSize(bytes, "[CUTOFF: json too large]");
       res.status(413);
@@ -104,14 +103,12 @@ app.use((req, res, next) => {
         },
       });
     }
-
     logSize(bytes);
     return originalJson(payload);
   };
 
   res.send = (payload) => {
     const bytes = byteLen(payload);
-
     if (bytes > RESPONSE_LIMIT_BYTES) {
       logSize(bytes, "[CUTOFF: send too large]");
       res.status(413);
@@ -130,7 +127,6 @@ app.use((req, res, next) => {
         })
       );
     }
-
     logSize(bytes);
     return originalSend(payload);
   };
@@ -138,23 +134,17 @@ app.use((req, res, next) => {
   next();
 });
 
-// ---- register endpoints (REST) ----
+// ---- register endpoints ----
 registerRoutes(app);
 
-// ✅ 마지막 404 핸들러(원인 추적용)
+// ✅ 디버깅용 404 JSON
 app.use((req, res) => {
-  res.status(404).json({
-    ok: false,
-    error: "NotFound",
-    method: req.method,
-    path: req.originalUrl,
-  });
+  res.status(404).json({ ok: false, error: "NotFound", method: req.method, path: req.originalUrl });
 });
 
 // ---- start ----
-// Cloud Run은 process.env.PORT가 “진짜” 포트임
-const port = Number(process.env.PORT || ENV_PORT || 8080);
-
+// ✅ Cloud Run은 process.env.PORT가 진짜 포트
+const port = Number(process.env.PORT || PORT || 8080);
 app.listen(port, () => {
   console.log(`Server listening on :${port}`);
   console.log(`Sheet range: ${SHEET_RANGE}`);
