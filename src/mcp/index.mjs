@@ -1,9 +1,4 @@
-/**
- * src/mcp/index.mjs
- * - MCP 서버/툴 등록 + /mcp 엔드포인트 핸들러
- * - sheet 파라미터 추가 지원
- */
-
+// src/mcp/index.mjs
 import { z } from "zod";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";

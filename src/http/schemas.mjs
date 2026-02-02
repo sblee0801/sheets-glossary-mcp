@@ -1,17 +1,4 @@
-/**
- * src/http/schemas.mjs
- * - REST Zod Schemas
- *
- * FIX:
- * 1) CustomGPT/Connector may omit category (undefined) or send null/"". => normalize to "".
- * 2) pending/next supports excludeRowIndexes
- * 3) Some clients may send texts as a single string; normalize to string[]
- *
- * IMPORTANT:
- * - z.preprocess returns ZodEffects, so do NOT chain .min/.max on it.
- *   Apply min/max on the inner schema (2nd arg) or via .pipe(...)
- */
-
+// src/http/schemas.mjs
 import { z } from "zod";
 
 /**
@@ -133,7 +120,7 @@ export const CandidatesBatchSchema = z.object({
   sheet: SheetOpt,
   category: CategoryStr.optional().default(""),
 
-  sourceLang: z.enum(["en-US", "ko-KR"]).optional().default("en-US"),
+  sourceLang: z.enum(["en-US", "ko-KR", "th-TH"]).optional().default("en-US"), // "th-TH" 추가
   sourceTexts: z.array(z.string().min(1)).min(1).max(500),
   targetLangs: z.array(z.string().min(1)).min(1).max(20),
   sources: z.array(z.enum(["divinePride"])).optional(),
@@ -145,7 +132,7 @@ export const ApplySchema = z.object({
   sheet: SheetOpt,
   category: CategoryStr.optional().default(""),
 
-  sourceLang: z.enum(["en-US", "ko-KR"]).optional().default("en-US"),
+  sourceLang: z.enum(["en-US", "ko-KR", "th-TH"]).optional().default("en-US"), // "th-TH" 추가
   entries: z
     .array(
       z.object({
@@ -165,7 +152,7 @@ export const PendingNextSchema = z.object({
   sheet: SheetOpt,
   category: CategoryStr.optional().default(""),
 
-  sourceLang: z.enum(["en-US", "ko-KR"]).optional().default("en-US"),
+  sourceLang: z.enum(["en-US", "ko-KR", "th-TH"]).optional().default("en-US"), // "th-TH" 추가
   targetLangs: z.array(z.string().min(1)).min(1).max(20),
 
   limit: z.number().int().min(1).max(500).optional().default(100),
@@ -179,7 +166,7 @@ export const GlossaryQaNextSchema = z.object({
   sheet: SheetOpt,
   category: CategoryStr.optional().default(""),
 
-  sourceLang: z.enum(["en-US", "ko-KR"]).optional().default("en-US"),
+  sourceLang: z.enum(["en-US", "ko-KR", "th-TH"]).optional().default("en-US"), // "th-TH" 추가
   targetLang: z.string().min(1),
   limit: z.number().int().min(1).max(500).optional().default(100),
   cursor: OptTrimmedStr,
@@ -193,7 +180,7 @@ export const MaskSchema = z.object({
 
   category: CategoryStr.optional().default(""),
 
-  sourceLang: z.enum(["en-US", "ko-KR"]).optional().default("en-US"),
+  sourceLang: z.enum(["en-US", "ko-KR", "th-TH"]).optional().default("en-US"), // "th-TH" 추가
   targetLang: z.string().min(1),
 
   texts: TextsParam,
@@ -233,7 +220,7 @@ export const AutoTranslateSchema = z.object({
 
   mode: z.enum(["replace", "mask"]).optional().default("mask"),
 
-  sourceLang: z.enum(["en-US", "ko-KR"]).optional().default("en-US"),
+  sourceLang: z.enum(["en-US", "ko-KR", "th-TH"]).optional().default("en-US"), // "th-TH" 추가
   targetLang: z.string().min(1),
 
   chunkSize: z.number().int().min(1).max(100).optional(),
