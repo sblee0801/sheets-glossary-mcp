@@ -228,7 +228,7 @@ export const AutoTranslateSchema = z.object({
 
 /**
  * ✅ NEW: /v2/batch/run
- * - 서버가 pending → replace(Glossary) → replace(Rules) → LLM translate → upload 까지 수행
+ * - pending → glossary replace → rules replace → LLM translate → (optional) upload
  */
 export const BatchRunSchema = z.object({
   sheet: SheetOpt,

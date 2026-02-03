@@ -3,3 +3,4 @@ req*.json
 *.bak
 .env
 sa.json
+sheets-glossary-mcp/
