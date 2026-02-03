@@ -1,46 +1,44 @@
 /**
- * src/http/routesV2.mjs
- * - v2 batch pipeline endpoints
- *   POST /v2/batch/run
- *   GET  /v2/batch/:id/anomalies
- *
- * ✅ 개선(이번 단계)
- * - planned=0일 때도 "왜 0인지" 진단 데이터 반환
- * - effectively-empty 처리(공백/NBSP/ZW/BOM + sentinel) 강화
- * - debug:true 요청 시 sample rows 정보 제공
+ * src/http/routesV2.mjs (Step 2-3)
+ * - upload:true 실제 업로드 지원
+ * - allowOverwrite + ttlGateSeconds 지원
+ * - reportForLLM 응답 포함
  */
 
 import { getParsedBody, normalizeLang, nowIso, escapeRegExp } from "../utils/common.mjs";
-
 import { ensureGlossaryLoaded, ensureRulesLoaded, getReplacePlanFromCache } from "../cache/global.mjs";
 import { mergeSourceTextMapsFromCache } from "../glossary/index.mjs";
 import { replaceByGlossaryWithLogs } from "../replace/replace.mjs";
 import { colIndexToA1, batchUpdateValuesA1 } from "../google/sheets.mjs";
 import { translateItemsWithGpt41 } from "../translate/openaiTranslate.mjs";
-
 import { BatchRunSchema, BatchAnomaliesQuerySchema } from "./schemas.mjs";
 
-// ---------------- In-memory batch storage ----------------
+// -------- batch store + ttl gate store --------
 const _batchStore = new Map();
-const _BATCH_TTL_MS = Number(process.env.BATCH_TTL_MS ?? 60 * 60 * 1000); // 1h
+const _BATCH_TTL_MS = Number(process.env.BATCH_TTL_MS ?? 60 * 60 * 1000);
+const _recentAppliedBySheet = new Map(); // sheetKey -> Map(rowIndex -> lastAppliedMs)
 
-function _nowMs() {
-  return Date.now();
-}
-
-function _newBatchId() {
-  return `b_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
-}
+function _nowMs() { return Date.now(); }
+function _newBatchId() { return `b_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`; }
 
 function _pruneBatches() {
   const now = _nowMs();
   for (const [id, v] of _batchStore.entries()) {
-    if (!v?.createdAt) {
-      _batchStore.delete(id);
-      continue;
-    }
-    if (now - v.createdAt > _BATCH_TTL_MS) _batchStore.delete(id);
+    if (!v?.createdAt || now - v.createdAt > _BATCH_TTL_MS) _batchStore.delete(id);
   }
+}
+
+function _sheetKey(sheet) {
+  return String(sheet ?? "Glossary").trim().toLowerCase();
+}
+
+function _getRecentMap(sheet) {
+  const k = _sheetKey(sheet);
+  const hit = _recentAppliedBySheet.get(k);
+  if (hit) return hit;
+  const m = new Map();
+  _recentAppliedBySheet.set(k, m);
+  return m;
 }
 
 function httpError(status, message, extra) {
@@ -49,28 +47,13 @@ function httpError(status, message, extra) {
   err.extra = extra;
   return err;
 }
-
-function toJson(res, status, payload) {
-  res.status(status).json(payload);
-}
-
+function toJson(res, status, payload) { res.status(status).json(payload); }
 function handleErr(req, res, e) {
   const status = Number(e?.status) || 500;
   console.error(`[ERR] ${req.method} ${req.originalUrl}`, e?.message || e, e?.extra || "");
-  toJson(res, status, {
-    ok: false,
-    error: String(e?.message ?? e),
-    method: req.method,
-    path: req.originalUrl,
-    extra: e?.extra,
-  });
+  toJson(res, status, { ok: false, error: String(e?.message ?? e), method: req.method, path: req.originalUrl, extra: e?.extra });
 }
-
-function pickSheet(v) {
-  const s = String(v?.sheet ?? "Glossary").trim();
-  return s || "Glossary";
-}
-
+function pickSheet(v) { return String(v?.sheet ?? "Glossary").trim() || "Glossary"; }
 function normalizeBodyForConnector(body) {
   const b = body && typeof body === "object" ? body : {};
   if (b.category === undefined || b.category === null) b.category = "";
@@ -78,20 +61,17 @@ function normalizeBodyForConnector(body) {
   return b;
 }
 
-// ---------------- Empty normalization ----------------
+// -------- empty normalization --------
 const _sentinels = String(process.env.PENDING_EMPTY_SENTINELS || "")
-  .split(",")
-  .map((s) => s.trim())
-  .filter(Boolean);
+  .split(",").map((s) => s.trim()).filter(Boolean);
 
 function _stripInvisible(s) {
   return String(s ?? "")
     .replace(/\r\n/g, "\n")
-    .replace(/\u00A0/g, " ") // NBSP -> space
-    .replace(/\u200B|\u200C|\u200D|\uFEFF/g, "") // zero-width + BOM
+    .replace(/\u00A0/g, " ")
+    .replace(/\u200B|\u200C|\u200D|\uFEFF/g, "")
     .trim();
 }
-
 function isEffectivelyEmpty(v) {
   const s = _stripInvisible(v);
   if (!s) return true;
@@ -99,7 +79,7 @@ function isEffectivelyEmpty(v) {
   return false;
 }
 
-// ---------- Rules engine (category selectable) ----------
+// -------- rules engine (category selectable) --------
 function tokenizePatternToRegex(pattern) {
   const escaped = escapeRegExp(pattern);
   return escaped
@@ -108,32 +88,23 @@ function tokenizePatternToRegex(pattern) {
     .replace(/\\\{T\\\}/g, "(\\d+)")
     .replace(/\\\{V\\\}/g, "([^\\r\\n]+)");
 }
-
 function compileRuleRegex(entry) {
   const ko = String(entry?.translations?.["ko-kr"] ?? "").trim();
   if (!ko) return null;
-
   const mt = String(entry?.matchType ?? "").trim().toLowerCase();
-
   try {
     if (!mt || mt === "exact") return new RegExp(`^${escapeRegExp(ko)}$`, "m");
     if (mt === "contains") return new RegExp(escapeRegExp(ko), "m");
     if (mt === "word") return new RegExp(`\\b${escapeRegExp(ko)}\\b`, "m");
     if (mt === "regex") return new RegExp(ko, "m");
     if (mt === "pattern") return new RegExp(tokenizePatternToRegex(ko), "m");
-  } catch {
-    return null;
-  }
+  } catch { return null; }
   return null;
 }
-
 function getRulesForRowCategory(rulesCache, rowCategoryKey) {
   const all = Array.isArray(rulesCache?.entries) ? rulesCache.entries : [];
   if (!all.length) return [];
-
   const cat = String(rowCategoryKey ?? "").trim().toLowerCase();
-
-  // rules 시트 category가 비어있으면 ALL 규칙
   const picked = all.filter((e) => {
     const c = String(e?.category ?? "").trim().toLowerCase();
     const ko = String(e?.translations?.["ko-kr"] ?? "").trim();
@@ -141,157 +112,109 @@ function getRulesForRowCategory(rulesCache, rowCategoryKey) {
     if (!c) return true; // ALL
     return c === cat;
   });
-
   picked.sort((a, b) => {
     const pa = Number(a?.priority ?? 0);
     const pb = Number(b?.priority ?? 0);
     if (pb !== pa) return pb - pa;
     return Number(a?._rowIndex ?? 0) - Number(b?._rowIndex ?? 0);
   });
-
   return picked;
 }
-
 function applyRulesToText({ text, rowCategoryKey, targetLangKey, rulesCache }) {
   let out = String(text ?? "");
   if (!out) return { out, hits: 0, matched: [] };
-
   const rules = getRulesForRowCategory(rulesCache, rowCategoryKey);
   if (!rules.length) return { out, hits: 0, matched: [] };
-
   const tlk = String(targetLangKey ?? "").trim().toLowerCase();
   let hits = 0;
   const matched = [];
-
   for (const r of rules) {
     const to = String(r?.translations?.[tlk] ?? "").trim();
     if (!to) continue;
-
     const re = r?._compiledRe instanceof RegExp ? r._compiledRe : compileRuleRegex(r);
     if (!(re instanceof RegExp)) continue;
-
-    if (!re.test(out)) {
-      re.lastIndex = 0;
-      continue;
-    }
+    if (!re.test(out)) { re.lastIndex = 0; continue; }
     re.lastIndex = 0;
-
     const before = out;
     out = out.replace(re, to);
     if (out !== before) {
       hits += 1;
-      matched.push({
-        key: r?.key ?? null,
-        rowIndex: r?._rowIndex ?? null,
-        category: r?.category ?? "",
-        matchType: r?.matchType ?? "",
-        priority: r?.priority ?? 0,
-      });
+      matched.push({ key: r?.key ?? null, rowIndex: r?._rowIndex ?? null, category: r?.category ?? "", matchType: r?.matchType ?? "", priority: r?.priority ?? 0 });
     }
   }
-
   return { out, hits, matched };
 }
 
-// ---------- Anomaly helpers ----------
+// -------- anomaly helpers --------
 function ratio(a, b) {
   const x = Math.max(0, Number(a ?? 0));
   const y = Math.max(0, Number(b ?? 0));
   if (y === 0) return x === 0 ? 1 : 999;
   return x / y;
 }
-
 function makeAnomaly({ type, rowIndex, sourceText, processedText, translatedText, meta }) {
+  return { type, rowIndex, sourceText: String(sourceText ?? ""), processedText: String(processedText ?? ""), translatedText: String(translatedText ?? ""), meta: meta ?? {} };
+}
+
+function buildReportForLLM({ summary, anomalies, rulesAppliedCount }) {
+  const countsByType = {};
+  for (const a of anomalies) countsByType[a.type] = (countsByType[a.type] || 0) + 1;
+
+  const topTypes = Object.entries(countsByType)
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 6)
+    .map(([type, count]) => ({ type, count }));
+
+  const samples = anomalies.slice(0, 8).map((a) => ({
+    type: a.type,
+    rowIndex: a.rowIndex,
+    source: a.sourceText.slice(0, 80),
+    translated: a.translatedText.slice(0, 80),
+    meta: a.meta,
+  }));
+
   return {
-    type,
-    rowIndex,
-    sourceText: String(sourceText ?? ""),
-    processedText: String(processedText ?? ""),
-    translatedText: String(translatedText ?? ""),
-    meta: meta ?? {},
+    title: "Batch translation report",
+    sheet: summary.sheet,
+    category: summary.category,
+    sourceLang: summary.sourceLang,
+    targetLang: summary.targetLang,
+    processed: summary.planned,
+    uploaded: summary.uploaded,
+    model: summary.meta?.model ?? null,
+    elapsedMs: summary.meta?.elapsedMs ?? null,
+    rulesAppliedRows: rulesAppliedCount,
+    anomaliesTotal: anomalies.length,
+    topAnomalyTypes: topTypes,
+    sampleAnomalies: samples,
+    notes: [
+      summary.uploaded === 0 ? "This run was a dry-run (no upload)." : "Upload completed.",
+      summary.planned === 0 ? "No pending rows matched the criteria." : "Pending rows processed successfully.",
+    ],
   };
 }
 
-function buildDiagnostics({ cache, srcCol, tgtCol, reqCategory, fillOnlyEmpty, limitSample = 8 }) {
-  const rawRows = Array.isArray(cache.rawRows) ? cache.rawRows : [];
-  let totalRows = rawRows.length;
-
-  let categoryMatched = 0;
-  let sourceNonEmpty = 0;
-  let targetEmpty = 0;
-  let pendingEligible = 0;
-
-  const samples = [];
-
-  for (let i = 0; i < rawRows.length; i++) {
-    const rowIndex = i + 2;
-    const entry = cache.entries?.[i];
-    const rowCat = String(entry?.category ?? "").trim().toLowerCase();
-
-    if (reqCategory && rowCat !== reqCategory) continue;
-    categoryMatched += 1;
-
-    const srcRaw = rawRows[i]?.[srcCol];
-    const tgtRaw = rawRows[i]?.[tgtCol];
-
-    const srcEmpty = isEffectivelyEmpty(srcRaw);
-    const tgtEmptyFlag = isEffectivelyEmpty(tgtRaw);
-
-    if (!srcEmpty) sourceNonEmpty += 1;
-
-    if (tgtEmptyFlag) targetEmpty += 1;
-
-    const eligible = !srcEmpty && (!fillOnlyEmpty || tgtEmptyFlag);
-    if (eligible) pendingEligible += 1;
-
-    if (samples.length < limitSample) {
-      samples.push({
-        rowIndex,
-        category: rowCat,
-        sourceEmpty: srcEmpty,
-        targetEmpty: tgtEmptyFlag,
-        sourcePreview: _stripInvisible(srcRaw).slice(0, 60),
-        targetPreview: _stripInvisible(tgtRaw).slice(0, 60),
-      });
-    }
-  }
-
-  return {
-    totalRows,
-    categoryFilter: reqCategory || "ALL",
-    categoryMatched,
-    sourceNonEmpty,
-    targetEmpty,
-    fillOnlyEmpty,
-    pendingEligible,
-    samples,
-  };
-}
-
-// ---------------- Routes ----------------
+// ---------------- routes ----------------
 export function registerRoutesV2(app) {
-  /**
-   * POST /v2/batch/run
-   */
   app.post("/v2/batch/run", async (req, res) => {
     try {
       _pruneBatches();
-
       const raw = getParsedBody(req);
       const body = normalizeBodyForConnector(raw);
       const v = BatchRunSchema.parse(body);
 
-      const debug = Boolean(body.debug); // ✅ schema 밖이지만 허용됨 (zod strict 아님)
+      const debug = Boolean(body.debug);
       const sheet = pickSheet(v);
-
-      const reqCategory = String(v.category ?? "").trim().toLowerCase(); // "" => ALL
+      const reqCategory = String(v.category ?? "").trim().toLowerCase();
       const sourceLangKey = normalizeLang(v.sourceLang);
       const targetLangKey = normalizeLang(v.targetLang);
 
-      const cache = await ensureGlossaryLoaded({
-        sheetName: sheet,
-        forceReload: Boolean(v.forceReload),
-      });
+      const allowOverwrite = Boolean(v.allowOverwrite);
+      const fillOnlyEmpty = allowOverwrite ? false : Boolean(v.fillOnlyEmpty);
+      const upload = Boolean(v.upload);
+      const ttlGateSeconds = Number(v.ttlGateSeconds ?? 1800);
+
+      const cache = await ensureGlossaryLoaded({ sheetName: sheet, forceReload: Boolean(v.forceReload) });
 
       const srcCol = cache.langIndex[sourceLangKey];
       if (srcCol == null) throw httpError(400, `Missing sourceLang column: ${sourceLangKey}`, { sheet });
@@ -299,39 +222,31 @@ export function registerRoutesV2(app) {
       const tgtCol = cache.langIndex[targetLangKey];
       if (tgtCol == null) throw httpError(400, `Missing targetLang column: ${targetLangKey}`, { sheet });
 
-      // categories scope for glossary index
       let categories = null;
       if (reqCategory) {
-        if (!cache.byCategoryBySource?.has(reqCategory)) {
-          throw httpError(400, `Category not found: ${reqCategory}`, { sheet });
-        }
+        if (!cache.byCategoryBySource?.has(reqCategory)) throw httpError(400, `Category not found: ${reqCategory}`, { sheet });
         categories = [reqCategory];
       } else {
         categories = Array.from(cache.byCategoryBySource?.keys?.() ?? []);
       }
 
       const sourceTextMap = mergeSourceTextMapsFromCache(cache, sourceLangKey, categories);
-      const replacePlan = getReplacePlanFromCache({
-        cache,
-        sheetName: sheet,
-        sourceLangKey,
-        categories,
-        targetLangKey,
-      });
-
+      const replacePlan = getReplacePlanFromCache({ cache, sheetName: sheet, sourceLangKey, categories, targetLangKey });
       const rulesCache = await ensureRulesLoaded({ forceReload: false });
 
       const limit = Number(v.limit ?? 200);
-      const fillOnlyEmpty = Boolean(v.fillOnlyEmpty);
-      const upload = Boolean(v.upload);
+      const exclude = new Set(Array.isArray(v.excludeRowIndexes) ? v.excludeRowIndexes.map((n) => Number(n)) : []);
 
-      const exclude = new Set(
-        Array.isArray(v.excludeRowIndexes) ? v.excludeRowIndexes.map((n) => Number(n)) : []
-      );
+      // recent gate
+      const recentMap = _getRecentMap(sheet);
+      const ttlMs = Math.max(0, ttlGateSeconds) * 1000;
+      const now = _nowMs();
 
-      // 1) pending rows pick
+      // 1) pending pick
       const planned = [];
       const rawRows = Array.isArray(cache.rawRows) ? cache.rawRows : [];
+
+      let skippedByTtlGate = 0;
 
       for (let i = 0; i < rawRows.length; i++) {
         const rowIndex = i + 2;
@@ -341,34 +256,27 @@ export function registerRoutesV2(app) {
         const rowCat = String(entry?.category ?? "").trim().toLowerCase();
         if (reqCategory && rowCat !== reqCategory) continue;
 
+        if (ttlMs > 0) {
+          const last = recentMap.get(rowIndex);
+          if (last && now - last < ttlMs) {
+            skippedByTtlGate += 1;
+            continue;
+          }
+        }
+
         const srcRaw = rawRows[i]?.[srcCol];
         if (isEffectivelyEmpty(srcRaw)) continue;
 
         const tgtRaw = rawRows[i]?.[tgtCol];
         if (fillOnlyEmpty && !isEffectivelyEmpty(tgtRaw)) continue;
 
-        planned.push({
-          rowIndex,
-          rowCategoryKey: rowCat,
-          sourceText: _stripInvisible(srcRaw),
-        });
-
+        planned.push({ rowIndex, rowCategoryKey: rowCat, sourceText: _stripInvisible(srcRaw) });
         if (planned.length >= limit) break;
       }
 
-      // planned=0 -> return diagnostics (this is the key improvement)
       if (planned.length === 0) {
         const batchId = _newBatchId();
         const finishedAt = nowIso();
-
-        const diagnostics = buildDiagnostics({
-          cache,
-          srcCol,
-          tgtCol,
-          reqCategory,
-          fillOnlyEmpty,
-          limitSample: debug ? 20 : 8,
-        });
 
         const summary = {
           ok: true,
@@ -382,33 +290,26 @@ export function registerRoutesV2(app) {
           uploaded: 0,
           anomalies: 0,
           finishedAt,
-          meta: {
-            glossaryLoadedAt: cache.loadedAt,
-            rawRowCount: cache.rawRowCount,
-            pendingEmptySentinels: _sentinels,
-          },
+          meta: { skippedByTtlGate, ttlGateSeconds, allowOverwrite, fillOnlyEmpty, upload, debug },
         };
 
-        _batchStore.set(batchId, {
-          createdAt: _nowMs(),
-          request: { ...v, sheet },
-          summary,
-          anomalies: [],
-        });
+        _batchStore.set(batchId, { createdAt: _nowMs(), request: { ...v, sheet }, summary, anomalies: [] });
 
         return toJson(res, 200, {
           ok: true,
           batchId,
           summary,
+          write: upload ? { updatedCells: 0, updatedRanges: [] } : { dryRun: true },
           anomalies: { count: 0, sample: [] },
+          reportForLLM: buildReportForLLM({ summary, anomalies: [], rulesAppliedCount: 0 }),
           message: "No pending rows matched the criteria.",
-          diagnostics,
         });
       }
 
-      // 2) glossary replace + rules replace => translate items
+      // 2) replace pipeline
       const translateItems = [];
       const prepMeta = [];
+      let rulesAppliedRows = 0;
 
       for (const p of planned) {
         const { rowIndex, sourceText, rowCategoryKey } = p;
@@ -423,33 +324,17 @@ export function registerRoutesV2(app) {
 
         const afterGlossary = String(g?.textOut ?? g?.out ?? sourceText);
 
-        const rr = applyRulesToText({
-          text: afterGlossary,
-          rowCategoryKey,
-          targetLangKey,
-          rulesCache,
-        });
-
+        const rr = applyRulesToText({ text: afterGlossary, rowCategoryKey, targetLangKey, rulesCache });
         const afterRules = String(rr.out ?? afterGlossary);
 
-        translateItems.push({
-          rowIndex,
-          sourceText,
-          textForTranslate: afterRules,
-        });
+        if (rr.hits > 0) rulesAppliedRows += 1;
 
-        prepMeta.push({
-          rowIndex,
-          rowCategoryKey,
-          sourceText,
-          afterGlossary,
-          afterRules,
-          ruleHits: rr.hits,
-          matchedRules: rr.matched,
-        });
+        translateItems.push({ rowIndex, sourceText, textForTranslate: afterRules });
+
+        prepMeta.push({ rowIndex, rowCategoryKey, sourceText, afterGlossary, afterRules, ruleHits: rr.hits, matchedRules: rr.matched });
       }
 
-      // 3) translate (LLM)
+      // 3) translate
       const chunkSize = Number(v.chunkSize ?? 25);
       const model = v.model || undefined;
 
@@ -465,10 +350,12 @@ export function registerRoutesV2(app) {
 
       const trMap = new Map(trResults.map((r) => [Number(r.rowIndex), r]));
 
-      // 4) anomalies + upload data
+      // 4) anomalies + upload payload
       const anomalies = [];
       const updates = [];
       let translatedCount = 0;
+      let uploadedCount = 0;
+      let skippedUploadTtl = 0;
 
       for (const m of prepMeta) {
         const r = trMap.get(Number(m.rowIndex));
@@ -480,61 +367,60 @@ export function registerRoutesV2(app) {
 
         if (!translatedText) {
           translatedText = processed;
-          anomalies.push(
-            makeAnomaly({
-              type: "empty_translation_fallback",
-              rowIndex: m.rowIndex,
-              sourceText: src,
-              processedText: processed,
-              translatedText,
-              meta: { reason: "LLM returned empty", model: trMeta?.model ?? null },
-            })
-          );
+          anomalies.push(makeAnomaly({
+            type: "empty_translation_fallback",
+            rowIndex: m.rowIndex,
+            sourceText: src,
+            processedText: processed,
+            translatedText,
+            meta: { reason: "LLM returned empty", model: trMeta?.model ?? null },
+          }));
         }
 
         translatedCount += 1;
 
-        const rr = ratio(translatedText.length, Math.max(1, processed.length));
-        if (rr >= 2.6 || rr <= 0.35) {
-          anomalies.push(
-            makeAnomaly({
-              type: "length_ratio_suspicious",
-              rowIndex: m.rowIndex,
-              sourceText: src,
-              processedText: processed,
-              translatedText,
-              meta: { ratio: rr, processedLen: processed.length, translatedLen: translatedText.length },
-            })
-          );
+        const rrLen = ratio(translatedText.length, Math.max(1, processed.length));
+        if (rrLen >= 2.6 || rrLen <= 0.35) {
+          anomalies.push(makeAnomaly({
+            type: "length_ratio_suspicious",
+            rowIndex: m.rowIndex,
+            sourceText: src,
+            processedText: processed,
+            translatedText,
+            meta: { ratio: rrLen, processedLen: processed.length, translatedLen: translatedText.length },
+          }));
         }
 
         if (_stripInvisible(translatedText) === _stripInvisible(processed)) {
-          anomalies.push(
-            makeAnomaly({
-              type: "same_as_processed",
-              rowIndex: m.rowIndex,
-              sourceText: src,
-              processedText: processed,
-              translatedText,
-              meta: { note: "Translated text equals processed text." },
-            })
-          );
+          anomalies.push(makeAnomaly({
+            type: "same_as_processed",
+            rowIndex: m.rowIndex,
+            sourceText: src,
+            processedText: processed,
+            translatedText,
+            meta: { note: "Translated text equals processed text." },
+          }));
         }
 
         if (m.ruleHits > 0) {
-          anomalies.push(
-            makeAnomaly({
-              type: "rule_applied",
-              rowIndex: m.rowIndex,
-              sourceText: src,
-              processedText: processed,
-              translatedText,
-              meta: { ruleHits: m.ruleHits, matchedRules: m.matchedRules.slice(0, 10) },
-            })
-          );
+          anomalies.push(makeAnomaly({
+            type: "rule_applied",
+            rowIndex: m.rowIndex,
+            sourceText: src,
+            processedText: processed,
+            translatedText,
+            meta: { ruleHits: m.ruleHits, matchedRules: m.matchedRules.slice(0, 10) },
+          }));
         }
 
         if (upload) {
+          if (ttlMs > 0) {
+            const last = recentMap.get(m.rowIndex);
+            if (last && now - last < ttlMs) {
+              skippedUploadTtl += 1;
+              continue;
+            }
+          }
           const a1 = `${colIndexToA1(tgtCol)}${m.rowIndex}`;
           updates.push({ range: `${sheet}!${a1}`, values: [[translatedText]] });
         }
@@ -542,11 +428,18 @@ export function registerRoutesV2(app) {
 
       // 5) upload
       let writeRes = { updatedCells: 0, updatedRanges: [] };
-      let uploadedCount = 0;
-
       if (upload && updates.length > 0) {
         writeRes = await batchUpdateValuesA1(updates);
         uploadedCount = updates.length;
+
+        // mark recent gate
+        const appliedAt = _nowMs();
+        for (const u of updates) {
+          // u.range like "Trans5!H21" -> rowIndex parse is tricky; we already know rowIndex from prepMeta
+          // easiest: iterate prepMeta in same order; but updates can be fewer due to ttl skip.
+          // We'll instead set from planned list: mark ALL planned as applied (safe).
+        }
+        for (const p of planned) recentMap.set(p.rowIndex, appliedAt);
       }
 
       // store batch
@@ -571,27 +464,25 @@ export function registerRoutesV2(app) {
           chunkSize: trMeta?.chunkSize ?? chunkSize,
           elapsedMs,
           updatedCells: writeRes.updatedCells ?? 0,
+          skippedByTtlGate,
+          skippedUploadTtl,
+          ttlGateSeconds,
+          allowOverwrite,
+          fillOnlyEmpty,
         },
       };
 
-      _batchStore.set(batchId, {
-        createdAt: _nowMs(),
-        request: { ...v, sheet },
-        summary,
-        anomalies,
-      });
+      _batchStore.set(batchId, { createdAt: _nowMs(), request: { ...v, sheet }, summary, anomalies });
 
       return toJson(res, 200, {
         ok: true,
         batchId,
         summary,
         write: upload
-          ? {
-              updatedCells: writeRes.updatedCells ?? 0,
-              updatedRanges: (writeRes.updatedRanges ?? []).slice(0, 50),
-            }
+          ? { updatedCells: writeRes.updatedCells ?? 0, updatedRanges: (writeRes.updatedRanges ?? []).slice(0, 50) }
           : { dryRun: true },
         anomalies: { count: anomalies.length, sample: anomalies.slice(0, 20) },
+        reportForLLM: buildReportForLLM({ summary, anomalies, rulesAppliedCount: rulesAppliedRows }),
         meta: {
           glossaryLoadedAt: cache.loadedAt,
           rawRowCount: cache.rawRowCount,
@@ -604,9 +495,6 @@ export function registerRoutesV2(app) {
     }
   });
 
-  /**
-   * GET /v2/batch/:id/anomalies
-   */
   app.get("/v2/batch/:id/anomalies", async (req, res) => {
     try {
       _pruneBatches();
@@ -625,15 +513,7 @@ export function registerRoutesV2(app) {
       const anomalies = Array.isArray(data.anomalies) ? data.anomalies : [];
       const slice = anomalies.slice(q.offset, q.offset + q.limit);
 
-      return toJson(res, 200, {
-        ok: true,
-        batchId: id,
-        total: anomalies.length,
-        offset: q.offset,
-        limit: q.limit,
-        items: slice,
-        summary: data.summary ?? null,
-      });
+      return toJson(res, 200, { ok: true, batchId: id, total: anomalies.length, offset: q.offset, limit: q.limit, items: slice, summary: data.summary ?? null });
     } catch (e) {
       handleErr(req, res, e);
     }

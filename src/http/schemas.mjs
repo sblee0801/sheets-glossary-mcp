@@ -231,6 +231,10 @@ export const AutoTranslateSchema = z.object({
  * - pending → glossary replace → rules replace → LLM translate → (optional) upload
  */
 export const BatchRunSchema = z.object({
+  // --- idempotency / safety gates ---
+  ttlGateSeconds: z.number().int().min(0).max(86400).optional().default(1800), // 30분
+  allowOverwrite: z.boolean().optional().default(false), // true면 fillOnlyEmpty 무시(강제 덮어쓰기)
+
   sheet: SheetOpt,
   category: CategoryStr.optional().default(""),
 
