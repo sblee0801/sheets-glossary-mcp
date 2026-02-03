@@ -74,7 +74,7 @@ export const ReplaceSchema = z
     sourceLang: OptTrimmedStr,
     targetLang: OptTrimmedStr,
 
-    texts: TextsParam, // ✅ already min(1)/max(500)
+    texts: TextsParam,
 
     includeLogs: z.boolean().optional(),
     limit: z.number().int().min(1).max(200).optional(),
@@ -102,36 +102,26 @@ export const SuggestSchema = z.object({
   targetLangs: z.array(z.string()).min(1).max(20),
   sources: z.array(z.enum(["iroWikiDb", "rateMyServer", "divinePride"])).optional(),
   includeEvidence: z.boolean().optional().default(true),
-  maxCandidatesPerLang: z.number().int().min(1).max(5).optional().default(2),
-  generateTargets: z.boolean().optional().default(false),
-});
-
-export const CandidatesSchema = z.object({
-  sheet: SheetOpt,
-  category: CategoryStr.optional().default(""),
-
-  sourceText: z.string().min(1),
-  sourceLang: OptTrimmedStr.default("en-US"),
-  targetLangs: z.array(z.string()).min(1).max(20),
-  sources: z.array(z.enum(["iroWikiDb", "rateMyServer", "divinePride"])).optional(),
+  maxCandidatesPerLang: z.number().int().min(1).max(5).optional(),
 });
 
 export const CandidatesBatchSchema = z.object({
   sheet: SheetOpt,
   category: CategoryStr.optional().default(""),
 
-  sourceLang: z.enum(["en-US", "ko-KR", "th-TH"]).optional().default("en-US"), // "th-TH" 추가
-  sourceTexts: z.array(z.string().min(1)).min(1).max(500),
+  anchorLang: OptTrimmedStr.default("en-US"),
   targetLangs: z.array(z.string().min(1)).min(1).max(20),
-  sources: z.array(z.enum(["divinePride"])).optional(),
-  maxCandidatesPerLang: z.number().int().min(1).max(5).optional().default(2),
-  includeEvidence: z.boolean().optional().default(true),
+
+  terms: z.array(z.string().min(1)).min(1).max(500),
+  maxCandidatesPerLang: z.number().int().min(1).max(10).optional().default(5),
+  includeEvidence: z.boolean().optional().default(false),
+
+  forceReload: z.boolean().optional().default(false),
 });
 
 export const ApplySchema = z.object({
-  sheet: SheetOpt,
+  sheet: z.string().min(1),
   category: CategoryStr.optional().default(""),
-
   sourceLang: z.enum(["en-US", "ko-KR", "th-TH"]).optional().default("en-US"),
   entries: z
     .array(
@@ -210,12 +200,7 @@ export const MaskApplySchema = z.object({
 });
 
 /**
- * ✅ NEW: /v1/translate/auto (server-side translation) schema
- * - mode="replace": server will apply glossary replacement then translate
- * - mode="mask": client may provide textProcessed (e.g., textsMasked) for translation
- *
- * sourceLang: en-US / ko-KR / th-TH 허용
- * targetLang: 어떤 BCP-47 코드든 string (다국어) 허용
+ * ✅ /v1/translate/auto (server-side translation)
  */
 export const AutoTranslateSchema = z.object({
   sheet: SheetOpt,
@@ -239,4 +224,33 @@ export const AutoTranslateSchema = z.object({
     )
     .min(1)
     .max(500),
+});
+
+/**
+ * ✅ NEW: /v2/batch/run
+ * - 서버가 pending → replace(Glossary) → replace(Rules) → LLM translate → upload 까지 수행
+ */
+export const BatchRunSchema = z.object({
+  sheet: SheetOpt,
+  category: CategoryStr.optional().default(""),
+
+  sourceLang: z.enum(["en-US", "ko-KR", "th-TH"]).optional().default("en-US"),
+  targetLang: z.string().min(1),
+
+  limit: z.number().int().min(1).max(500).optional().default(200),
+  chunkSize: z.number().int().min(1).max(100).optional().default(25),
+
+  fillOnlyEmpty: z.boolean().optional().default(true),
+  upload: z.boolean().optional().default(true),
+
+  forceReload: z.boolean().optional().default(false),
+  excludeRowIndexes: z.array(z.number().int().min(2)).max(5000).optional(),
+
+  // optional override
+  model: OptTrimmedStr,
+});
+
+export const BatchAnomaliesQuerySchema = z.object({
+  offset: z.number().int().min(0).optional().default(0),
+  limit: z.number().int().min(1).max(500).optional().default(200),
 });

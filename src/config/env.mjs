@@ -9,8 +9,13 @@
  *
  * ✅ 포함:
  * - Google Sheets (spreadsheet / ranges)
- * - OpenAI (Responses API) for server-side translation
+ * - OpenAI for server-side translation
  * - optional feature gate: ENABLE_OPENAI_TRANSLATION
+ *
+ * ✅ 모델 전환 전략:
+ * - 모델명을 코드에 하드코딩하지 말고 env로만 스위치
+ * - OPENAI_MODEL_TRANSLATE / OPENAI_MODEL_AUDIT 우선
+ * - OPENAI_MODEL은 과거 호환용(alias)로 유지
  */
 
 export const PORT = Number(process.env.PORT || 8080);
@@ -58,11 +63,11 @@ export const RULE_SHEET_RANGE = process.env.RULE_SHEET_RANGE || buildSheetRange(
  */
 export const GOOGLE_SERVICE_ACCOUNT_JSON = process.env.GOOGLE_SERVICE_ACCOUNT_JSON;
 
-// ---------------- OpenAI (Server-side translation) ----------------
+// ---------------- OpenAI (Server-side translation / audit) ----------------
 
 /**
  * 기능 스위치
- * - true일 때 /v1/translate/auto 사용을 전제로 필수 env 검증 강화
+ * - true일 때 server-side LLM 번역 기능을 사용
  */
 export const ENABLE_OPENAI_TRANSLATION = String(process.env.ENABLE_OPENAI_TRANSLATION || "false")
   .trim()
@@ -71,9 +76,32 @@ export const ENABLE_OPENAI_TRANSLATION = String(process.env.ENABLE_OPENAI_TRANSL
 export const OPENAI_API_KEY = process.env.OPENAI_API_KEY || "";
 
 /**
- * 모델 기본값 (네 의도: GPT-4.1)
+ * ✅ 모델 전환을 위한 권장 env
+ * - 번역용과 리포트/검수용을 분리(나중에 비용 최적화에 유리)
+ *
+ * 예)
+ *   OPENAI_MODEL_TRANSLATE=gpt-5.2
+ *   OPENAI_MODEL_AUDIT=gpt-5.2
+ *
+ * 아직 5.2로 전환 전이면:
+ *   OPENAI_MODEL_TRANSLATE=gpt-4.1
+ *   OPENAI_MODEL_AUDIT=gpt-4.1
  */
-export const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-4.1";
+export const OPENAI_MODEL_TRANSLATE =
+  process.env.OPENAI_MODEL_TRANSLATE ||
+  process.env.OPENAI_MODEL || // legacy fallback
+  "gpt-4.1";
+
+export const OPENAI_MODEL_AUDIT =
+  process.env.OPENAI_MODEL_AUDIT ||
+  process.env.OPENAI_MODEL || // legacy fallback
+  OPENAI_MODEL_TRANSLATE;
+
+/**
+ * ✅ 과거 호환용 export (기존 코드에서 OPENAI_MODEL을 import하는 경우 대비)
+ * - 의미적으로는 translate 모델을 가리키도록 alias 처리
+ */
+export const OPENAI_MODEL = OPENAI_MODEL_TRANSLATE;
 
 /**
  * 타임아웃/재시도/청크
