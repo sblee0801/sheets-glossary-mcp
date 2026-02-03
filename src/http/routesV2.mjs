@@ -3,6 +3,11 @@
  * - v2 batch pipeline endpoints
  *   POST /v2/batch/run
  *   GET  /v2/batch/:id/anomalies
+ *
+ * ✅ 개선(이번 단계)
+ * - planned=0일 때도 "왜 0인지" 진단 데이터 반환
+ * - effectively-empty 처리(공백/NBSP/ZW/BOM + sentinel) 강화
+ * - debug:true 요청 시 sample rows 정보 제공
  */
 
 import { getParsedBody, normalizeLang, nowIso, escapeRegExp } from "../utils/common.mjs";
@@ -16,8 +21,8 @@ import { translateItemsWithGpt41 } from "../translate/openaiTranslate.mjs";
 import { BatchRunSchema, BatchAnomaliesQuerySchema } from "./schemas.mjs";
 
 // ---------------- In-memory batch storage ----------------
-const _batchStore = new Map(); // batchId -> { createdAt, request, summary, anomalies:[] }
-const _BATCH_TTL_MS = Number(process.env.BATCH_TTL_MS ?? 60 * 60 * 1000); // default 1h
+const _batchStore = new Map();
+const _BATCH_TTL_MS = Number(process.env.BATCH_TTL_MS ?? 60 * 60 * 1000); // 1h
 
 function _nowMs() {
   return Date.now();
@@ -73,12 +78,25 @@ function normalizeBodyForConnector(body) {
   return b;
 }
 
-function normalizeSoft(s) {
-  // apply에선 NBSP/ZW/BOM 같은 “눈에 안 보이는 문자”가 자주 문제라 최소 정규화
+// ---------------- Empty normalization ----------------
+const _sentinels = String(process.env.PENDING_EMPTY_SENTINELS || "")
+  .split(",")
+  .map((s) => s.trim())
+  .filter(Boolean);
+
+function _stripInvisible(s) {
   return String(s ?? "")
-    .replace(/\u00A0/g, " ") // NBSP
+    .replace(/\r\n/g, "\n")
+    .replace(/\u00A0/g, " ") // NBSP -> space
     .replace(/\u200B|\u200C|\u200D|\uFEFF/g, "") // zero-width + BOM
     .trim();
+}
+
+function isEffectivelyEmpty(v) {
+  const s = _stripInvisible(v);
+  if (!s) return true;
+  if (_sentinels.length && _sentinels.includes(s)) return true;
+  return false;
 }
 
 // ---------- Rules engine (category selectable) ----------
@@ -115,18 +133,15 @@ function getRulesForRowCategory(rulesCache, rowCategoryKey) {
 
   const cat = String(rowCategoryKey ?? "").trim().toLowerCase();
 
-  // 정책:
-  // - rules 시트의 category가 비어있으면 "ALL" 규칙으로 모든 row에 적용
-  // - category가 있으면 row category와 매칭될 때만 적용
+  // rules 시트 category가 비어있으면 ALL 규칙
   const picked = all.filter((e) => {
     const c = String(e?.category ?? "").trim().toLowerCase();
     const ko = String(e?.translations?.["ko-kr"] ?? "").trim();
     if (!ko) return false;
-    if (!c) return true; // ALL rule
+    if (!c) return true; // ALL
     return c === cat;
   });
 
-  // priority 높은 게 먼저 적용되도록 (동일 priority면 rowIndex 순)
   picked.sort((a, b) => {
     const pa = Number(a?.priority ?? 0);
     const pb = Number(b?.priority ?? 0);
@@ -155,8 +170,6 @@ function applyRulesToText({ text, rowCategoryKey, targetLangKey, rulesCache }) {
     const re = r?._compiledRe instanceof RegExp ? r._compiledRe : compileRuleRegex(r);
     if (!(re instanceof RegExp)) continue;
 
-    // “match” 확인 후 replace (m 플래그라 global은 아니지만, 일단 1회 치환 정책)
-    // 원하면 후속 단계에서 global/반복 정책을 옵션화 가능
     if (!re.test(out)) {
       re.lastIndex = 0;
       continue;
@@ -199,6 +212,62 @@ function makeAnomaly({ type, rowIndex, sourceText, processedText, translatedText
   };
 }
 
+function buildDiagnostics({ cache, srcCol, tgtCol, reqCategory, fillOnlyEmpty, limitSample = 8 }) {
+  const rawRows = Array.isArray(cache.rawRows) ? cache.rawRows : [];
+  let totalRows = rawRows.length;
+
+  let categoryMatched = 0;
+  let sourceNonEmpty = 0;
+  let targetEmpty = 0;
+  let pendingEligible = 0;
+
+  const samples = [];
+
+  for (let i = 0; i < rawRows.length; i++) {
+    const rowIndex = i + 2;
+    const entry = cache.entries?.[i];
+    const rowCat = String(entry?.category ?? "").trim().toLowerCase();
+
+    if (reqCategory && rowCat !== reqCategory) continue;
+    categoryMatched += 1;
+
+    const srcRaw = rawRows[i]?.[srcCol];
+    const tgtRaw = rawRows[i]?.[tgtCol];
+
+    const srcEmpty = isEffectivelyEmpty(srcRaw);
+    const tgtEmptyFlag = isEffectivelyEmpty(tgtRaw);
+
+    if (!srcEmpty) sourceNonEmpty += 1;
+
+    if (tgtEmptyFlag) targetEmpty += 1;
+
+    const eligible = !srcEmpty && (!fillOnlyEmpty || tgtEmptyFlag);
+    if (eligible) pendingEligible += 1;
+
+    if (samples.length < limitSample) {
+      samples.push({
+        rowIndex,
+        category: rowCat,
+        sourceEmpty: srcEmpty,
+        targetEmpty: tgtEmptyFlag,
+        sourcePreview: _stripInvisible(srcRaw).slice(0, 60),
+        targetPreview: _stripInvisible(tgtRaw).slice(0, 60),
+      });
+    }
+  }
+
+  return {
+    totalRows,
+    categoryFilter: reqCategory || "ALL",
+    categoryMatched,
+    sourceNonEmpty,
+    targetEmpty,
+    fillOnlyEmpty,
+    pendingEligible,
+    samples,
+  };
+}
+
 // ---------------- Routes ----------------
 export function registerRoutesV2(app) {
   /**
@@ -212,13 +281,13 @@ export function registerRoutesV2(app) {
       const body = normalizeBodyForConnector(raw);
       const v = BatchRunSchema.parse(body);
 
+      const debug = Boolean(body.debug); // ✅ schema 밖이지만 허용됨 (zod strict 아님)
       const sheet = pickSheet(v);
-      const reqCategory = String(v.category ?? "").trim().toLowerCase(); // "" => ALL
 
+      const reqCategory = String(v.category ?? "").trim().toLowerCase(); // "" => ALL
       const sourceLangKey = normalizeLang(v.sourceLang);
       const targetLangKey = normalizeLang(v.targetLang);
 
-      // glossary load
       const cache = await ensureGlossaryLoaded({
         sheetName: sheet,
         forceReload: Boolean(v.forceReload),
@@ -230,7 +299,7 @@ export function registerRoutesV2(app) {
       const tgtCol = cache.langIndex[targetLangKey];
       if (tgtCol == null) throw httpError(400, `Missing targetLang column: ${targetLangKey}`, { sheet });
 
-      // categories scope (glossary index)
+      // categories scope for glossary index
       let categories = null;
       if (reqCategory) {
         if (!cache.byCategoryBySource?.has(reqCategory)) {
@@ -250,7 +319,6 @@ export function registerRoutesV2(app) {
         targetLangKey,
       });
 
-      // rules load (전체 entries를 유지하고 있으니 v2에서 category별로 골라 적용)
       const rulesCache = await ensureRulesLoaded({ forceReload: false });
 
       const limit = Number(v.limit ?? 200);
@@ -271,48 +339,38 @@ export function registerRoutesV2(app) {
 
         const entry = cache.entries?.[i];
         const rowCat = String(entry?.category ?? "").trim().toLowerCase();
-
         if (reqCategory && rowCat !== reqCategory) continue;
 
-        const srcText = normalizeSoft(rawRows[i]?.[srcCol]);
-        if (!srcText) continue;
+        const srcRaw = rawRows[i]?.[srcCol];
+        if (isEffectivelyEmpty(srcRaw)) continue;
 
-        const cur = normalizeSoft(rawRows[i]?.[tgtCol]);
-        if (fillOnlyEmpty && cur) continue;
+        const tgtRaw = rawRows[i]?.[tgtCol];
+        if (fillOnlyEmpty && !isEffectivelyEmpty(tgtRaw)) continue;
 
         planned.push({
           rowIndex,
           rowCategoryKey: rowCat,
-          sourceText: srcText,
+          sourceText: _stripInvisible(srcRaw),
         });
 
         if (planned.length >= limit) break;
       }
 
+      // planned=0 -> return diagnostics (this is the key improvement)
       if (planned.length === 0) {
         const batchId = _newBatchId();
         const finishedAt = nowIso();
 
-        _batchStore.set(batchId, {
-          createdAt: _nowMs(),
-          request: { ...v, sheet },
-          summary: {
-            ok: true,
-            batchId,
-            sheet,
-            category: reqCategory || "ALL",
-            sourceLang: v.sourceLang,
-            targetLang: v.targetLang,
-            planned: 0,
-            translated: 0,
-            uploaded: 0,
-            anomalies: 0,
-            finishedAt,
-          },
-          anomalies: [],
+        const diagnostics = buildDiagnostics({
+          cache,
+          srcCol,
+          tgtCol,
+          reqCategory,
+          fillOnlyEmpty,
+          limitSample: debug ? 20 : 8,
         });
 
-        return toJson(res, 200, {
+        const summary = {
           ok: true,
           batchId,
           sheet,
@@ -322,8 +380,29 @@ export function registerRoutesV2(app) {
           planned: 0,
           translated: 0,
           uploaded: 0,
+          anomalies: 0,
+          finishedAt,
+          meta: {
+            glossaryLoadedAt: cache.loadedAt,
+            rawRowCount: cache.rawRowCount,
+            pendingEmptySentinels: _sentinels,
+          },
+        };
+
+        _batchStore.set(batchId, {
+          createdAt: _nowMs(),
+          request: { ...v, sheet },
+          summary,
+          anomalies: [],
+        });
+
+        return toJson(res, 200, {
+          ok: true,
+          batchId,
+          summary,
           anomalies: { count: 0, sample: [] },
           message: "No pending rows matched the criteria.",
+          diagnostics,
         });
       }
 
@@ -394,12 +473,11 @@ export function registerRoutesV2(app) {
       for (const m of prepMeta) {
         const r = trMap.get(Number(m.rowIndex));
         const translatedTextRaw = String(r?.translatedText ?? "");
-        let translatedText = normalizeSoft(translatedTextRaw);
+        let translatedText = _stripInvisible(translatedTextRaw);
 
         const processed = String(m.afterRules ?? "");
         const src = String(m.sourceText ?? "");
 
-        // fallback if empty
         if (!translatedText) {
           translatedText = processed;
           anomalies.push(
@@ -416,7 +494,6 @@ export function registerRoutesV2(app) {
 
         translatedCount += 1;
 
-        // heuristics
         const rr = ratio(translatedText.length, Math.max(1, processed.length));
         if (rr >= 2.6 || rr <= 0.35) {
           anomalies.push(
@@ -431,7 +508,7 @@ export function registerRoutesV2(app) {
           );
         }
 
-        if (normalizeSoft(translatedText) === normalizeSoft(processed)) {
+        if (_stripInvisible(translatedText) === _stripInvisible(processed)) {
           anomalies.push(
             makeAnomaly({
               type: "same_as_processed",
@@ -504,7 +581,6 @@ export function registerRoutesV2(app) {
         anomalies,
       });
 
-      // response: connector-safe (anomalies sample only)
       return toJson(res, 200, {
         ok: true,
         batchId,
@@ -515,13 +591,11 @@ export function registerRoutesV2(app) {
               updatedRanges: (writeRes.updatedRanges ?? []).slice(0, 50),
             }
           : { dryRun: true },
-        anomalies: {
-          count: anomalies.length,
-          sample: anomalies.slice(0, 20),
-        },
+        anomalies: { count: anomalies.length, sample: anomalies.slice(0, 20) },
         meta: {
           glossaryLoadedAt: cache.loadedAt,
           rawRowCount: cache.rawRowCount,
+          pendingEmptySentinels: _sentinels,
           storedTtlMs: _BATCH_TTL_MS,
         },
       });
@@ -531,8 +605,7 @@ export function registerRoutesV2(app) {
   });
 
   /**
-   * GET /v2/batch/:id/anomalies?offset=&limit=
-   * - anomaly 상세(실제 값) 조회
+   * GET /v2/batch/:id/anomalies
    */
   app.get("/v2/batch/:id/anomalies", async (req, res) => {
     try {
