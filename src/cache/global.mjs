@@ -5,8 +5,11 @@ import { loadRulesAll } from "../rules/load.mjs";
 import { compileReplacePlan } from "../replace/replace.mjs";
 import { escapeRegExp } from "../utils/common.mjs";
 
-let _glossaryCache = null;
 let _rulesCache = null;
+
+// ✅ CHANGE: sheetName별 glossary cache
+// key: normalized sheetName(lower/trim) -> cache object
+const _glossaryCacheBySheet = new Map();
 
 function nowIso() {
   return new Date().toISOString();
@@ -47,13 +50,7 @@ function _makeCategoriesKey(categories) {
 /**
  * Build/return compiled replace plan from glossary cache.
  */
-export function getReplacePlanFromCache({
-  cache,
-  sheetName,
-  sourceLangKey,
-  categories,
-  targetLangKey,
-}) {
+export function getReplacePlanFromCache({ cache, sheetName, sourceLangKey, categories, targetLangKey }) {
   const loadedAt = String(cache?.loadedAt ?? "");
   const sheet = String(sheetName ?? cache?.sheetName ?? "Glossary").trim() || "Glossary";
 
@@ -105,14 +102,7 @@ export function getMaskAnchorsFromCache({ cache, sheetName, sourceLangKey, categ
 }
 
 /**
- * ✅ NEW: Get compiled mask regex plan (avoid per-text RegExp creation).
- *
- * Returns array of:
- *   [{ term, re }]
- *
- * Cache key includes:
- * - sheet, loadedAt, sourceLangKey, categoriesKey
- * - caseSensitive, wordBoundary
+ * Get compiled mask regex plan (avoid per-text RegExp creation).
  */
 export function getMaskRegexPlanFromCache({
   cache,
@@ -131,9 +121,7 @@ export function getMaskRegexPlanFromCache({
   const cs = Boolean(caseSensitive);
   const wb = Boolean(wordBoundary);
 
-  const key = `mrp@@${sheet}@@${loadedAt}@@${slk}@@${catsKey}@@cs=${cs ? 1 : 0}@@wb=${
-    wb ? 1 : 0
-  }`;
+  const key = `mrp@@${sheet}@@${loadedAt}@@${slk}@@${catsKey}@@cs=${cs ? 1 : 0}@@wb=${wb ? 1 : 0}`;
 
   const hit = _maskRegexPlanCache.get(key);
   if (hit) return hit;
@@ -157,7 +145,7 @@ export function getMaskRegexPlanFromCache({
     try {
       plan.push({ term: t, re: new RegExp(pattern, flags) });
     } catch {
-      // ignore invalid regex construction (should be rare due to escaping)
+      // ignore invalid regex construction
     }
   }
 
@@ -167,23 +155,27 @@ export function getMaskRegexPlanFromCache({
   return plan;
 }
 
-/** ---------------- Glossary cache ---------------- **/
+/** ---------------- Glossary cache (sheet-scoped) ---------------- **/
 
 export async function ensureGlossaryLoaded(opts = {}) {
   const forceReload = Boolean(opts.forceReload);
 
-  if (_glossaryCache && !forceReload) return _glossaryCache;
+  const sheetNameRaw = String(opts.sheetName ?? "").trim() || "Glossary";
+  const sheetKey = _normKeyPart(sheetNameRaw);
 
-  const loaded = await loadGlossaryAll(opts);
+  const hit = _glossaryCacheBySheet.get(sheetKey);
+  if (hit && !forceReload) return hit;
 
-  // th-TH 추가하여 캐시가 제대로 갱신되도록 처리
+  // Always pass sheetName through so loadGlossaryAll reads the intended sheet
+  const loaded = await loadGlossaryAll({ ...opts, sheetName: sheetNameRaw });
+
   const byCategoryBySource = buildIndexBySourcePreserveDuplicates(
     loaded.entries,
-    ["ko-kr", "en-us", "th-th"] // "th-TH" 추가
+    ["ko-kr", "en-us", "th-th"]
   );
 
-  _glossaryCache = freezeShallow({
-    sheetName: loaded.sheetName || opts.sheetName || "Glossary",
+  const cache = freezeShallow({
+    sheetName: loaded.sheetName || sheetNameRaw,
     loadedAt: loaded.loadedAt || nowIso(),
     header: loaded.header,
     rawRows: loaded.rawRows,
@@ -194,12 +186,15 @@ export async function ensureGlossaryLoaded(opts = {}) {
     idx: loaded.idx,
   });
 
-  // ✅ Invalidate derived caches on reload
+  _glossaryCacheBySheet.set(sheetKey, cache);
+
+  // ✅ Easiest safe invalidation: clear derived caches (keys include loadedAt anyway)
+  // (If you want, we can optimize later to clear only keys for this sheet.)
   _replacePlanCache.clear();
   _maskAnchorsCache.clear();
   _maskRegexPlanCache.clear();
 
-  return _glossaryCache;
+  return cache;
 }
 
 /** ---------------- Rules cache ---------------- **/
@@ -218,83 +213,37 @@ function precompileRule(entry) {
   if (!ko) return entry;
 
   const mt = String(entry?.matchType ?? "").trim().toLowerCase();
-  if (!mt || mt === "exact") return entry;
 
   try {
-    if (mt === "regex") {
-      entry._compiledRe = new RegExp(ko, "m");
-      return entry;
-    }
-    if (mt === "pattern") {
-      const src = tokenizePatternToRegex(ko);
-      entry._compiledRe = new RegExp(src, "m");
-      return entry;
-    }
+    if (!mt || mt === "exact") entry._compiledRe = new RegExp(`^${escapeRegExp(ko)}$`, "m");
+    else if (mt === "contains") entry._compiledRe = new RegExp(escapeRegExp(ko), "m");
+    else if (mt === "word") entry._compiledRe = new RegExp(`\\b${escapeRegExp(ko)}\\b`, "m");
+    else if (mt === "regex") entry._compiledRe = new RegExp(ko, "m");
+    else if (mt === "pattern") entry._compiledRe = new RegExp(tokenizePatternToRegex(ko), "m");
   } catch {
-    // ignore; fallback to runtime
+    // ignore invalid regex compile
   }
+
   return entry;
 }
 
 export async function ensureRulesLoaded(opts = {}) {
   const forceReload = Boolean(opts.forceReload);
-
   if (_rulesCache && !forceReload) return _rulesCache;
 
-  const loaded = await loadRulesAll(opts);
+  const loaded = await loadRulesAll();
 
-  const itemEntries = loaded.entries
-    .filter((e) => {
-      if (String(e.category ?? "").trim().toLowerCase() !== "item") return false;
-      const ko = String(e.translations?.["ko-kr"] ?? "").trim();
-      return Boolean(ko);
-    })
-    .map((e) => {
-      const x = { ...e };
-      return precompileRule(x);
-    });
+  // 기존 호환 유지: entries 전체를 들고 있고, 필요한 곳에서 category별로 선택
+  const entries = Array.isArray(loaded.entries) ? loaded.entries.map(precompileRule) : [];
 
   _rulesCache = freezeShallow({
     loadedAt: loaded.loadedAt || nowIso(),
     header: loaded.header,
     rawRows: loaded.rawRows,
-    entries: loaded.entries,
+    entries,
     rawRowCount: loaded.rawRowCount,
     langIndex: loaded.langIndex,
-    itemEntries,
   });
 
   return _rulesCache;
-}
-
-export function resetGlobalCaches() {
-  _glossaryCache = null;
-  _rulesCache = null;
-  _replacePlanCache.clear();
-  _maskAnchorsCache.clear();
-  _maskRegexPlanCache.clear();
-}
-
-export function getGlobalCacheStatus() {
-  return {
-    glossary: _glossaryCache
-      ? {
-          loadedAt: _glossaryCache.loadedAt,
-          rawRowCount: _glossaryCache.rawRowCount,
-          categoriesCount: _glossaryCache.byCategoryBySource?.size ?? 0,
-          derived: {
-            replacePlanKeys: _replacePlanCache.size,
-            maskAnchorsKeys: _maskAnchorsCache.size,
-            maskRegexPlanKeys: _maskRegexPlanCache.size,
-          },
-        }
-      : null,
-    rules: _rulesCache
-      ? {
-          loadedAt: _rulesCache.loadedAt,
-          rawRowCount: _rulesCache.rawRowCount,
-          itemRulesCount: _rulesCache.itemEntries?.length ?? 0,
-        }
-      : null,
-  };
 }
