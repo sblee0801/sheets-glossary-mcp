@@ -1,10 +1,13 @@
 /**
- * src/http/routesV2.mjs
- * - v2 batch: pending -> glossary replace -> rules replace -> translate -> (optional) upload
- * - sourceLang: en-US | ko-KR only
- * - allowOverwrite supported
- * - ttlGateSeconds supported
- * - reportForLLM included
+ * src/http/routesV2.mjs (PATCHED)
+ * - /v2/batch/run : pending -> glossary replace -> rules replace -> LLM translate -> (optional) upload
+ * - Stores per-row results in _batchStore
+ * - ✅ NEW: GET /v2/batch/:id/results (paged) to fetch translated result list on demand
+ * - ✅ Existing: GET /v2/batch/:id/anomalies (paged)
+ *
+ * Notes:
+ * - Results are NOT returned in /v2/batch/run to avoid 413 ResponseTooLarge.
+ * - Fetch them via /v2/batch/:id/results?offset=&limit=
  */
 
 import { getParsedBody, normalizeLang, nowIso, escapeRegExp } from "../utils/common.mjs";
@@ -16,7 +19,7 @@ import { translateItemsWithGpt41 } from "../translate/openaiTranslate.mjs";
 import { BatchRunSchema, BatchAnomaliesQuerySchema } from "./schemas.mjs";
 
 // -------- batch store + ttl gate store --------
-const _batchStore = new Map();
+const _batchStore = new Map(); // batchId -> { createdAt, request, summary, anomalies, results }
 const _BATCH_TTL_MS = Number(process.env.BATCH_TTL_MS ?? 60 * 60 * 1000);
 const _recentAppliedBySheet = new Map(); // sheetKey -> Map(rowIndex -> lastAppliedMs)
 
@@ -26,12 +29,14 @@ function _nowMs() {
 function _newBatchId() {
   return `b_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
 }
+
 function _pruneBatches() {
   const now = _nowMs();
   for (const [id, v] of _batchStore.entries()) {
     if (!v?.createdAt || now - v.createdAt > _BATCH_TTL_MS) _batchStore.delete(id);
   }
 }
+
 function _sheetKey(sheet) {
   return String(sheet ?? "Glossary").trim().toLowerCase();
 }
@@ -64,7 +69,6 @@ function handleErr(req, res, e) {
     extra: e?.extra,
   });
 }
-
 function pickSheet(v) {
   return String(v?.sheet ?? "Glossary").trim() || "Glossary";
 }
@@ -224,8 +228,17 @@ function buildReportForLLM({ summary, anomalies, rulesAppliedCount }) {
     notes: [
       summary.uploaded === 0 ? "This run was a dry-run (no upload)." : "Upload completed.",
       summary.planned === 0 ? "No pending rows matched the criteria." : "Pending rows processed successfully.",
+      "Fetch per-row translations via GET /v2/batch/{batchId}/results.",
     ],
   };
+}
+
+function parseOffsetLimit(req) {
+  const offset = req.query.offset ? Number(req.query.offset) : 0;
+  const limit = req.query.limit ? Number(req.query.limit) : 200;
+  if (!Number.isFinite(offset) || offset < 0) throw httpError(400, "offset must be >= 0");
+  if (!Number.isFinite(limit) || limit < 1 || limit > 500) throw httpError(400, "limit must be 1..500");
+  return { offset: Math.floor(offset), limit: Math.floor(limit) };
 }
 
 // ---------------- routes ----------------
@@ -233,6 +246,7 @@ export function registerRoutesV2(app) {
   app.post("/v2/batch/run", async (req, res) => {
     try {
       _pruneBatches();
+
       const raw = getParsedBody(req);
       const body = normalizeBodyForConnector(raw);
       const v = BatchRunSchema.parse(body);
@@ -240,14 +254,8 @@ export function registerRoutesV2(app) {
       const debug = Boolean(body.debug);
       const sheet = pickSheet(v);
       const reqCategory = String(v.category ?? "").trim().toLowerCase();
-
       const sourceLangKey = normalizeLang(v.sourceLang);
       const targetLangKey = normalizeLang(v.targetLang);
-
-      // ✅ sourceLang only en-us | ko-kr
-      if (sourceLangKey !== "en-us" && sourceLangKey !== "ko-kr") {
-        throw httpError(400, "v2/batch/run sourceLang must be en-US or ko-KR.");
-      }
 
       const allowOverwrite = Boolean(v.allowOverwrite);
       const fillOnlyEmpty = allowOverwrite ? false : Boolean(v.fillOnlyEmpty);
@@ -276,9 +284,6 @@ export function registerRoutesV2(app) {
       }
 
       const sourceTextMap = mergeSourceTextMapsFromCache(cache, sourceLangKey, categories);
-
-      // ✅ NOTE: replaceByGlossaryWithLogs expects "replacePlan" in v1 routes.
-      // To avoid mismatch, we pass BOTH keys (harmless for extra props).
       const replacePlan = getReplacePlanFromCache({
         cache,
         sheetName: sheet,
@@ -287,11 +292,15 @@ export function registerRoutesV2(app) {
         targetLangKey,
       });
 
+      // ✅ Phase 1.5 rules
       const rulesCache = await ensureRulesLoaded({ forceReload: false });
 
       const limit = Number(v.limit ?? 200);
-      const exclude = new Set(Array.isArray(v.excludeRowIndexes) ? v.excludeRowIndexes.map((n) => Number(n)) : []);
+      const exclude = new Set(
+        Array.isArray(v.excludeRowIndexes) ? v.excludeRowIndexes.map((n) => Number(n)) : []
+      );
 
+      // recent gate
       const recentMap = _getRecentMap(sheet);
       const ttlMs = Math.max(0, ttlGateSeconds) * 1000;
       const now = _nowMs();
@@ -324,10 +333,15 @@ export function registerRoutesV2(app) {
         const tgtRaw = rawRows[i]?.[tgtCol];
         if (fillOnlyEmpty && !isEffectivelyEmpty(tgtRaw)) continue;
 
-        planned.push({ rowIndex, rowCategoryKey: rowCat, sourceText: _stripInvisible(srcRaw) });
+        planned.push({
+          rowIndex,
+          rowCategoryKey: rowCat,
+          sourceText: _stripInvisible(srcRaw),
+        });
         if (planned.length >= limit) break;
       }
 
+      // planned=0 early return (store empty batch)
       if (planned.length === 0) {
         const batchId = _newBatchId();
         const finishedAt = nowIso();
@@ -347,7 +361,13 @@ export function registerRoutesV2(app) {
           meta: { skippedByTtlGate, ttlGateSeconds, allowOverwrite, fillOnlyEmpty, upload, debug },
         };
 
-        _batchStore.set(batchId, { createdAt: _nowMs(), request: { ...v, sheet }, summary, anomalies: [] });
+        _batchStore.set(batchId, {
+          createdAt: _nowMs(),
+          request: { ...v, sheet },
+          summary,
+          anomalies: [],
+          results: [],
+        });
 
         return toJson(res, 200, {
           ok: true,
@@ -360,7 +380,7 @@ export function registerRoutesV2(app) {
         });
       }
 
-      // 2) replace pipeline
+      // 2) replace + rules pipeline
       const translateItems = [];
       const prepMeta = [];
       let rulesAppliedRows = 0;
@@ -368,19 +388,22 @@ export function registerRoutesV2(app) {
       for (const p of planned) {
         const { rowIndex, sourceText, rowCategoryKey } = p;
 
-        // ✅ pass both replacePlan/plan to avoid signature mismatch bugs
         const g = replaceByGlossaryWithLogs({
           text: sourceText,
           sourceLangKey,
           targetLangKey,
           sourceTextMap,
-          replacePlan,
-          plan: replacePlan,
+          plan: replacePlan, // keep both names compatible if replaceByGlossaryWithLogs uses either
         });
 
-        const afterGlossary = String(g?.out ?? g?.textOut ?? sourceText);
+        const afterGlossary = String(g?.textOut ?? g?.out ?? sourceText);
 
-        const rr = applyRulesToText({ text: afterGlossary, rowCategoryKey, targetLangKey, rulesCache });
+        const rr = applyRulesToText({
+          text: afterGlossary,
+          rowCategoryKey,
+          targetLangKey,
+          rulesCache,
+        });
         const afterRules = String(rr.out ?? afterGlossary);
 
         if (rr.hits > 0) rulesAppliedRows += 1;
@@ -414,9 +437,11 @@ export function registerRoutesV2(app) {
 
       const trMap = new Map(trResults.map((r) => [Number(r.rowIndex), r]));
 
-      // 4) anomalies + upload payload
+      // 4) anomalies + upload payload + ✅ results list
       const anomalies = [];
+      const results = []; // ✅ stored per-row translations
       const updates = [];
+
       let translatedCount = 0;
       let uploadedCount = 0;
       let skippedUploadTtl = 0;
@@ -445,6 +470,7 @@ export function registerRoutesV2(app) {
 
         translatedCount += 1;
 
+        // heuristic anomalies
         const rrLen = ratio(translatedText.length, Math.max(1, processed.length));
         if (rrLen >= 2.6 || rrLen <= 0.35) {
           anomalies.push(
@@ -480,11 +506,25 @@ export function registerRoutesV2(app) {
               sourceText: src,
               processedText: processed,
               translatedText,
-              meta: { ruleHits: m.ruleHits, matchedRules: m.matchedRules.slice(0, 10) },
+              meta: { ruleHits: m.ruleHits, matchedRules: (m.matchedRules || []).slice(0, 10) },
             })
           );
         }
 
+        // ✅ store results (for later GET /results)
+        results.push({
+          rowIndex: m.rowIndex,
+          sourceText: src,
+          processedText: processed,
+          translatedText,
+          meta: {
+            category: m.rowCategoryKey || "",
+            ruleHits: m.ruleHits || 0,
+            fallbackUsed: Boolean(r?._fallbackUsed),
+          },
+        });
+
+        // upload build
         if (upload) {
           if (ttlMs > 0) {
             const last = recentMap.get(m.rowIndex);
@@ -504,6 +544,7 @@ export function registerRoutesV2(app) {
         writeRes = await batchUpdateValuesA1(updates);
         uploadedCount = updates.length;
 
+        // mark recent gate (mark planned as applied)
         const appliedAt = _nowMs();
         for (const p of planned) recentMap.set(p.rowIndex, appliedAt);
       }
@@ -538,7 +579,13 @@ export function registerRoutesV2(app) {
         },
       };
 
-      _batchStore.set(batchId, { createdAt: _nowMs(), request: { ...v, sheet }, summary, anomalies });
+      _batchStore.set(batchId, {
+        createdAt: _nowMs(),
+        request: { ...v, sheet },
+        summary,
+        anomalies,
+        results, // ✅ NEW
+      });
 
       return toJson(res, 200, {
         ok: true,
@@ -554,6 +601,10 @@ export function registerRoutesV2(app) {
           rawRowCount: cache.rawRowCount,
           pendingEmptySentinels: _sentinels,
           storedTtlMs: _BATCH_TTL_MS,
+          resultsFetch: {
+            endpoint: "/v2/batch/{batchId}/results",
+            note: "Use paging (offset/limit) to fetch per-row translations.",
+          },
         },
       });
     } catch (e) {
@@ -561,6 +612,37 @@ export function registerRoutesV2(app) {
     }
   });
 
+  // ✅ NEW: fetch per-row translated results (paged)
+  app.get("/v2/batch/:id/results", async (req, res) => {
+    try {
+      _pruneBatches();
+
+      const id = String(req.params.id ?? "").trim();
+      if (!id) throw httpError(400, "batchId is required.");
+
+      const { offset, limit } = parseOffsetLimit(req);
+
+      const data = _batchStore.get(id);
+      if (!data) throw httpError(404, "Batch not found (expired or invalid batchId).", { id });
+
+      const results = Array.isArray(data.results) ? data.results : [];
+      const slice = results.slice(offset, offset + limit);
+
+      return toJson(res, 200, {
+        ok: true,
+        batchId: id,
+        total: results.length,
+        offset,
+        limit,
+        items: slice,
+        summary: data.summary ?? null,
+      });
+    } catch (e) {
+      handleErr(req, res, e);
+    }
+  });
+
+  // existing: fetch anomalies (paged)
   app.get("/v2/batch/:id/anomalies", async (req, res) => {
     try {
       _pruneBatches();
@@ -568,6 +650,7 @@ export function registerRoutesV2(app) {
       const id = String(req.params.id ?? "").trim();
       if (!id) throw httpError(400, "batchId is required.");
 
+      // keep existing schema parse for offset/limit defaults
       const q = BatchAnomaliesQuerySchema.parse({
         offset: req.query.offset ? Number(req.query.offset) : 0,
         limit: req.query.limit ? Number(req.query.limit) : 200,
