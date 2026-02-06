@@ -1,13 +1,13 @@
 // src/glossary/load.mjs
-// - Glossary-like 시트를 로드해서 entries 구조로 변환
-// - "언어 컬럼 인덱스(langIndex)"를 자동 구성
+// - Load glossary sheet into normalized entries
+// - Auto-detect language columns
 
 import { DEFAULT_SHEET_NAME, buildSheetRange } from "../config/env.mjs";
 import { readSheetRange } from "../google/sheets.mjs";
 import { normalizeHeader, nowIso } from "../utils/common.mjs";
 
-function normSheetCategory(sheetName) {
-  return String(sheetName ?? "").trim().toLowerCase();
+function normCategoryFallback(sheetName) {
+  return String(sheetName ?? "").trim().toLowerCase() || "default";
 }
 
 export async function loadGlossaryAll(opts = {}) {
@@ -33,14 +33,12 @@ export async function loadGlossaryAll(opts = {}) {
 
   const norm = header.map(normalizeHeader);
 
-  // ✅ key 컬럼: "key" 우선, 없으면 "id" 사용, 둘 다 없으면 -1 허용
+  // key / category column
   const idxKey = norm.indexOf("key") >= 0 ? norm.indexOf("key") : norm.indexOf("id");
-
-  // ✅ category 컬럼: "분류" 또는 "category" 사용, 없으면 -1 허용 (Trans형)
   const idxCategory =
     norm.indexOf("분류") >= 0 ? norm.indexOf("분류") : norm.indexOf("category");
 
-  // 언어 컬럼으로 보지 않을 헤더들
+  // non-language headers
   const excluded = new Set([
     "key",
     "id",
@@ -59,26 +57,23 @@ export async function loadGlossaryAll(opts = {}) {
     "match_type",
   ]);
 
-  // langIndex: { "ko-kr": <colIdx>, "en-us": <colIdx>, ... }
+  // language columns
   const langIndex = {};
   for (let i = 0; i < norm.length; i++) {
     const h = norm[i];
-    if (!h) continue;
-    if (excluded.has(h)) continue;
+    if (!h || excluded.has(h)) continue;
     langIndex[h] = i;
   }
 
-  // 최소 요구: ko-KR 존재
+  // ko-KR is mandatory anchor language
   if (langIndex["ko-kr"] == null) {
-    throw new Error(
-      `Sheet '${sheetName}' header must include 'ko-KR' (language column header must be 'ko-KR').`
-    );
+    throw new Error(`Sheet '${sheetName}' must include 'ko-KR' language column.`);
   }
 
-  const fallbackCategory = normSheetCategory(sheetName) || "default";
+  const fallbackCategory = normCategoryFallback(sheetName);
 
-  const entries = rows.map((r, rowIdx) => {
-    const rowIndex = rowIdx + 2; // sheet row index (1-based + header)
+  const entries = rows.map((r, i) => {
+    const rowIndex = i + 2;
 
     const key =
       idxKey >= 0 ? String(r[idxKey] ?? "").trim() : `row:${rowIndex}`;
@@ -89,9 +84,9 @@ export async function loadGlossaryAll(opts = {}) {
         : fallbackCategory;
 
     const translations = {};
-    for (const [langKey, colIdx] of Object.entries(langIndex)) {
+    for (const [lang, colIdx] of Object.entries(langIndex)) {
       const v = String(r[colIdx] ?? "").trim();
-      if (v) translations[langKey] = v;
+      if (v) translations[lang] = v;
     }
 
     return {

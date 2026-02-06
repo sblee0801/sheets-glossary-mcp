@@ -1,19 +1,13 @@
-/**
- * src/google/sheets.mjs
- * - Google Sheets API client (Read/Write)
- * - readSheetRange(range): values.get
- * - batchUpdateValuesA1(updates): values.batchUpdate
- */
+// src/google/sheets.mjs
+// - Google Sheets API client (Read/Write)
+// - readSheetRange(range): values.get
+// - batchUpdateValuesA1(updates): values.batchUpdate
 
 import { google } from "googleapis";
-import {
-  SPREADSHEET_ID,
-  GOOGLE_SERVICE_ACCOUNT_JSON,
-} from "../config/env.mjs";
+import { SPREADSHEET_ID, GOOGLE_SERVICE_ACCOUNT_JSON } from "../config/env.mjs";
 
-// ---------------- Helpers ----------------
+// ---------------- A1 Helpers ----------------
 export function colIndexToA1(colIndex0) {
-  // 0 -> A, 1 -> B ...
   let n = Number(colIndex0) + 1;
   let s = "";
   while (n > 0) {
@@ -24,7 +18,7 @@ export function colIndexToA1(colIndex0) {
   return s;
 }
 
-// ---------------- Google Sheets Client (cached) ----------------
+// ---------------- Sheets Client (cached) ----------------
 let _sheetsClient = null;
 
 export function getSheetsClient() {
@@ -34,16 +28,14 @@ export function getSheetsClient() {
 
   const auth = new google.auth.GoogleAuth({
     credentials: serviceAccount,
-    // ✅ Write 지원 스코프
     scopes: ["https://www.googleapis.com/auth/spreadsheets"],
   });
 
-  const sheets = google.sheets({ version: "v4", auth });
-  _sheetsClient = sheets;
-  return sheets;
+  _sheetsClient = google.sheets({ version: "v4", auth });
+  return _sheetsClient;
 }
 
-// ---------------- Google Sheets Read (Generic) ----------------
+// ---------------- Read ----------------
 export async function readSheetRange(range) {
   const sheets = getSheetsClient();
 
@@ -61,27 +53,25 @@ export async function readSheetRange(range) {
   return { header, rows };
 }
 
-// ---------------- Google Sheets Write (Batch A1) ----------------
+// ---------------- Write ----------------
 export async function batchUpdateValuesA1(updates) {
-  // updates: [{ range: "Glossary!K12", values: [[...]] }]
   const sheets = getSheetsClient();
 
-  if (!updates || updates.length === 0) {
-    return { updatedCells: 0, updatedRanges: [] };
-  }
+  const data = Array.isArray(updates) ? updates : [];
+  if (!data.length) return { updatedCells: 0, updatedRanges: [] };
 
   const res = await sheets.spreadsheets.values.batchUpdate({
     spreadsheetId: SPREADSHEET_ID,
     requestBody: {
       valueInputOption: "RAW",
-      data: updates,
+      data,
     },
   });
 
-  const totalUpdatedCells = res.data.totalUpdatedCells ?? 0;
+  const updatedCells = res.data.totalUpdatedCells ?? 0;
   const updatedRanges = (res.data.responses || [])
     .map((r) => r.updatedRange)
     .filter(Boolean);
 
-  return { updatedCells: totalUpdatedCells, updatedRanges };
+  return { updatedCells, updatedRanges };
 }

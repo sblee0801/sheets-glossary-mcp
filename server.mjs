@@ -1,28 +1,25 @@
 /**
  * server.mjs (ENTRY)
- * - Express 앱 생성 + 미들웨어 설정
- * - REST 라우트 등록
- * - 응답 크기 가드(커넥터 ResponseTooLarge 사전 차단)
+ * - Express app + middleware
+ * - Response size guard (CustomGPT Actions 안정성)
+ * - Route registration: v1 (QA) + v2 (batch translate)
  */
 
 import "dotenv/config";
 import express from "express";
 
-import { PORT, SHEET_RANGE, RULE_SHEET_RANGE, assertRequiredEnv } from "./src/config/env.mjs";
-import { registerRoutes } from "./src/http/routes.mjs";
-import { registerRoutesV2 } from "./src/http/routesV2.mjs"; // ✅ NEW
+import { PORT, assertRequiredEnv } from "./src/config/env.mjs";
+import { registerRoutes } from "./src/http/routes.mjs";     // v1 (QA/update/apply)
+import { registerRoutesV2 } from "./src/http/routesV2.mjs"; // v2 (batch)
 
-// ---- boot-time env validation ----
 assertRequiredEnv();
 
-// ---- env knobs ----
 const BODY_LIMIT = process.env.BODY_LIMIT ?? "8mb";
 
-// 커넥터/Actions 쪽은 "응답"이 너무 크면 죽는다.
-const RESPONSE_LIMIT_KB = Number(process.env.RESPONSE_LIMIT_KB ?? "900"); // 기본 900KB
-const RESPONSE_LIMIT_BYTES = Math.max(50 * 1024, RESPONSE_LIMIT_KB * 1024); // 최소 50KB
+// Connector/Actions 응답이 너무 크면 실패하는 경우가 있어 서버에서 선제 차단
+const RESPONSE_LIMIT_KB = Number(process.env.RESPONSE_LIMIT_KB ?? "900"); // default 900KB
+const RESPONSE_LIMIT_BYTES = Math.max(50 * 1024, RESPONSE_LIMIT_KB * 1024); // min 50KB
 
-// ---- app ----
 const app = express();
 
 app.use(
@@ -33,9 +30,7 @@ app.use(
 );
 app.use(express.text({ limit: BODY_LIMIT, type: ["text/*"] }));
 
-/**
- * Response size guard + logging
- */
+// ---------------- Response size guard ----------------
 app.use((req, res, next) => {
   const startedAt = Date.now();
 
@@ -62,54 +57,40 @@ app.use((req, res, next) => {
     );
   }
 
+  function cutoffPayload(bytes) {
+    return {
+      ok: false,
+      error: "ResponseTooLarge",
+      message:
+        "Server response exceeded safe limit for CustomGPT Actions. Reduce payload (e.g., use summary-only responses, or fetch details via /v2/batch/:id/anomalies).",
+      meta: {
+        responseBytes: bytes,
+        limitBytes: RESPONSE_LIMIT_BYTES,
+        limitKB: RESPONSE_LIMIT_KB,
+        method: req.method,
+        path: req.originalUrl,
+      },
+    };
+  }
+
   res.json = (payload) => {
     const bytes = byteLen(payload);
-
     if (bytes > RESPONSE_LIMIT_BYTES) {
       logSize(bytes, "[CUTOFF: json too large]");
       res.status(413);
-      return originalJson({
-        ok: false,
-        error: "ResponseTooLarge",
-        message:
-          "Server response exceeded safe limit for CustomGPT Actions. Reduce payload (e.g., return only summary + anomaly sample, fetch details via /v2/batch/:id/anomalies).",
-        meta: {
-          responseBytes: bytes,
-          limitBytes: RESPONSE_LIMIT_BYTES,
-          limitKB: RESPONSE_LIMIT_KB,
-          method: req.method,
-          path: req.originalUrl,
-        },
-      });
+      return originalJson(cutoffPayload(bytes));
     }
-
     logSize(bytes);
     return originalJson(payload);
   };
 
   res.send = (payload) => {
     const bytes = byteLen(payload);
-
     if (bytes > RESPONSE_LIMIT_BYTES) {
       logSize(bytes, "[CUTOFF: send too large]");
       res.status(413);
-      return originalSend(
-        JSON.stringify({
-          ok: false,
-          error: "ResponseTooLarge",
-          message:
-            "Server response exceeded safe limit for CustomGPT Actions. Reduce payload (e.g., return only summary + anomaly sample, fetch details via /v2/batch/:id/anomalies).",
-          meta: {
-            responseBytes: bytes,
-            limitBytes: RESPONSE_LIMIT_BYTES,
-            limitKB: RESPONSE_LIMIT_KB,
-            method: req.method,
-            path: req.originalUrl,
-          },
-        })
-      );
+      return originalSend(JSON.stringify(cutoffPayload(bytes)));
     }
-
     logSize(bytes);
     return originalSend(payload);
   };
@@ -117,17 +98,15 @@ app.use((req, res, next) => {
   next();
 });
 
-// ---- register endpoints ----
-registerRoutes(app);   // v1 existing
-registerRoutesV2(app); // ✅ v2 new
+// ---------------- Routes ----------------
+registerRoutes(app);   // v1
+registerRoutesV2(app); // v2
 
-// ---- start ----
+// ---------------- Start ----------------
 app.listen(PORT, () => {
   console.log(`Server listening on :${PORT}`);
-  console.log(`Sheet range: ${SHEET_RANGE} (TERM ignored)`);
-  console.log(`Rule range: ${RULE_SHEET_RANGE}`);
   console.log(`BODY_LIMIT=${BODY_LIMIT}`);
-  console.log(`RESPONSE_LIMIT_KB=${RESPONSE_LIMIT_KB} (guard enabled)`);
-  console.log(`REST(v1): /v1/*`);
+  console.log(`RESPONSE_LIMIT_KB=${RESPONSE_LIMIT_KB}`);
+  console.log(`REST(v1): /v1/glossary/update, /v1/glossary/qa/next, /v1/glossary/apply`);
   console.log(`REST(v2): /v2/batch/run, /v2/batch/:id/anomalies`);
 });

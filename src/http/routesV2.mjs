@@ -1,8 +1,10 @@
 /**
- * src/http/routesV2.mjs (Step 2-3)
- * - upload:true 실제 업로드 지원
- * - allowOverwrite + ttlGateSeconds 지원
- * - reportForLLM 응답 포함
+ * src/http/routesV2.mjs
+ * - v2 batch: pending -> glossary replace -> rules replace -> translate -> (optional) upload
+ * - sourceLang: en-US | ko-KR only
+ * - allowOverwrite supported
+ * - ttlGateSeconds supported
+ * - reportForLLM included
  */
 
 import { getParsedBody, normalizeLang, nowIso, escapeRegExp } from "../utils/common.mjs";
@@ -18,20 +20,21 @@ const _batchStore = new Map();
 const _BATCH_TTL_MS = Number(process.env.BATCH_TTL_MS ?? 60 * 60 * 1000);
 const _recentAppliedBySheet = new Map(); // sheetKey -> Map(rowIndex -> lastAppliedMs)
 
-function _nowMs() { return Date.now(); }
-function _newBatchId() { return `b_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`; }
-
+function _nowMs() {
+  return Date.now();
+}
+function _newBatchId() {
+  return `b_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
+}
 function _pruneBatches() {
   const now = _nowMs();
   for (const [id, v] of _batchStore.entries()) {
     if (!v?.createdAt || now - v.createdAt > _BATCH_TTL_MS) _batchStore.delete(id);
   }
 }
-
 function _sheetKey(sheet) {
   return String(sheet ?? "Glossary").trim().toLowerCase();
 }
-
 function _getRecentMap(sheet) {
   const k = _sheetKey(sheet);
   const hit = _recentAppliedBySheet.get(k);
@@ -47,13 +50,24 @@ function httpError(status, message, extra) {
   err.extra = extra;
   return err;
 }
-function toJson(res, status, payload) { res.status(status).json(payload); }
+function toJson(res, status, payload) {
+  res.status(status).json(payload);
+}
 function handleErr(req, res, e) {
   const status = Number(e?.status) || 500;
   console.error(`[ERR] ${req.method} ${req.originalUrl}`, e?.message || e, e?.extra || "");
-  toJson(res, status, { ok: false, error: String(e?.message ?? e), method: req.method, path: req.originalUrl, extra: e?.extra });
+  toJson(res, status, {
+    ok: false,
+    error: String(e?.message ?? e),
+    method: req.method,
+    path: req.originalUrl,
+    extra: e?.extra,
+  });
 }
-function pickSheet(v) { return String(v?.sheet ?? "Glossary").trim() || "Glossary"; }
+
+function pickSheet(v) {
+  return String(v?.sheet ?? "Glossary").trim() || "Glossary";
+}
 function normalizeBodyForConnector(body) {
   const b = body && typeof body === "object" ? body : {};
   if (b.category === undefined || b.category === null) b.category = "";
@@ -63,7 +77,9 @@ function normalizeBodyForConnector(body) {
 
 // -------- empty normalization --------
 const _sentinels = String(process.env.PENDING_EMPTY_SENTINELS || "")
-  .split(",").map((s) => s.trim()).filter(Boolean);
+  .split(",")
+  .map((s) => s.trim())
+  .filter(Boolean);
 
 function _stripInvisible(s) {
   return String(s ?? "")
@@ -98,7 +114,9 @@ function compileRuleRegex(entry) {
     if (mt === "word") return new RegExp(`\\b${escapeRegExp(ko)}\\b`, "m");
     if (mt === "regex") return new RegExp(ko, "m");
     if (mt === "pattern") return new RegExp(tokenizePatternToRegex(ko), "m");
-  } catch { return null; }
+  } catch {
+    return null;
+  }
   return null;
 }
 function getRulesForRowCategory(rulesCache, rowCategoryKey) {
@@ -133,13 +151,22 @@ function applyRulesToText({ text, rowCategoryKey, targetLangKey, rulesCache }) {
     if (!to) continue;
     const re = r?._compiledRe instanceof RegExp ? r._compiledRe : compileRuleRegex(r);
     if (!(re instanceof RegExp)) continue;
-    if (!re.test(out)) { re.lastIndex = 0; continue; }
+    if (!re.test(out)) {
+      re.lastIndex = 0;
+      continue;
+    }
     re.lastIndex = 0;
     const before = out;
     out = out.replace(re, to);
     if (out !== before) {
       hits += 1;
-      matched.push({ key: r?.key ?? null, rowIndex: r?._rowIndex ?? null, category: r?.category ?? "", matchType: r?.matchType ?? "", priority: r?.priority ?? 0 });
+      matched.push({
+        key: r?.key ?? null,
+        rowIndex: r?._rowIndex ?? null,
+        category: r?.category ?? "",
+        matchType: r?.matchType ?? "",
+        priority: r?.priority ?? 0,
+      });
     }
   }
   return { out, hits, matched };
@@ -153,7 +180,14 @@ function ratio(a, b) {
   return x / y;
 }
 function makeAnomaly({ type, rowIndex, sourceText, processedText, translatedText, meta }) {
-  return { type, rowIndex, sourceText: String(sourceText ?? ""), processedText: String(processedText ?? ""), translatedText: String(translatedText ?? ""), meta: meta ?? {} };
+  return {
+    type,
+    rowIndex,
+    sourceText: String(sourceText ?? ""),
+    processedText: String(processedText ?? ""),
+    translatedText: String(translatedText ?? ""),
+    meta: meta ?? {},
+  };
 }
 
 function buildReportForLLM({ summary, anomalies, rulesAppliedCount }) {
@@ -206,15 +240,24 @@ export function registerRoutesV2(app) {
       const debug = Boolean(body.debug);
       const sheet = pickSheet(v);
       const reqCategory = String(v.category ?? "").trim().toLowerCase();
+
       const sourceLangKey = normalizeLang(v.sourceLang);
       const targetLangKey = normalizeLang(v.targetLang);
+
+      // ✅ sourceLang only en-us | ko-kr
+      if (sourceLangKey !== "en-us" && sourceLangKey !== "ko-kr") {
+        throw httpError(400, "v2/batch/run sourceLang must be en-US or ko-KR.");
+      }
 
       const allowOverwrite = Boolean(v.allowOverwrite);
       const fillOnlyEmpty = allowOverwrite ? false : Boolean(v.fillOnlyEmpty);
       const upload = Boolean(v.upload);
       const ttlGateSeconds = Number(v.ttlGateSeconds ?? 1800);
 
-      const cache = await ensureGlossaryLoaded({ sheetName: sheet, forceReload: Boolean(v.forceReload) });
+      const cache = await ensureGlossaryLoaded({
+        sheetName: sheet,
+        forceReload: Boolean(v.forceReload),
+      });
 
       const srcCol = cache.langIndex[sourceLangKey];
       if (srcCol == null) throw httpError(400, `Missing sourceLang column: ${sourceLangKey}`, { sheet });
@@ -224,20 +267,31 @@ export function registerRoutesV2(app) {
 
       let categories = null;
       if (reqCategory) {
-        if (!cache.byCategoryBySource?.has(reqCategory)) throw httpError(400, `Category not found: ${reqCategory}`, { sheet });
+        if (!cache.byCategoryBySource?.has(reqCategory)) {
+          throw httpError(400, `Category not found: ${reqCategory}`, { sheet });
+        }
         categories = [reqCategory];
       } else {
         categories = Array.from(cache.byCategoryBySource?.keys?.() ?? []);
       }
 
       const sourceTextMap = mergeSourceTextMapsFromCache(cache, sourceLangKey, categories);
-      const replacePlan = getReplacePlanFromCache({ cache, sheetName: sheet, sourceLangKey, categories, targetLangKey });
+
+      // ✅ NOTE: replaceByGlossaryWithLogs expects "replacePlan" in v1 routes.
+      // To avoid mismatch, we pass BOTH keys (harmless for extra props).
+      const replacePlan = getReplacePlanFromCache({
+        cache,
+        sheetName: sheet,
+        sourceLangKey,
+        categories,
+        targetLangKey,
+      });
+
       const rulesCache = await ensureRulesLoaded({ forceReload: false });
 
       const limit = Number(v.limit ?? 200);
       const exclude = new Set(Array.isArray(v.excludeRowIndexes) ? v.excludeRowIndexes.map((n) => Number(n)) : []);
 
-      // recent gate
       const recentMap = _getRecentMap(sheet);
       const ttlMs = Math.max(0, ttlGateSeconds) * 1000;
       const now = _nowMs();
@@ -314,15 +368,17 @@ export function registerRoutesV2(app) {
       for (const p of planned) {
         const { rowIndex, sourceText, rowCategoryKey } = p;
 
+        // ✅ pass both replacePlan/plan to avoid signature mismatch bugs
         const g = replaceByGlossaryWithLogs({
           text: sourceText,
           sourceLangKey,
           targetLangKey,
           sourceTextMap,
+          replacePlan,
           plan: replacePlan,
         });
 
-        const afterGlossary = String(g?.textOut ?? g?.out ?? sourceText);
+        const afterGlossary = String(g?.out ?? g?.textOut ?? sourceText);
 
         const rr = applyRulesToText({ text: afterGlossary, rowCategoryKey, targetLangKey, rulesCache });
         const afterRules = String(rr.out ?? afterGlossary);
@@ -331,7 +387,15 @@ export function registerRoutesV2(app) {
 
         translateItems.push({ rowIndex, sourceText, textForTranslate: afterRules });
 
-        prepMeta.push({ rowIndex, rowCategoryKey, sourceText, afterGlossary, afterRules, ruleHits: rr.hits, matchedRules: rr.matched });
+        prepMeta.push({
+          rowIndex,
+          rowCategoryKey,
+          sourceText,
+          afterGlossary,
+          afterRules,
+          ruleHits: rr.hits,
+          matchedRules: rr.matched,
+        });
       }
 
       // 3) translate
@@ -367,50 +431,58 @@ export function registerRoutesV2(app) {
 
         if (!translatedText) {
           translatedText = processed;
-          anomalies.push(makeAnomaly({
-            type: "empty_translation_fallback",
-            rowIndex: m.rowIndex,
-            sourceText: src,
-            processedText: processed,
-            translatedText,
-            meta: { reason: "LLM returned empty", model: trMeta?.model ?? null },
-          }));
+          anomalies.push(
+            makeAnomaly({
+              type: "empty_translation_fallback",
+              rowIndex: m.rowIndex,
+              sourceText: src,
+              processedText: processed,
+              translatedText,
+              meta: { reason: "LLM returned empty", model: trMeta?.model ?? null },
+            })
+          );
         }
 
         translatedCount += 1;
 
         const rrLen = ratio(translatedText.length, Math.max(1, processed.length));
         if (rrLen >= 2.6 || rrLen <= 0.35) {
-          anomalies.push(makeAnomaly({
-            type: "length_ratio_suspicious",
-            rowIndex: m.rowIndex,
-            sourceText: src,
-            processedText: processed,
-            translatedText,
-            meta: { ratio: rrLen, processedLen: processed.length, translatedLen: translatedText.length },
-          }));
+          anomalies.push(
+            makeAnomaly({
+              type: "length_ratio_suspicious",
+              rowIndex: m.rowIndex,
+              sourceText: src,
+              processedText: processed,
+              translatedText,
+              meta: { ratio: rrLen, processedLen: processed.length, translatedLen: translatedText.length },
+            })
+          );
         }
 
         if (_stripInvisible(translatedText) === _stripInvisible(processed)) {
-          anomalies.push(makeAnomaly({
-            type: "same_as_processed",
-            rowIndex: m.rowIndex,
-            sourceText: src,
-            processedText: processed,
-            translatedText,
-            meta: { note: "Translated text equals processed text." },
-          }));
+          anomalies.push(
+            makeAnomaly({
+              type: "same_as_processed",
+              rowIndex: m.rowIndex,
+              sourceText: src,
+              processedText: processed,
+              translatedText,
+              meta: { note: "Translated text equals processed text." },
+            })
+          );
         }
 
         if (m.ruleHits > 0) {
-          anomalies.push(makeAnomaly({
-            type: "rule_applied",
-            rowIndex: m.rowIndex,
-            sourceText: src,
-            processedText: processed,
-            translatedText,
-            meta: { ruleHits: m.ruleHits, matchedRules: m.matchedRules.slice(0, 10) },
-          }));
+          anomalies.push(
+            makeAnomaly({
+              type: "rule_applied",
+              rowIndex: m.rowIndex,
+              sourceText: src,
+              processedText: processed,
+              translatedText,
+              meta: { ruleHits: m.ruleHits, matchedRules: m.matchedRules.slice(0, 10) },
+            })
+          );
         }
 
         if (upload) {
@@ -432,13 +504,7 @@ export function registerRoutesV2(app) {
         writeRes = await batchUpdateValuesA1(updates);
         uploadedCount = updates.length;
 
-        // mark recent gate
         const appliedAt = _nowMs();
-        for (const u of updates) {
-          // u.range like "Trans5!H21" -> rowIndex parse is tricky; we already know rowIndex from prepMeta
-          // easiest: iterate prepMeta in same order; but updates can be fewer due to ttl skip.
-          // We'll instead set from planned list: mark ALL planned as applied (safe).
-        }
         for (const p of planned) recentMap.set(p.rowIndex, appliedAt);
       }
 
@@ -513,7 +579,15 @@ export function registerRoutesV2(app) {
       const anomalies = Array.isArray(data.anomalies) ? data.anomalies : [];
       const slice = anomalies.slice(q.offset, q.offset + q.limit);
 
-      return toJson(res, 200, { ok: true, batchId: id, total: anomalies.length, offset: q.offset, limit: q.limit, items: slice, summary: data.summary ?? null });
+      return toJson(res, 200, {
+        ok: true,
+        batchId: id,
+        total: anomalies.length,
+        offset: q.offset,
+        limit: q.limit,
+        items: slice,
+        summary: data.summary ?? null,
+      });
     } catch (e) {
       handleErr(req, res, e);
     }
