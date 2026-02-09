@@ -10,7 +10,8 @@ import { ensureGlossaryLoaded } from "../cache/global.mjs";
 import { colIndexToA1, batchUpdateValuesA1 } from "../google/sheets.mjs";
 import { GlossaryQaNextSchema, ApplySchema, UpdateSchema } from "./schemas.mjs";
 
-// ---------------- Helpers ----------------
+/* ---------------- Helpers ---------------- */
+
 function httpError(status, message, extra) {
   const e = new Error(message);
   e.status = status;
@@ -58,7 +59,8 @@ function clipForQaResponse(s) {
   return t.length > QA_TEXT_MAX_CHARS ? t.slice(0, QA_TEXT_MAX_CHARS) : t;
 }
 
-// ---------------- Core Apply Logic (공통) ----------------
+/* ---------------- Core Apply Logic (SHARED) ---------------- */
+
 async function handleApply(req, res) {
   const body = normalizeBody(getParsedBody(req));
   const v = ApplySchema.parse(body);
@@ -82,7 +84,7 @@ async function handleApply(req, res) {
     const sourceText = strip(entry.sourceText);
 
     if (!Number.isFinite(rowIndex) || rowIndex < 2) {
-      results.push({ rowIndex: entry.rowIndex, status: "skipped", reason: "invalid_rowIndex" });
+      results.push({ rowIndex, status: "skipped", reason: "invalid_rowIndex" });
       continue;
     }
 
@@ -101,6 +103,7 @@ async function handleApply(req, res) {
     }
 
     let updated = 0;
+
     for (const [lang, valRaw] of Object.entries(entry.translations || {})) {
       const langKey = normalizeLang(lang);
       const val = strip(valRaw);
@@ -109,6 +112,7 @@ async function handleApply(req, res) {
       const colIdx = cache.langIndex[langKey];
       if (colIdx == null) continue;
 
+      // ✅ QA policy: ALWAYS OVERWRITE
       const a1 = `${sheet}!${colIndexToA1(colIdx)}${rowIndex}`;
       updates.push({ range: a1, values: [[val]] });
       updated += 1;
@@ -134,12 +138,19 @@ async function handleApply(req, res) {
   });
 }
 
-// ---------------- Routes ----------------
+/* ---------------- Routes ---------------- */
+
 export function registerRoutes(app) {
+  /**
+   * Health
+   */
   app.get("/health", (_req, res) => {
     toJson(res, 200, { ok: true });
   });
 
+  /**
+   * POST /v1/glossary/update
+   */
   app.post("/v1/glossary/update", async (req, res) => {
     try {
       const body = normalizeBody(getParsedBody(req));
@@ -163,6 +174,9 @@ export function registerRoutes(app) {
     }
   });
 
+  /**
+   * POST /v1/glossary/qa/next (READ-ONLY)
+   */
   app.post("/v1/glossary/qa/next", async (req, res) => {
     try {
       const body = normalizeBody(getParsedBody(req));
@@ -196,8 +210,9 @@ export function registerRoutes(app) {
 
       if (v.cursor && String(v.cursor).trim()) {
         const n = Number(String(v.cursor).trim());
-        if (!Number.isFinite(n) || n < 0)
+        if (!Number.isFinite(n) || n < 0) {
           throw httpError(400, "cursor must be a non-negative integer string.");
+        }
         start = Math.floor(n);
       }
 
@@ -247,7 +262,10 @@ export function registerRoutes(app) {
     }
   });
 
-  // ✅ NON-CONSEQUENTIAL
+  /**
+   * POST /run-apply (NON-CONSEQUENTIAL)
+   * - CustomGPT 전용
+   */
   app.post("/run-apply", async (req, res) => {
     try {
       await handleApply(req, res);
@@ -256,7 +274,9 @@ export function registerRoutes(app) {
     }
   });
 
-  // ✅ ORIGINAL WRITE ENDPOINT
+  /**
+   * POST /v1/glossary/apply (WRITE)
+   */
   app.post("/v1/glossary/apply", async (req, res) => {
     try {
       await handleApply(req, res);
