@@ -58,18 +58,88 @@ function clipForQaResponse(s) {
   return t.length > QA_TEXT_MAX_CHARS ? t.slice(0, QA_TEXT_MAX_CHARS) : t;
 }
 
+// ---------------- Core Apply Logic (공통) ----------------
+async function handleApply(req, res) {
+  const body = normalizeBody(getParsedBody(req));
+  const v = ApplySchema.parse(body);
+
+  const sheet = pickSheet(v);
+  const cache = await ensureGlossaryLoaded({ sheetName: sheet, forceReload: false });
+
+  const sourceLangKey = normalizeLang(v.sourceLang);
+  if (sourceLangKey !== "en-us" && sourceLangKey !== "ko-kr") {
+    throw httpError(400, "apply sourceLang must be en-US or ko-KR.");
+  }
+
+  const srcCol = cache.langIndex[sourceLangKey];
+  if (srcCol == null) throw httpError(400, "Missing sourceLang column");
+
+  const updates = [];
+  const results = [];
+
+  for (const entry of v.entries) {
+    const rowIndex = Number(entry.rowIndex);
+    const sourceText = strip(entry.sourceText);
+
+    if (!Number.isFinite(rowIndex) || rowIndex < 2) {
+      results.push({ rowIndex: entry.rowIndex, status: "skipped", reason: "invalid_rowIndex" });
+      continue;
+    }
+
+    const rowArrIdx = rowIndex - 2;
+    if (rowArrIdx < 0 || rowArrIdx >= cache.rawRows.length) {
+      results.push({ rowIndex, status: "skipped", reason: "rowIndex_out_of_range" });
+      continue;
+    }
+
+    const rawRow = cache.rawRows[rowArrIdx] || [];
+    const actualSrc = strip(rawRow[srcCol]);
+
+    if (actualSrc !== sourceText) {
+      results.push({ rowIndex, status: "skipped", reason: "source_mismatch" });
+      continue;
+    }
+
+    let updated = 0;
+    for (const [lang, valRaw] of Object.entries(entry.translations || {})) {
+      const langKey = normalizeLang(lang);
+      const val = strip(valRaw);
+      if (!langKey || !val) continue;
+
+      const colIdx = cache.langIndex[langKey];
+      if (colIdx == null) continue;
+
+      const a1 = `${sheet}!${colIndexToA1(colIdx)}${rowIndex}`;
+      updates.push({ range: a1, values: [[val]] });
+      updated += 1;
+    }
+
+    results.push({
+      rowIndex,
+      updatedCellsPlanned: updated,
+      status: updated ? "success" : "no_op",
+    });
+  }
+
+  const writeRes = await batchUpdateValuesA1(updates);
+  await ensureGlossaryLoaded({ sheetName: sheet, forceReload: true });
+
+  toJson(res, 200, {
+    ok: true,
+    sheet,
+    plannedUpdates: updates.length,
+    updatedCells: writeRes.updatedCells,
+    updatedRanges: writeRes.updatedRanges,
+    results,
+  });
+}
+
 // ---------------- Routes ----------------
 export function registerRoutes(app) {
-  /**
-   * Health
-   */
   app.get("/health", (_req, res) => {
     toJson(res, 200, { ok: true });
   });
 
-  /**
-   * POST /v1/glossary/update
-   */
   app.post("/v1/glossary/update", async (req, res) => {
     try {
       const body = normalizeBody(getParsedBody(req));
@@ -93,9 +163,6 @@ export function registerRoutes(app) {
     }
   });
 
-  /**
-   * POST /v1/glossary/qa/next (READ-ONLY)
-   */
   app.post("/v1/glossary/qa/next", async (req, res) => {
     try {
       const body = normalizeBody(getParsedBody(req));
@@ -180,97 +247,19 @@ export function registerRoutes(app) {
     }
   });
 
-  /**
-   * POST /run-apply (NON-CONSEQUENTIAL)
-   * - Wrapper for CustomGPT
-   * - Calls same logic as /v1/glossary/apply
-   */
+  // ✅ NON-CONSEQUENTIAL
   app.post("/run-apply", async (req, res) => {
     try {
-      const body = normalizeBody(getParsedBody(req));
-      const v = ApplySchema.parse(body);
-
-      // ⬇️ 그대로 apply 로직 재사용
-      req.body = v;
-      return app._router.handle(req, res, () => {}, "/v1/glossary/apply", "post");
+      await handleApply(req, res);
     } catch (e) {
       handleErr(res, e);
     }
   });
 
-  /**
-   * POST /v1/glossary/apply (WRITE)
-   * ✅ QA policy: ALWAYS OVERWRITE
-   */
+  // ✅ ORIGINAL WRITE ENDPOINT
   app.post("/v1/glossary/apply", async (req, res) => {
     try {
-      const body = normalizeBody(getParsedBody(req));
-      const v = ApplySchema.parse(body);
-
-      const sheet = pickSheet(v);
-      const cache = await ensureGlossaryLoaded({ sheetName: sheet, forceReload: false });
-
-      const sourceLangKey = normalizeLang(v.sourceLang);
-      if (sourceLangKey !== "en-us" && sourceLangKey !== "ko-kr") {
-        throw httpError(400, "apply sourceLang must be en-US or ko-KR.");
-      }
-
-      const srcCol = cache.langIndex[sourceLangKey];
-      if (srcCol == null) throw httpError(400, "Missing sourceLang column");
-
-      const updates = [];
-      const results = [];
-
-      for (const entry of v.entries) {
-        const rowIndex = Number(entry.rowIndex);
-        const sourceText = strip(entry.sourceText);
-
-        if (!Number.isFinite(rowIndex) || rowIndex < 2) {
-          results.push({ rowIndex, status: "skipped", reason: "invalid_rowIndex" });
-          continue;
-        }
-
-        const rowArrIdx = rowIndex - 2;
-        const rawRow = cache.rawRows[rowArrIdx] || [];
-        const actualSrc = strip(rawRow[srcCol]);
-
-        if (actualSrc !== sourceText) {
-          results.push({ rowIndex, status: "skipped", reason: "source_mismatch" });
-          continue;
-        }
-
-        let updated = 0;
-        for (const [lang, valRaw] of Object.entries(entry.translations || {})) {
-          const langKey = normalizeLang(lang);
-          const val = strip(valRaw);
-          if (!langKey || !val) continue;
-
-          const colIdx = cache.langIndex[langKey];
-          if (colIdx == null) continue;
-
-          const a1 = `${sheet}!${colIndexToA1(colIdx)}${rowIndex}`;
-          updates.push({ range: a1, values: [[val]] });
-          updated += 1;
-        }
-
-        results.push({
-          rowIndex,
-          updatedCellsPlanned: updated,
-          status: updated ? "success" : "no_op",
-        });
-      }
-
-      const writeRes = await batchUpdateValuesA1(updates);
-      await ensureGlossaryLoaded({ sheetName: sheet, forceReload: true });
-
-      toJson(res, 200, {
-        ok: true,
-        sheet,
-        plannedUpdates: updates.length,
-        updatedCells: writeRes.updatedCells,
-        updatedRanges: writeRes.updatedRanges,
-        results,
-      });
+      await handleApply(req, res);
     } catch (e) {
       handleErr(res, e);
     }
