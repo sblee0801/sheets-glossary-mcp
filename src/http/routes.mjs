@@ -3,6 +3,7 @@
 // - QA default 100 (schema)
 // - QA response text length clip via env QA_TEXT_MAX_CHARS
 // - APPLY: always overwrite (QA policy)
+// - RUN-APPLY: non-consequential wrapper for CustomGPT
 
 import { normalizeLang, getParsedBody } from "../utils/common.mjs";
 import { ensureGlossaryLoaded } from "../cache/global.mjs";
@@ -40,7 +41,7 @@ function normalizeBody(body) {
   return b;
 }
 
-// NBSP + zero-width + BOM 제거해서 source mismatch 줄이기
+// NBSP + zero-width + BOM 제거
 function strip(s) {
   return String(s ?? "")
     .replace(/\r\n/g, "\n")
@@ -49,7 +50,7 @@ function strip(s) {
     .trim();
 }
 
-// QA 응답 텍스트 컷 (0 이하이면 컷 없음)
+// QA 응답 텍스트 컷
 const QA_TEXT_MAX_CHARS = Number(process.env.QA_TEXT_MAX_CHARS ?? 2000);
 function clipForQaResponse(s) {
   const t = strip(s);
@@ -94,9 +95,6 @@ export function registerRoutes(app) {
 
   /**
    * POST /v1/glossary/qa/next (READ-ONLY)
-   * - returns rows that have BOTH source and target filled
-   * - default limit=100 (schema)
-   * - response text clipped by QA_TEXT_MAX_CHARS to avoid 413
    */
   app.post("/v1/glossary/qa/next", async (req, res) => {
     try {
@@ -112,7 +110,6 @@ export function registerRoutes(app) {
       const sourceLangKey = normalizeLang(v.sourceLang);
       const targetLangKey = normalizeLang(v.targetLang);
 
-      // sourceLang: ko-kr | en-us only
       if (sourceLangKey !== "en-us" && sourceLangKey !== "ko-kr") {
         throw httpError(400, "qa/next sourceLang must be en-US or ko-KR.");
       }
@@ -128,11 +125,12 @@ export function registerRoutes(app) {
           : null;
 
       const limit = Number(v.limit ?? 100);
-
       let start = 0;
+
       if (v.cursor && String(v.cursor).trim()) {
         const n = Number(String(v.cursor).trim());
-        if (!Number.isFinite(n) || n < 0) throw httpError(400, "cursor must be a non-negative integer string.");
+        if (!Number.isFinite(n) || n < 0)
+          throw httpError(400, "cursor must be a non-negative integer string.");
         start = Math.floor(n);
       }
 
@@ -149,15 +147,10 @@ export function registerRoutes(app) {
           if (c !== categoryKey) continue;
         }
 
-        const sourceTextRaw = row[srcCol];
-        const targetTextRaw = row[tgtCol];
-
-        const sourceText = strip(sourceTextRaw);
-        const targetText = strip(targetTextRaw);
-
+        const sourceText = strip(row[srcCol]);
+        const targetText = strip(row[tgtCol]);
         if (!sourceText || !targetText) continue;
 
-        // ✅ clip only for response payload
         items.push({
           rowIndex,
           sourceText: clipForQaResponse(sourceText),
@@ -181,12 +174,25 @@ export function registerRoutes(app) {
         cursor: String(start),
         cursorNext: i < cache.entries.length ? String(i) : null,
         items,
-        meta: {
-          qaTextMaxChars: QA_TEXT_MAX_CHARS,
-          glossaryLoadedAt: cache.loadedAt,
-          rawRowCount: cache.rawRowCount,
-        },
       });
+    } catch (e) {
+      handleErr(res, e);
+    }
+  });
+
+  /**
+   * POST /run-apply (NON-CONSEQUENTIAL)
+   * - Wrapper for CustomGPT
+   * - Calls same logic as /v1/glossary/apply
+   */
+  app.post("/run-apply", async (req, res) => {
+    try {
+      const body = normalizeBody(getParsedBody(req));
+      const v = ApplySchema.parse(body);
+
+      // ⬇️ 그대로 apply 로직 재사용
+      req.body = v;
+      return app._router.handle(req, res, () => {}, "/v1/glossary/apply", "post");
     } catch (e) {
       handleErr(res, e);
     }
@@ -195,7 +201,6 @@ export function registerRoutes(app) {
   /**
    * POST /v1/glossary/apply (WRITE)
    * ✅ QA policy: ALWAYS OVERWRITE
-   * - still enforces rowIndex + sourceText match for safety
    */
   app.post("/v1/glossary/apply", async (req, res) => {
     try {
@@ -221,20 +226,11 @@ export function registerRoutes(app) {
         const sourceText = strip(entry.sourceText);
 
         if (!Number.isFinite(rowIndex) || rowIndex < 2) {
-          results.push({ rowIndex: entry.rowIndex, status: "skipped", reason: "invalid_rowIndex" });
-          continue;
-        }
-        if (!sourceText) {
-          results.push({ rowIndex, status: "skipped", reason: "empty_sourceText" });
+          results.push({ rowIndex, status: "skipped", reason: "invalid_rowIndex" });
           continue;
         }
 
         const rowArrIdx = rowIndex - 2;
-        if (rowArrIdx < 0 || rowArrIdx >= cache.rawRows.length) {
-          results.push({ rowIndex, status: "skipped", reason: "rowIndex_out_of_range" });
-          continue;
-        }
-
         const rawRow = cache.rawRows[rowArrIdx] || [];
         const actualSrc = strip(rawRow[srcCol]);
 
@@ -244,7 +240,6 @@ export function registerRoutes(app) {
         }
 
         let updated = 0;
-
         for (const [lang, valRaw] of Object.entries(entry.translations || {})) {
           const langKey = normalizeLang(lang);
           const val = strip(valRaw);
@@ -253,7 +248,6 @@ export function registerRoutes(app) {
           const colIdx = cache.langIndex[langKey];
           if (colIdx == null) continue;
 
-          // ✅ ALWAYS OVERWRITE: no "fillOnlyEmpty" check
           const a1 = `${sheet}!${colIndexToA1(colIdx)}${rowIndex}`;
           updates.push({ range: a1, values: [[val]] });
           updated += 1;
