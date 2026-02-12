@@ -20,7 +20,6 @@ import {
 } from "../google/sheets.mjs";
 
 import {
-  GlossaryQaNextSchema,
   ApplySchema,
   UpdateSchema,
 } from "./schemas.mjs";
@@ -102,11 +101,15 @@ async function handleApply(req, res) {
 
 export function registerRoutes(app) {
 
+  /* ---------- Health ---------- */
+
   app.get("/health", (_req, res) => {
     toJson(res, 200, { ok: true });
   });
 
-  /* ---------- FULL QA ENGINE ---------- */
+  /* =========================================================
+     🔥 FULL QA ENGINE (ANCHOR REVERSE VALIDATION)
+  ========================================================= */
 
   app.post("/v1/qa/run", async (req, res) => {
     try {
@@ -125,8 +128,10 @@ export function registerRoutes(app) {
 
       const srcCol = cache.langIndex[sourceLangKey];
       const tgtCol = cache.langIndex[targetLangKey];
-      if (srcCol == null || tgtCol == null)
+
+      if (srcCol == null || tgtCol == null) {
         throw httpError(400, "Missing language column");
+      }
 
       /* ---------- 1. QA 대상 수집 ---------- */
 
@@ -150,7 +155,9 @@ export function registerRoutes(app) {
         }
       }
 
-      /* ---------- 2. Glossary 로드 (항상 source 기준) ---------- */
+      /* ---------- 2. Glossary 역매핑 생성 ---------- */
+
+      const reverseMap = {};
 
       const glossaryMaps = mergeSourceTextMapsFromCache(
         cache,
@@ -158,15 +165,28 @@ export function registerRoutes(app) {
         Array.from(cache.byCategoryBySource.keys())
       );
 
-      const glossaryEntries = [];
       for (const arr of glossaryMaps.values()) {
-        for (const e of arr || []) glossaryEntries.push(e);
+        for (const entry of arr || []) {
+          const translations = entry.translations || {};
+          const correctTarget = strip(translations[targetLangKey] ?? "");
+          if (!correctTarget) continue;
+
+          for (const [langKey, valRaw] of Object.entries(translations)) {
+            const val = strip(valRaw);
+            if (!val) continue;
+
+            reverseMap[val] = {
+              correct: correctTarget,
+              lang: normalizeLang(langKey),
+            };
+          }
+        }
       }
+
+      /* ---------- 3. Anchor 강제 검증 ---------- */
 
       const finalize = [];
       const maskSummary = [];
-
-      /* ---------- 3. Anchor 정밀 검사 ---------- */
 
       for (const item of items) {
         let modified = item.targetText;
@@ -176,52 +196,22 @@ export function registerRoutes(app) {
         const anchors = [...modified.matchAll(anchorRegex)];
 
         for (const match of anchors) {
-          const fullMatch = match[0];          // «T:Cracked Rift»
-          const innerValue = strip(match[1]); // Cracked Rift
+          const fullMatch = match[0];
+          const innerValue = strip(match[1]);
 
-          for (const entry of glossaryEntries) {
-            const sourceValue = strip(entry?.source ?? "");
-            const translations = entry?.translations || {};
-            const correctTarget = strip(translations[targetLangKey] ?? "");
+          const info = reverseMap[innerValue];
+          if (!info) continue;
 
-            if (!sourceValue || !correctTarget) continue;
+          if (info.lang !== targetLangKey) {
+            modified = modified.replace(
+              fullMatch,
+              `«T:${info.correct}»`
+            );
 
-            // source에 해당 용어가 있어야 검사
-            if (!item.sourceText.includes(sourceValue)) continue;
-
-            // 1️⃣ 이미 targetLang이면 정상
-            if (innerValue === correctTarget) break;
-
-            // 2️⃣ sourceLang 원문이면 교체
-            if (innerValue === sourceValue) {
-              modified = modified.replace(
-                fullMatch,
-                `«T:${correctTarget}»`
-              );
-              applied.push({
-                source: `${sourceValue} (${sourceLangKey})`,
-                target: correctTarget,
-              });
-              break;
-            }
-
-            // 3️⃣ 다른 언어 번역이면 교체
-            for (const [langKey, valRaw] of Object.entries(translations)) {
-              const val = strip(valRaw);
-              if (!val) continue;
-
-              if (langKey !== targetLangKey && innerValue === val) {
-                modified = modified.replace(
-                  fullMatch,
-                  `«T:${correctTarget}»`
-                );
-                applied.push({
-                  source: `${val} (${langKey})`,
-                  target: correctTarget,
-                });
-                break;
-              }
-            }
+            applied.push({
+              source: `${innerValue} (${info.lang})`,
+              target: info.correct,
+            });
           }
         }
 
@@ -240,7 +230,7 @@ export function registerRoutes(app) {
         }
       }
 
-      toJson(res, 200, {
+      return toJson(res, 200, {
         ok: true,
         cursorNext:
           nextCursor < cache.entries.length ? String(nextCursor) : null,
