@@ -1,9 +1,20 @@
 // src/glossary/index.mjs
 // - Build indexes for replace/search
 // - Preserve duplicates: Map -> entry[]
+// ✅ Fix: glossary term에도 invisible 문자 정규화 적용
+// ✅ Fix: 빈 category 방어(default)
+
+function stripInvisible(s) {
+  return String(s ?? "")
+    .replace(/\r\n/g, "\n")
+    .replace(/\u00A0/g, " ") // NBSP
+    .replace(/\u200B|\u200C|\u200D|\uFEFF/g, "") // ZW + BOM
+    .trim();
+}
 
 function normCategory(cat) {
-  return String(cat ?? "").trim().toLowerCase();
+  const c = String(cat ?? "").trim().toLowerCase();
+  return c || "default";
 }
 
 /**
@@ -15,7 +26,6 @@ export function buildIndexBySourcePreserveDuplicates(entries, sourceLangKeys = [
   const list = Array.isArray(entries) ? entries : [];
   for (const e of list) {
     const cat = normCategory(e?.category);
-    if (!cat) continue;
 
     let bySource = byCategoryBySource.get(cat);
     if (!bySource) {
@@ -24,7 +34,7 @@ export function buildIndexBySourcePreserveDuplicates(entries, sourceLangKeys = [
     }
 
     for (const src of sourceLangKeys) {
-      const sourceText = String(e?.translations?.[src] ?? "").trim();
+      const sourceText = stripInvisible(e?.translations?.[src]);
       if (!sourceText) continue;
 
       let textMap = bySource.get(src);
@@ -49,9 +59,12 @@ export function mergeSourceTextMapsFromCache(cache, sourceLangKey, categories) {
   const merged = new Map();
   const cats = Array.isArray(categories) ? categories : [];
 
-  for (const cat of cats) {
+  const slk = String(sourceLangKey ?? "").trim().toLowerCase();
+
+  for (const catRaw of cats) {
+    const cat = String(catRaw ?? "").trim().toLowerCase();
     const bySource = cache.byCategoryBySource?.get?.(cat);
-    const map = bySource?.get?.(sourceLangKey);
+    const map = bySource?.get?.(slk);
     if (!map) continue;
 
     for (const [term, entries] of map.entries()) {

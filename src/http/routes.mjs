@@ -1,14 +1,35 @@
 // src/http/routes.mjs
-// - QA / Apply / Glossary Update only (minimal)
+// - QA / Apply / Glossary Update
+// - + Mask endpoint added
 // - QA default 100 (schema)
 // - QA response text length clip via env QA_TEXT_MAX_CHARS
 // - APPLY: always overwrite (QA policy)
 // - RUN-APPLY: non-consequential wrapper for CustomGPT
 
-import { normalizeLang, getParsedBody } from "../utils/common.mjs";
-import { ensureGlossaryLoaded } from "../cache/global.mjs";
-import { colIndexToA1, batchUpdateValuesA1 } from "../google/sheets.mjs";
-import { GlossaryQaNextSchema, ApplySchema, UpdateSchema } from "./schemas.mjs";
+import {
+  normalizeLang,
+  getParsedBody,
+  escapeRegExp,
+} from "../utils/common.mjs";
+
+import {
+  ensureGlossaryLoaded,
+} from "../cache/global.mjs";
+
+import {
+  mergeSourceTextMapsFromCache,
+} from "../glossary/index.mjs";
+
+import {
+  colIndexToA1,
+  batchUpdateValuesA1,
+} from "../google/sheets.mjs";
+
+import {
+  GlossaryQaNextSchema,
+  ApplySchema,
+  UpdateSchema,
+} from "./schemas.mjs";
 
 /* ---------------- Helpers ---------------- */
 
@@ -53,6 +74,7 @@ function strip(s) {
 
 // QA 응답 텍스트 컷
 const QA_TEXT_MAX_CHARS = Number(process.env.QA_TEXT_MAX_CHARS ?? 2000);
+
 function clipForQaResponse(s) {
   const t = strip(s);
   if (!Number.isFinite(QA_TEXT_MAX_CHARS) || QA_TEXT_MAX_CHARS <= 0) return t;
@@ -112,7 +134,6 @@ async function handleApply(req, res) {
       const colIdx = cache.langIndex[langKey];
       if (colIdx == null) continue;
 
-      // ✅ QA policy: ALWAYS OVERWRITE
       const a1 = `${sheet}!${colIndexToA1(colIdx)}${rowIndex}`;
       updates.push({ range: a1, values: [[val]] });
       updated += 1;
@@ -141,16 +162,15 @@ async function handleApply(req, res) {
 /* ---------------- Routes ---------------- */
 
 export function registerRoutes(app) {
-  /**
-   * Health
-   */
+
+  /* ---------- Health ---------- */
+
   app.get("/health", (_req, res) => {
     toJson(res, 200, { ok: true });
   });
 
-  /**
-   * POST /v1/glossary/update
-   */
+  /* ---------- Glossary Update ---------- */
+
   app.post("/v1/glossary/update", async (req, res) => {
     try {
       const body = normalizeBody(getParsedBody(req));
@@ -174,9 +194,8 @@ export function registerRoutes(app) {
     }
   });
 
-  /**
-   * POST /v1/glossary/qa/next (READ-ONLY)
-   */
+  /* ---------- QA Next ---------- */
+
   app.post("/v1/glossary/qa/next", async (req, res) => {
     try {
       const body = normalizeBody(getParsedBody(req));
@@ -191,12 +210,9 @@ export function registerRoutes(app) {
       const sourceLangKey = normalizeLang(v.sourceLang);
       const targetLangKey = normalizeLang(v.targetLang);
 
-      if (sourceLangKey !== "en-us" && sourceLangKey !== "ko-kr") {
-        throw httpError(400, "qa/next sourceLang must be en-US or ko-KR.");
-      }
-
       const srcCol = cache.langIndex[sourceLangKey];
       const tgtCol = cache.langIndex[targetLangKey];
+
       if (srcCol == null) throw httpError(400, "Missing sourceLang column");
       if (tgtCol == null) throw httpError(400, "Missing targetLang column");
 
@@ -206,20 +222,11 @@ export function registerRoutes(app) {
           : null;
 
       const limit = Number(v.limit ?? 100);
-      let start = 0;
-
-      if (v.cursor && String(v.cursor).trim()) {
-        const n = Number(String(v.cursor).trim());
-        if (!Number.isFinite(n) || n < 0) {
-          throw httpError(400, "cursor must be a non-negative integer string.");
-        }
-        start = Math.floor(n);
-      }
+      let start = Number(v.cursor ?? 0);
 
       const items = [];
-      let i = start;
 
-      for (; i < cache.entries.length; i++) {
+      for (let i = start; i < cache.entries.length; i++) {
         const entry = cache.entries[i];
         const row = cache.rawRows[i] || [];
         const rowIndex = i + 2;
@@ -231,6 +238,7 @@ export function registerRoutes(app) {
 
         const sourceText = strip(row[srcCol]);
         const targetText = strip(row[tgtCol]);
+
         if (!sourceText || !targetText) continue;
 
         items.push({
@@ -240,7 +248,7 @@ export function registerRoutes(app) {
         });
 
         if (items.length >= limit) {
-          i += 1;
+          start = i + 1;
           break;
         }
       }
@@ -248,24 +256,104 @@ export function registerRoutes(app) {
       toJson(res, 200, {
         ok: true,
         sheet: cache.sheetName,
-        category: categoryKey || "ALL",
         sourceLang: v.sourceLang,
         targetLang: v.targetLang,
-        limit,
-        count: items.length,
-        cursor: String(start),
-        cursorNext: i < cache.entries.length ? String(i) : null,
+        cursorNext: start < cache.entries.length ? String(start) : null,
         items,
       });
+
     } catch (e) {
       handleErr(res, e);
     }
   });
 
-  /**
-   * POST /run-apply (NON-CONSEQUENTIAL)
-   * - CustomGPT 전용
-   */
+  /* ---------- NEW: Mask Endpoint ---------- */
+
+  app.post("/v1/translate/mask", async (req, res) => {
+    try {
+      const body = getParsedBody(req) || {};
+
+      const sheet = String(body.sheet ?? "Glossary").trim();
+      const targetLangKey = normalizeLang(body.targetLang);
+      const texts = Array.isArray(body.texts)
+        ? body.texts.map((x) => String(x ?? ""))
+        : [];
+
+      if (!targetLangKey) throw httpError(400, "targetLang is required.");
+      if (!texts.length) throw httpError(400, "texts must be non-empty array.");
+
+      const cache = await ensureGlossaryLoaded({
+        sheetName: sheet,
+        forceReload: false,
+      });
+
+      const categories = Array.from(cache.byCategoryBySource.keys());
+      const sourceTextMap = mergeSourceTextMapsFromCache(
+        cache,
+        "ko-kr",
+        categories
+      );
+
+      const termSet = new Set();
+
+      for (const entries of sourceTextMap.values()) {
+        for (const e of entries || []) {
+          const t = String(e?.translations?.[targetLangKey] ?? "").trim();
+          if (t) termSet.add(t);
+        }
+      }
+
+      const targetTerms = Array.from(termSet)
+        .sort((a, b) => b.length - a.length);
+
+      const compiled = targetTerms.map((term) => ({
+        term,
+        re: new RegExp(escapeRegExp(term), "g"),
+      }));
+
+      let nextId = 1;
+      const masks = [];
+      const textsMasked = [];
+
+      for (const raw of texts) {
+        let out = String(raw ?? "");
+
+        for (const { term, re } of compiled) {
+          out = out.replace(re, () => {
+            const id = nextId++;
+            const token = `{mask:${id}}`;
+            masks.push({
+              id,
+              anchor: token,
+              restore: term,
+            });
+            return token;
+          });
+        }
+
+        textsMasked.push(out);
+      }
+
+      toJson(res, 200, {
+        ok: true,
+        sheet,
+        targetLang: targetLangKey,
+        textsMasked,
+        masks,
+        summary: {
+          inputTexts: texts.length,
+          masks: masks.length,
+          uniqueTerms: targetTerms.length,
+        },
+      });
+
+    } catch (e) {
+      handleErr(res, e);
+    }
+  });
+
+  /* ---------- Apply ---------- */
+
   app.post("/run-apply", async (req, res) => {
     try {
       await handleApply(req, res);
@@ -274,9 +362,6 @@ export function registerRoutes(app) {
     }
   });
 
-  /**
-   * POST /v1/glossary/apply (WRITE)
-   */
   app.post("/v1/glossary/apply", async (req, res) => {
     try {
       await handleApply(req, res);
@@ -284,4 +369,5 @@ export function registerRoutes(app) {
       handleErr(res, e);
     }
   });
+
 }

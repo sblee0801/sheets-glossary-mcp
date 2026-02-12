@@ -103,6 +103,12 @@ export const BatchRunSchema = z.object({
   // overwrite policy
   allowOverwrite: z.boolean().optional().default(false),
 
+  // ✅ NEW: ttl gate (seconds) - routesV2에서 사용
+  ttlGateSeconds: z.number().int().min(0).max(86400).optional().default(1800),
+
+  // ✅ NEW: debug flag
+  debug: z.boolean().optional().default(false),
+
   // optional model override
   model: OptTrimmedStr,
 });

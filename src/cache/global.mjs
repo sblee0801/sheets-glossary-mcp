@@ -53,6 +53,7 @@ export function getReplacePlanFromCache({ cache, sheetName, sourceLangKey, categ
   const tlk = _normKeyPart(targetLangKey);
   const catsKey = _makeCategoriesKey(categories);
 
+  // loadedAt를 키에 포함해서 "글로서리 reload" 이후 plan이 섞이지 않게 함
   const key = `rp@@${sheet}@@${loadedAt}@@${slk}@@${catsKey}@@${tlk}`;
 
   const hit = _replacePlanCache.get(key);
@@ -80,6 +81,8 @@ export async function ensureGlossaryLoaded(opts = {}) {
   const loaded = await loadGlossaryAll({ ...opts, sheetName: sheetNameRaw });
 
   // ✅ sourceLang keys are ko/en only (th removed)
+  // - 여기 인덱스는 "어떤 source 컬럼을 기준으로 치환할지"를 위해 사용됨
+  // - v2에서 sourceLang은 en/ko만 허용이므로 ko/en만 만들면 충분
   const byCategoryBySource = buildIndexBySourcePreserveDuplicates(loaded.entries, ["ko-kr", "en-us"]);
 
   const cache = freezeShallow({
@@ -96,7 +99,7 @@ export async function ensureGlossaryLoaded(opts = {}) {
 
   _glossaryCacheBySheet.set(sheetKey, cache);
 
-  // safe invalidation
+  // safe invalidation: glossary가 바뀌면 derived cache는 전부 초기화
   _replacePlanCache.clear();
 
   return cache;

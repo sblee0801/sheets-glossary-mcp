@@ -388,12 +388,13 @@ export function registerRoutesV2(app) {
       for (const p of planned) {
         const { rowIndex, sourceText, rowCategoryKey } = p;
 
+        // ✅ 핵심: replacePlan을 정확한 파라미터명으로 전달
         const g = replaceByGlossaryWithLogs({
           text: sourceText,
           sourceLangKey,
           targetLangKey,
           sourceTextMap,
-          plan: replacePlan, // keep both names compatible if replaceByGlossaryWithLogs uses either
+          replacePlan,
         });
 
         const afterGlossary = String(g?.textOut ?? g?.out ?? sourceText);
