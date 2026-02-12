@@ -1,7 +1,4 @@
 // src/http/routes.mjs
-// - QA / Apply / Glossary Update
-// - + Mask endpoint
-// - + NEW: /v1/qa/run (Full Server-Side QA Engine)
 
 import {
   normalizeLang,
@@ -68,13 +65,64 @@ function strip(s) {
     .trim();
 }
 
+/* ---------------- Apply Logic ---------------- */
+
+async function handleApply(req, res) {
+  const body = normalizeBody(getParsedBody(req));
+  const v = ApplySchema.parse(body);
+
+  const sheet = pickSheet(v);
+  const cache = await ensureGlossaryLoaded({ sheetName: sheet, forceReload: false });
+
+  const sourceLangKey = normalizeLang(v.sourceLang);
+  const srcCol = cache.langIndex[sourceLangKey];
+  if (srcCol == null) throw httpError(400, "Missing sourceLang column");
+
+  const updates = [];
+  const results = [];
+
+  for (const entry of v.entries) {
+    const rowIndex = Number(entry.rowIndex);
+    const sourceText = strip(entry.sourceText);
+
+    const rowArrIdx = rowIndex - 2;
+    if (rowArrIdx < 0 || rowArrIdx >= cache.rawRows.length) continue;
+
+    const rawRow = cache.rawRows[rowArrIdx] || [];
+    const actualSrc = strip(rawRow[srcCol]);
+
+    if (actualSrc !== sourceText) continue;
+
+    for (const [lang, valRaw] of Object.entries(entry.translations || {})) {
+      const langKey = normalizeLang(lang);
+      const val = strip(valRaw);
+      if (!langKey || !val) continue;
+
+      const colIdx = cache.langIndex[langKey];
+      if (colIdx == null) continue;
+
+      const a1 = `${sheet}!${colIndexToA1(colIdx)}${rowIndex}`;
+      updates.push({ range: a1, values: [[val]] });
+    }
+
+    results.push({ rowIndex, status: "success" });
+  }
+
+  const writeRes = await batchUpdateValuesA1(updates);
+  await ensureGlossaryLoaded({ sheetName: sheet, forceReload: true });
+
+  toJson(res, 200, {
+    ok: true,
+    updatedCells: writeRes.updatedCells,
+    results,
+  });
+}
+
 /* =========================================================
-   REGISTER ROUTES
+   ROUTES
 ========================================================= */
 
 export function registerRoutes(app) {
-
-  /* ---------- Health ---------- */
 
   app.get("/health", (_req, res) => {
     toJson(res, 200, { ok: true });
@@ -97,8 +145,6 @@ export function registerRoutes(app) {
         ok: true,
         sheet: cache.sheetName,
         glossaryLoadedAt: cache.loadedAt,
-        rawRowCount: cache.rawRowCount,
-        categoriesCount: cache.byCategoryBySource.size,
       });
     } catch (e) {
       handleErr(res, e);
@@ -113,19 +159,13 @@ export function registerRoutes(app) {
       const v = GlossaryQaNextSchema.parse(body);
 
       const sheet = pickSheet(v);
-      const cache = await ensureGlossaryLoaded({
-        sheetName: sheet,
-        forceReload: Boolean(v.forceReload),
-      });
+      const cache = await ensureGlossaryLoaded({ sheetName: sheet });
 
       const sourceLangKey = normalizeLang(v.sourceLang);
       const targetLangKey = normalizeLang(v.targetLang);
 
       const srcCol = cache.langIndex[sourceLangKey];
       const tgtCol = cache.langIndex[targetLangKey];
-
-      if (srcCol == null) throw httpError(400, "Missing sourceLang column");
-      if (tgtCol == null) throw httpError(400, "Missing targetLang column");
 
       const limit = Number(v.limit ?? 50);
       let start = Number(v.cursor ?? 0);
@@ -141,11 +181,7 @@ export function registerRoutes(app) {
 
         if (!sourceText || !targetText) continue;
 
-        items.push({
-          rowIndex,
-          sourceText,
-          targetText,
-        });
+        items.push({ rowIndex, sourceText, targetText });
 
         if (items.length >= limit) {
           start = i + 1;
@@ -155,9 +191,6 @@ export function registerRoutes(app) {
 
       toJson(res, 200, {
         ok: true,
-        sheet: cache.sheetName,
-        sourceLang: v.sourceLang,
-        targetLang: v.targetLang,
         cursorNext: start < cache.entries.length ? String(start) : null,
         items,
       });
@@ -168,7 +201,7 @@ export function registerRoutes(app) {
   });
 
   /* =========================================================
-     🔥 NEW: FULL QA ENGINE
+     🔥 FULL QA ENGINE (강화 버전)
   ========================================================= */
 
   app.post("/v1/qa/run", async (req, res) => {
@@ -184,19 +217,13 @@ export function registerRoutes(app) {
         throw httpError(400, "sheet, sourceLang, targetLang required");
       }
 
-      const cache = await ensureGlossaryLoaded({
-        sheetName: sheet,
-        forceReload: false,
-      });
+      const cache = await ensureGlossaryLoaded({ sheetName: sheet });
 
       const srcCol = cache.langIndex[sourceLangKey];
       const tgtCol = cache.langIndex[targetLangKey];
 
-      if (srcCol == null) throw httpError(400, "Missing sourceLang column");
-      if (tgtCol == null) throw httpError(400, "Missing targetLang column");
-
       const items = [];
-      let start = cursor;
+      let nextCursor = cursor;
 
       for (let i = cursor; i < cache.entries.length; i++) {
         const row = cache.rawRows[i] || [];
@@ -207,24 +234,17 @@ export function registerRoutes(app) {
 
         if (!sourceText || !targetText) continue;
 
-        items.push({
-          rowIndex,
-          sourceText,
-          targetText,
-        });
+        items.push({ rowIndex, sourceText, targetText });
 
         if (items.length >= limit) {
-          start = i + 1;
+          nextCursor = i + 1;
           break;
         }
       }
 
-      const finalize = [];
-      const maskSummary = [];
-
       const glossaryMaps = mergeSourceTextMapsFromCache(
         cache,
-        "ko-kr",
+        sourceLangKey,
         Array.from(cache.byCategoryBySource.keys())
       );
 
@@ -233,24 +253,46 @@ export function registerRoutes(app) {
         for (const e of arr || []) glossaryEntries.push(e);
       }
 
+      const finalize = [];
+      const maskSummary = [];
+
       for (const item of items) {
         let modified = item.targetText;
         const applied = [];
 
         for (const entry of glossaryEntries) {
-          const src = strip(entry?.source ?? "");
-          const tgt = strip(entry?.translations?.[targetLangKey] ?? "");
+          const sourceValue = strip(entry?.source ?? "");
+          const translations = entry?.translations || {};
+          const correctTarget = strip(translations[targetLangKey] ?? "");
 
-          if (!src || !tgt) continue;
+          if (!sourceValue || !correctTarget) continue;
+          if (!item.sourceText.includes(sourceValue)) continue;
 
-          if (item.sourceText.includes(src)) {
-            if (!modified.includes(tgt)) {
+          for (const [langKey, valRaw] of Object.entries(translations)) {
+            const val = strip(valRaw);
+            if (!val) continue;
+
+            if (langKey !== targetLangKey && modified.includes(val)) {
               modified = modified.replace(
-                new RegExp(escapeRegExp(src), "g"),
-                tgt
+                new RegExp(escapeRegExp(val), "g"),
+                correctTarget
               );
+              applied.push({
+                source: `${val} (${langKey})`,
+                target: correctTarget,
+              });
             }
-            applied.push({ source: src, target: tgt });
+          }
+
+          if (modified.includes(sourceValue)) {
+            modified = modified.replace(
+              new RegExp(escapeRegExp(sourceValue), "g"),
+              correctTarget
+            );
+            applied.push({
+              source: `${sourceValue} (${sourceLangKey})`,
+              target: correctTarget,
+            });
           }
         }
 
@@ -272,7 +314,7 @@ export function registerRoutes(app) {
       toJson(res, 200, {
         ok: true,
         cursorNext:
-          start < cache.entries.length ? String(start) : null,
+          nextCursor < cache.entries.length ? String(nextCursor) : null,
         hasFix: finalize.length > 0,
         maskSummary,
         finalize,
