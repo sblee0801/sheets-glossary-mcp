@@ -1,10 +1,7 @@
 // src/http/routes.mjs
 // - QA / Apply / Glossary Update
-// - + Mask endpoint added
-// - QA default 100 (schema)
-// - QA response text length clip via env QA_TEXT_MAX_CHARS
-// - APPLY: always overwrite (QA policy)
-// - RUN-APPLY: non-consequential wrapper for CustomGPT
+// - + Mask endpoint
+// - + NEW: /v1/qa/run (Full Server-Side QA Engine)
 
 import {
   normalizeLang,
@@ -63,7 +60,6 @@ function normalizeBody(body) {
   return b;
 }
 
-// NBSP + zero-width + BOM 제거
 function strip(s) {
   return String(s ?? "")
     .replace(/\r\n/g, "\n")
@@ -72,94 +68,9 @@ function strip(s) {
     .trim();
 }
 
-// QA 응답 텍스트 컷
-const QA_TEXT_MAX_CHARS = Number(process.env.QA_TEXT_MAX_CHARS ?? 2000);
-
-function clipForQaResponse(s) {
-  const t = strip(s);
-  if (!Number.isFinite(QA_TEXT_MAX_CHARS) || QA_TEXT_MAX_CHARS <= 0) return t;
-  return t.length > QA_TEXT_MAX_CHARS ? t.slice(0, QA_TEXT_MAX_CHARS) : t;
-}
-
-/* ---------------- Core Apply Logic (SHARED) ---------------- */
-
-async function handleApply(req, res) {
-  const body = normalizeBody(getParsedBody(req));
-  const v = ApplySchema.parse(body);
-
-  const sheet = pickSheet(v);
-  const cache = await ensureGlossaryLoaded({ sheetName: sheet, forceReload: false });
-
-  const sourceLangKey = normalizeLang(v.sourceLang);
-  if (sourceLangKey !== "en-us" && sourceLangKey !== "ko-kr") {
-    throw httpError(400, "apply sourceLang must be en-US or ko-KR.");
-  }
-
-  const srcCol = cache.langIndex[sourceLangKey];
-  if (srcCol == null) throw httpError(400, "Missing sourceLang column");
-
-  const updates = [];
-  const results = [];
-
-  for (const entry of v.entries) {
-    const rowIndex = Number(entry.rowIndex);
-    const sourceText = strip(entry.sourceText);
-
-    if (!Number.isFinite(rowIndex) || rowIndex < 2) {
-      results.push({ rowIndex, status: "skipped", reason: "invalid_rowIndex" });
-      continue;
-    }
-
-    const rowArrIdx = rowIndex - 2;
-    if (rowArrIdx < 0 || rowArrIdx >= cache.rawRows.length) {
-      results.push({ rowIndex, status: "skipped", reason: "rowIndex_out_of_range" });
-      continue;
-    }
-
-    const rawRow = cache.rawRows[rowArrIdx] || [];
-    const actualSrc = strip(rawRow[srcCol]);
-
-    if (actualSrc !== sourceText) {
-      results.push({ rowIndex, status: "skipped", reason: "source_mismatch" });
-      continue;
-    }
-
-    let updated = 0;
-
-    for (const [lang, valRaw] of Object.entries(entry.translations || {})) {
-      const langKey = normalizeLang(lang);
-      const val = strip(valRaw);
-      if (!langKey || !val) continue;
-
-      const colIdx = cache.langIndex[langKey];
-      if (colIdx == null) continue;
-
-      const a1 = `${sheet}!${colIndexToA1(colIdx)}${rowIndex}`;
-      updates.push({ range: a1, values: [[val]] });
-      updated += 1;
-    }
-
-    results.push({
-      rowIndex,
-      updatedCellsPlanned: updated,
-      status: updated ? "success" : "no_op",
-    });
-  }
-
-  const writeRes = await batchUpdateValuesA1(updates);
-  await ensureGlossaryLoaded({ sheetName: sheet, forceReload: true });
-
-  toJson(res, 200, {
-    ok: true,
-    sheet,
-    plannedUpdates: updates.length,
-    updatedCells: writeRes.updatedCells,
-    updatedRanges: writeRes.updatedRanges,
-    results,
-  });
-}
-
-/* ---------------- Routes ---------------- */
+/* =========================================================
+   REGISTER ROUTES
+========================================================= */
 
 export function registerRoutes(app) {
 
@@ -194,7 +105,7 @@ export function registerRoutes(app) {
     }
   });
 
-  /* ---------- QA Next ---------- */
+  /* ---------- QA Next (기존 유지) ---------- */
 
   app.post("/v1/glossary/qa/next", async (req, res) => {
     try {
@@ -216,25 +127,14 @@ export function registerRoutes(app) {
       if (srcCol == null) throw httpError(400, "Missing sourceLang column");
       if (tgtCol == null) throw httpError(400, "Missing targetLang column");
 
-      const categoryKey =
-        v.category && String(v.category).trim()
-          ? String(v.category).trim().toLowerCase()
-          : null;
-
-      const limit = Number(v.limit ?? 100);
+      const limit = Number(v.limit ?? 50);
       let start = Number(v.cursor ?? 0);
 
       const items = [];
 
       for (let i = start; i < cache.entries.length; i++) {
-        const entry = cache.entries[i];
         const row = cache.rawRows[i] || [];
         const rowIndex = i + 2;
-
-        if (categoryKey) {
-          const c = String(entry?.category ?? "").trim().toLowerCase();
-          if (c !== categoryKey) continue;
-        }
 
         const sourceText = strip(row[srcCol]);
         const targetText = strip(row[tgtCol]);
@@ -243,8 +143,8 @@ export function registerRoutes(app) {
 
         items.push({
           rowIndex,
-          sourceText: clipForQaResponse(sourceText),
-          targetText: clipForQaResponse(targetText),
+          sourceText,
+          targetText,
         });
 
         if (items.length >= limit) {
@@ -267,84 +167,115 @@ export function registerRoutes(app) {
     }
   });
 
-  /* ---------- NEW: Mask Endpoint ---------- */
+  /* =========================================================
+     🔥 NEW: FULL QA ENGINE
+  ========================================================= */
 
-  app.post("/v1/translate/mask", async (req, res) => {
+  app.post("/v1/qa/run", async (req, res) => {
     try {
       const body = getParsedBody(req) || {};
-
-      const sheet = String(body.sheet ?? "Glossary").trim();
+      const sheet = String(body.sheet ?? "").trim();
+      const sourceLangKey = normalizeLang(body.sourceLang);
       const targetLangKey = normalizeLang(body.targetLang);
-      const texts = Array.isArray(body.texts)
-        ? body.texts.map((x) => String(x ?? ""))
-        : [];
+      const limit = Number(body.limit ?? 50);
+      const cursor = Number(body.cursor ?? 0);
 
-      if (!targetLangKey) throw httpError(400, "targetLang is required.");
-      if (!texts.length) throw httpError(400, "texts must be non-empty array.");
+      if (!sheet || !sourceLangKey || !targetLangKey) {
+        throw httpError(400, "sheet, sourceLang, targetLang required");
+      }
 
       const cache = await ensureGlossaryLoaded({
         sheetName: sheet,
         forceReload: false,
       });
 
-      const categories = Array.from(cache.byCategoryBySource.keys());
-      const sourceTextMap = mergeSourceTextMapsFromCache(
-        cache,
-        "ko-kr",
-        categories
-      );
+      const srcCol = cache.langIndex[sourceLangKey];
+      const tgtCol = cache.langIndex[targetLangKey];
 
-      const termSet = new Set();
+      if (srcCol == null) throw httpError(400, "Missing sourceLang column");
+      if (tgtCol == null) throw httpError(400, "Missing targetLang column");
 
-      for (const entries of sourceTextMap.values()) {
-        for (const e of entries || []) {
-          const t = String(e?.translations?.[targetLangKey] ?? "").trim();
-          if (t) termSet.add(t);
+      const items = [];
+      let start = cursor;
+
+      for (let i = cursor; i < cache.entries.length; i++) {
+        const row = cache.rawRows[i] || [];
+        const rowIndex = i + 2;
+
+        const sourceText = strip(row[srcCol]);
+        const targetText = strip(row[tgtCol]);
+
+        if (!sourceText || !targetText) continue;
+
+        items.push({
+          rowIndex,
+          sourceText,
+          targetText,
+        });
+
+        if (items.length >= limit) {
+          start = i + 1;
+          break;
         }
       }
 
-      const targetTerms = Array.from(termSet)
-        .sort((a, b) => b.length - a.length);
+      const finalize = [];
+      const maskSummary = [];
 
-      const compiled = targetTerms.map((term) => ({
-        term,
-        re: new RegExp(escapeRegExp(term), "g"),
-      }));
+      const glossaryMaps = mergeSourceTextMapsFromCache(
+        cache,
+        "ko-kr",
+        Array.from(cache.byCategoryBySource.keys())
+      );
 
-      let nextId = 1;
-      const masks = [];
-      const textsMasked = [];
+      const glossaryEntries = [];
+      for (const arr of glossaryMaps.values()) {
+        for (const e of arr || []) glossaryEntries.push(e);
+      }
 
-      for (const raw of texts) {
-        let out = String(raw ?? "");
+      for (const item of items) {
+        let modified = item.targetText;
+        const applied = [];
 
-        for (const { term, re } of compiled) {
-          out = out.replace(re, () => {
-            const id = nextId++;
-            const token = `{mask:${id}}`;
-            masks.push({
-              id,
-              anchor: token,
-              restore: term,
-            });
-            return token;
+        for (const entry of glossaryEntries) {
+          const src = strip(entry?.source ?? "");
+          const tgt = strip(entry?.translations?.[targetLangKey] ?? "");
+
+          if (!src || !tgt) continue;
+
+          if (item.sourceText.includes(src)) {
+            if (!modified.includes(tgt)) {
+              modified = modified.replace(
+                new RegExp(escapeRegExp(src), "g"),
+                tgt
+              );
+            }
+            applied.push({ source: src, target: tgt });
+          }
+        }
+
+        if (applied.length) {
+          maskSummary.push({
+            rowIndex: item.rowIndex,
+            applied,
           });
         }
 
-        textsMasked.push(out);
+        if (modified !== item.targetText) {
+          finalize.push({
+            rowIndex: item.rowIndex,
+            translation: modified,
+          });
+        }
       }
 
       toJson(res, 200, {
         ok: true,
-        sheet,
-        targetLang: targetLangKey,
-        textsMasked,
-        masks,
-        summary: {
-          inputTexts: texts.length,
-          masks: masks.length,
-          uniqueTerms: targetTerms.length,
-        },
+        cursorNext:
+          start < cache.entries.length ? String(start) : null,
+        hasFix: finalize.length > 0,
+        maskSummary,
+        finalize,
       });
 
     } catch (e) {
@@ -355,14 +286,6 @@ export function registerRoutes(app) {
   /* ---------- Apply ---------- */
 
   app.post("/run-apply", async (req, res) => {
-    try {
-      await handleApply(req, res);
-    } catch (e) {
-      handleErr(res, e);
-    }
-  });
-
-  app.post("/v1/glossary/apply", async (req, res) => {
     try {
       await handleApply(req, res);
     } catch (e) {
