@@ -46,17 +46,6 @@ function handleErr(res, e) {
   });
 }
 
-function pickSheet(v) {
-  return String(v?.sheet ?? "Glossary").trim() || "Glossary";
-}
-
-function normalizeBody(body) {
-  const b = body && typeof body === "object" ? body : {};
-  if (b.category == null) b.category = "";
-  if (b.sheet == null) b.sheet = "Glossary";
-  return b;
-}
-
 function strip(s) {
   return String(s ?? "")
     .replace(/\r\n/g, "\n")
@@ -68,30 +57,22 @@ function strip(s) {
 /* ---------------- Apply Logic ---------------- */
 
 async function handleApply(req, res) {
-  const body = normalizeBody(getParsedBody(req));
+  const body = getParsedBody(req) || {};
   const v = ApplySchema.parse(body);
 
-  const sheet = pickSheet(v);
-  const cache = await ensureGlossaryLoaded({ sheetName: sheet, forceReload: false });
+  const sheet = v.sheet;
+  const cache = await ensureGlossaryLoaded({ sheetName: sheet });
 
   const sourceLangKey = normalizeLang(v.sourceLang);
   const srcCol = cache.langIndex[sourceLangKey];
   if (srcCol == null) throw httpError(400, "Missing sourceLang column");
 
   const updates = [];
-  const results = [];
 
   for (const entry of v.entries) {
     const rowIndex = Number(entry.rowIndex);
-    const sourceText = strip(entry.sourceText);
-
     const rowArrIdx = rowIndex - 2;
     if (rowArrIdx < 0 || rowArrIdx >= cache.rawRows.length) continue;
-
-    const rawRow = cache.rawRows[rowArrIdx] || [];
-    const actualSrc = strip(rawRow[srcCol]);
-
-    if (actualSrc !== sourceText) continue;
 
     for (const [lang, valRaw] of Object.entries(entry.translations || {})) {
       const langKey = normalizeLang(lang);
@@ -104,8 +85,6 @@ async function handleApply(req, res) {
       const a1 = `${sheet}!${colIndexToA1(colIdx)}${rowIndex}`;
       updates.push({ range: a1, values: [[val]] });
     }
-
-    results.push({ rowIndex, status: "success" });
   }
 
   const writeRes = await batchUpdateValuesA1(updates);
@@ -114,12 +93,11 @@ async function handleApply(req, res) {
   toJson(res, 200, {
     ok: true,
     updatedCells: writeRes.updatedCells,
-    results,
   });
 }
 
 /* =========================================================
-   ROUTES
+   REGISTER ROUTES
 ========================================================= */
 
 export function registerRoutes(app) {
@@ -128,81 +106,7 @@ export function registerRoutes(app) {
     toJson(res, 200, { ok: true });
   });
 
-  /* ---------- Glossary Update ---------- */
-
-  app.post("/v1/glossary/update", async (req, res) => {
-    try {
-      const body = normalizeBody(getParsedBody(req));
-      const v = UpdateSchema.parse(body);
-
-      const sheet = pickSheet(v);
-      const cache = await ensureGlossaryLoaded({
-        sheetName: sheet,
-        forceReload: true,
-      });
-
-      toJson(res, 200, {
-        ok: true,
-        sheet: cache.sheetName,
-        glossaryLoadedAt: cache.loadedAt,
-      });
-    } catch (e) {
-      handleErr(res, e);
-    }
-  });
-
-  /* ---------- QA Next (기존 유지) ---------- */
-
-  app.post("/v1/glossary/qa/next", async (req, res) => {
-    try {
-      const body = normalizeBody(getParsedBody(req));
-      const v = GlossaryQaNextSchema.parse(body);
-
-      const sheet = pickSheet(v);
-      const cache = await ensureGlossaryLoaded({ sheetName: sheet });
-
-      const sourceLangKey = normalizeLang(v.sourceLang);
-      const targetLangKey = normalizeLang(v.targetLang);
-
-      const srcCol = cache.langIndex[sourceLangKey];
-      const tgtCol = cache.langIndex[targetLangKey];
-
-      const limit = Number(v.limit ?? 50);
-      let start = Number(v.cursor ?? 0);
-
-      const items = [];
-
-      for (let i = start; i < cache.entries.length; i++) {
-        const row = cache.rawRows[i] || [];
-        const rowIndex = i + 2;
-
-        const sourceText = strip(row[srcCol]);
-        const targetText = strip(row[tgtCol]);
-
-        if (!sourceText || !targetText) continue;
-
-        items.push({ rowIndex, sourceText, targetText });
-
-        if (items.length >= limit) {
-          start = i + 1;
-          break;
-        }
-      }
-
-      toJson(res, 200, {
-        ok: true,
-        cursorNext: start < cache.entries.length ? String(start) : null,
-        items,
-      });
-
-    } catch (e) {
-      handleErr(res, e);
-    }
-  });
-
-  /* =========================================================
-     🔥 FULL QA ENGINE (강화 버전)
-  ========================================================= */
+  /* ---------- FULL QA ENGINE ---------- */
 
   app.post("/v1/qa/run", async (req, res) => {
     try {
@@ -221,6 +125,10 @@ export function registerRoutes(app) {
 
       const srcCol = cache.langIndex[sourceLangKey];
       const tgtCol = cache.langIndex[targetLangKey];
+      if (srcCol == null || tgtCol == null)
+        throw httpError(400, "Missing language column");
+
+      /* ---------- 1. QA 대상 수집 ---------- */
 
       const items = [];
       let nextCursor = cursor;
@@ -242,6 +150,8 @@ export function registerRoutes(app) {
         }
       }
 
+      /* ---------- 2. Glossary 로드 (항상 source 기준) ---------- */
+
       const glossaryMaps = mergeSourceTextMapsFromCache(
         cache,
         sourceLangKey,
@@ -256,43 +166,62 @@ export function registerRoutes(app) {
       const finalize = [];
       const maskSummary = [];
 
+      /* ---------- 3. Anchor 정밀 검사 ---------- */
+
       for (const item of items) {
         let modified = item.targetText;
         const applied = [];
 
-        for (const entry of glossaryEntries) {
-          const sourceValue = strip(entry?.source ?? "");
-          const translations = entry?.translations || {};
-          const correctTarget = strip(translations[targetLangKey] ?? "");
+        const anchorRegex = /«T:([^»]+)»/g;
+        const anchors = [...modified.matchAll(anchorRegex)];
 
-          if (!sourceValue || !correctTarget) continue;
-          if (!item.sourceText.includes(sourceValue)) continue;
+        for (const match of anchors) {
+          const fullMatch = match[0];          // «T:Cracked Rift»
+          const innerValue = strip(match[1]); // Cracked Rift
 
-          for (const [langKey, valRaw] of Object.entries(translations)) {
-            const val = strip(valRaw);
-            if (!val) continue;
+          for (const entry of glossaryEntries) {
+            const sourceValue = strip(entry?.source ?? "");
+            const translations = entry?.translations || {};
+            const correctTarget = strip(translations[targetLangKey] ?? "");
 
-            if (langKey !== targetLangKey && modified.includes(val)) {
+            if (!sourceValue || !correctTarget) continue;
+
+            // source에 해당 용어가 있어야 검사
+            if (!item.sourceText.includes(sourceValue)) continue;
+
+            // 1️⃣ 이미 targetLang이면 정상
+            if (innerValue === correctTarget) break;
+
+            // 2️⃣ sourceLang 원문이면 교체
+            if (innerValue === sourceValue) {
               modified = modified.replace(
-                new RegExp(escapeRegExp(val), "g"),
-                correctTarget
+                fullMatch,
+                `«T:${correctTarget}»`
               );
               applied.push({
-                source: `${val} (${langKey})`,
+                source: `${sourceValue} (${sourceLangKey})`,
                 target: correctTarget,
               });
+              break;
             }
-          }
 
-          if (modified.includes(sourceValue)) {
-            modified = modified.replace(
-              new RegExp(escapeRegExp(sourceValue), "g"),
-              correctTarget
-            );
-            applied.push({
-              source: `${sourceValue} (${sourceLangKey})`,
-              target: correctTarget,
-            });
+            // 3️⃣ 다른 언어 번역이면 교체
+            for (const [langKey, valRaw] of Object.entries(translations)) {
+              const val = strip(valRaw);
+              if (!val) continue;
+
+              if (langKey !== targetLangKey && innerValue === val) {
+                modified = modified.replace(
+                  fullMatch,
+                  `«T:${correctTarget}»`
+                );
+                applied.push({
+                  source: `${val} (${langKey})`,
+                  target: correctTarget,
+                });
+                break;
+              }
+            }
           }
         }
 
